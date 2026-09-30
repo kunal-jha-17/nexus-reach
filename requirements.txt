@@ -1,0 +1,7 @@
+flask>=3.0
+requests>=2.31
+beautifulsoup4>=4.12
+python-dotenv>=1.0
+cryptography>=42.0      # encrypts each user's saved API keys / email passwords
+playwright>=1.44      # only needed for scraping; the rest of the app runs without it
+gunicorn>=22.0        # only if you deploy it (see README)

@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexus Reach</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/static/img/favicon-64.png">
+<link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div class="app">
+
+  <nav class="rail" aria-label="Main">
+    <div class="brand"><img src="/static/img/logo-mark.png" class="brand-mark" alt="" width="26" height="26">Nexus Reach</div>
+    <a href="#dashboard" data-view="dashboard">Dashboard</a>
+    <a href="#campaigns" data-view="campaigns">Campaigns</a>
+    <div id="rail-campaigns" class="rail-sub"></div>
+    <div class="rail-group">Get leads</div>
+    <a href="#find" data-view="find">Find leads</a>
+    <a href="#pipeline" data-view="pipeline">Enrich &amp; judge</a>
+    <div class="rail-group">Work leads</div>
+    <a href="#leads" data-view="leads">All leads</a>
+    <a href="#outreach" data-view="outreach">Outreach</a>
+    <div class="rail-spacer"></div>
+    <a href="#settings" data-view="settings">Settings</a>
+    <div class="rail-user">
+      <div id="who" class="who"></div>
+      <button class="linklike" id="signout">Sign out</button>
+    </div>
+  </nav>
+
+  <main>
+
+    <!-- ============================================================ DASHBOARD -->
+    <section id="view-dashboard" class="view" hidden>
+      <header class="view-head"><h1>Dashboard</h1>
+        <select id="dash-campaign" aria-label="Campaign"><option value="">All campaigns</option></select>
+      </header>
+      <div id="dash-tiles" class="tiles"></div>
+      <div class="grid two">
+        <div class="card"><h2>What to do next</h2><div id="dash-next"></div></div>
+        <div class="card"><h2>Where leads are</h2><div id="dash-stages"></div></div>
+      </div>
+      <div class="card"><h2>Campaigns</h2><div id="dash-campaigns"></div></div>
+      <div class="grid two">
+        <div class="card"><h2>Budgets</h2><div id="dash-budgets"></div></div>
+        <div class="card"><h2>Recent activity</h2><div data-jobs="" data-limit="6"></div></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ CAMPAIGNS -->
+    <section id="view-campaigns" class="view" hidden>
+      <header class="view-head"><h1>Campaigns</h1>
+        <button class="btn primary" id="cp-new-btn">New campaign</button></header>
+      <p class="hint">A campaign is one push at one audience &mdash; say &ldquo;Dallas HVAC&rdquo; or &ldquo;Houston roofers&rdquo;.
+         Each has its own leads, its own dashboard, and can have its own fit criteria, message templates and channel order.</p>
+      <div id="cp-new" class="card" hidden>
+        <h2>New campaign</h2>
+        <div class="row">
+          <div class="field"><label for="cp-name">Name</label><input id="cp-name" placeholder="dallas-hvac" maxlength="60"></div>
+          <div class="field"><label for="cp-copy">Start from</label><select id="cp-copy"></select></div>
+        </div>
+        <div class="field"><label for="cp-desc">What is it for? <span class="muted">(optional)</span></label>
+          <input id="cp-desc" placeholder="HVAC contractors in Dallas / Fort Worth with no website"></div>
+        <div class="row actions"><button class="btn primary" id="cp-create">Create</button>
+          <button class="btn" id="cp-cancel">Cancel</button></div>
+      </div>
+      <div id="cp-cards" class="cards"></div>
+      <label class="check" id="cp-archived-wrap" hidden><input type="checkbox" id="cp-show-archived"> Show archived campaigns</label>
+      <div id="cp-unassigned" class="hint"></div>
+    </section>
+
+    <section id="view-campaign" class="view" hidden>
+      <header class="view-head">
+        <div><a href="#campaigns" class="crumb">&larr; All campaigns</a>
+          <h1 id="cd-title"></h1><div id="cd-desc" class="muted"></div></div>
+        <div class="row-tight">
+          <button class="btn" id="cd-leads">View leads</button>
+          <button class="btn" id="cd-import">Add leads</button>
+          <button class="btn" id="cd-archive"></button>
+          <button class="btn danger" id="cd-delete">Delete</button>
+        </div>
+      </header>
+      <div id="cd-tiles" class="tiles"></div>
+      <div class="card"><h2>Funnel</h2><div id="cd-funnel"></div></div>
+      <div class="grid two">
+        <div class="card"><h2>What needs doing</h2><div id="cd-queue"></div></div>
+        <div class="card"><h2>Last 14 days</h2><div id="cd-chart"></div></div>
+      </div>
+      <div class="grid two">
+        <div class="card"><h2>Who's in it</h2><div id="cd-breakdown"></div></div>
+        <div class="card"><h2>Recent activity</h2><div id="cd-recent"></div></div>
+      </div>
+      <div class="card"><h2>Recent runs</h2><div data-jobs="" data-campaign-jobs="1" data-limit="6"></div></div>
+      <div class="card" id="cd-settings">
+        <h2>Campaign settings</h2>
+        <p class="hint">Anything you leave blank here uses your account-wide Settings.</p>
+        <div class="field"><label for="cs-desc">Description</label><input id="cs-desc"></div>
+        <div class="field"><label for="cs-criteria">Who's a good fit (used by <b>Judge fit</b>)</label>
+          <textarea id="cs-criteria" rows="9"></textarea>
+          <div class="hint" id="cs-criteria-note"></div></div>
+        <div class="field"><label for="cs-info">About this campaign <span class="muted">(added to what the AI knows about you)</span></label>
+          <textarea id="cs-info" rows="4" placeholder="Leave blank to use About you from Settings"></textarea></div>
+        <div class="field"><label class="check"><input type="checkbox" id="cs-prio-on"> Use a different channel order for this campaign</label>
+          <div id="cs-prio"></div></div>
+        <div class="field"><label class="check"><input type="checkbox" id="cs-tpl-on"> Use different message templates for this campaign</label>
+          <div id="cs-tpl"></div><button class="btn small" id="cs-tpl-add" hidden>Add template</button></div>
+        <button class="btn primary" id="cs-save">Save campaign settings</button>
+      </div>
+    </section>
+
+    <!-- ============================================================ FIND LEADS -->
+    <section id="view-find" class="view" hidden>
+      <header class="view-head"><h1>Find leads</h1></header>
+      <div class="grid two">
+        <div class="card">
+          <h2>Import a CSV</h2>
+          <p class="hint">Outscraper, Instant Data Scraper, your own sheets, the old scraper's export &mdash;
+             columns are matched automatically. Duplicates are merged, never overwritten.</p>
+          <div class="field"><label for="imp-file">CSV file</label><input type="file" id="imp-file" accept=".csv,text/csv"></div>
+          <div class="row">
+            <div class="field"><label for="imp-campaign">Campaign</label>
+              <input id="imp-campaign" list="campaign-list" placeholder="e.g. dfw-trades"></div>
+            <div class="field"><label for="imp-source">Source label</label>
+              <input id="imp-source" value="import" placeholder="outscraper"></div>
+          </div>
+          <button class="btn primary" id="imp-go">Import</button>
+          <div id="imp-result" class="result" hidden></div>
+        </div>
+
+        <div class="card">
+          <h2>Scrape now</h2>
+          <p class="hint">Runs a real browser in the background. Scrapers are untested against the live
+             sites &mdash; if a run returns 0 results, check the run log below.</p>
+          <div id="sc-nobrowser" class="notice" hidden></div>
+          <div class="row">
+            <div class="field"><label for="sc-platform">Where</label>
+              <select id="sc-platform">
+                <option value="google_maps">Google Maps</option>
+                <option value="yelp">Yelp</option>
+                <option value="instagram">Instagram (hashtag)</option>
+              </select></div>
+            <div class="field"><label for="sc-max">Listings to check</label><input id="sc-max" type="number" min="1" max="200" value="30"></div>
+          </div>
+          <label class="check"><input type="checkbox" id="sc-nosite" checked> Only keep businesses with <b>no website</b> (skips the ones your offer wouldn't fit)</label>
+          <p class="hint" id="sc-nosite-hint" style="margin-top:-6px">With this on, "listings to check" is how many are looked at, not how many are kept &mdash;
+             expect roughly a quarter to a half to survive.</p>
+          <div class="field"><label for="sc-query" id="sc-query-label">Search</label>
+            <input id="sc-query" placeholder="plumbers"></div>
+          <div class="field"><label for="sc-location">Location</label>
+            <input id="sc-location" placeholder="Dallas, TX"></div>
+          <div class="field"><label for="sc-campaign">Campaign</label>
+            <input id="sc-campaign" list="campaign-list" placeholder="e.g. dfw-trades"></div>
+          <div class="row actions">
+            <button class="btn primary" id="sc-go">Start scrape</button>
+            <span class="muted">or repeat every</span>
+            <input id="sc-hours" type="number" min="1" value="24" class="narrow" aria-label="Hours between runs">
+            <span class="muted">hours</span>
+            <button class="btn" id="sc-schedule">Schedule</button>
+          </div>
+        </div>
+      </div>
+      <div class="grid two">
+        <div class="card"><h2>Recurring scrapes</h2><div id="schedule-list"></div></div>
+        <div class="card"><h2>Scrape runs</h2><div data-jobs="scrape" data-limit="8"></div></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ LEADS -->
+    <section id="view-leads" class="view" hidden>
+      <header class="view-head"><h1>All leads</h1>
+        <div class="row-tight">
+          <a class="btn" id="ld-export" href="/api/export.csv" download>Export CSV</a>
+          <button class="btn primary" id="ld-add">Add lead</button>
+        </div>
+      </header>
+      <div class="toolbar">
+        <input id="f-q" type="search" placeholder="Search name, email, phone, city, notes" aria-label="Search">
+        <select id="f-campaign" aria-label="Campaign"><option value="">All campaigns</option></select>
+        <select id="f-stage" aria-label="Stage"><option value="">Any stage</option></select>
+        <select id="f-fit" aria-label="Fit">
+          <option value="">Any fit</option><option value="1">Fits</option>
+          <option value="0">Rejected</option><option value="null">Not judged</option></select>
+        <select id="f-channel" aria-label="Channel"><option value="">Any channel</option></select>
+        <select id="f-sort" aria-label="Sort">
+          <option value="score">Best score first</option><option value="newest">Newest first</option>
+          <option value="oldest">Oldest first</option><option value="name">Name A&ndash;Z</option></select>
+      </div>
+      <div id="bulkbar" class="bulkbar" hidden>
+        <span id="bulk-count"></span>
+        <button class="linklike" id="bulk-all" hidden></button>
+        <span class="spacer"></span>
+        <button class="btn small" data-bulk="enrich">Enrich</button>
+        <button class="btn small" data-bulk="judge">Judge fit</button>
+        <button class="btn small" data-bulk="draft">Draft messages</button>
+        <select id="bulk-stage" class="small" aria-label="Set stage"><option value="">Set stage&hellip;</option></select>
+        <button class="btn small" data-bulk="campaign">Set campaign</button>
+        <button class="btn small" data-bulk="dnc">Do not contact</button>
+        <button class="btn small danger" data-bulk="delete">Delete</button>
+      </div>
+      <div class="tablewrap">
+        <table class="leads" id="leads-table">
+          <thead><tr>
+            <th class="chk"><input type="checkbox" id="sel-page" aria-label="Select this page"></th>
+            <th>Business</th><th>Reach</th><th class="num">Score</th><th>Fit</th>
+            <th>Channel</th><th>Stage</th><th>Sent</th>
+          </tr></thead>
+          <tbody id="leads-body"></tbody>
+        </table>
+        <div id="leads-empty" class="empty" hidden></div>
+      </div>
+      <div class="pager"><button class="btn small" id="pg-prev">Previous</button>
+        <span id="pg-info" class="muted"></span><button class="btn small" id="pg-next">Next</button></div>
+    </section>
+
+    <!-- ============================================================ PIPELINE -->
+    <section id="view-pipeline" class="view" hidden>
+      <header class="view-head"><h1>Enrich &amp; judge</h1></header>
+      <div class="grid two">
+        <div class="card">
+          <h2>1. Enrich</h2>
+          <p class="hint">Finds missing emails, socials, websites and owner names. Free sources first; web
+             searches only for what's still missing.</p>
+          <div class="field"><label for="en-campaign">Leads</label>
+            <select id="en-campaign"><option value="">All campaigns</option></select></div>
+          <div class="row">
+            <label class="check"><input type="checkbox" id="en-force"> Redo already-enriched leads</label>
+            <div class="field inline"><label for="en-limit">Max</label><input id="en-limit" type="number" min="1" class="narrow" placeholder="all"></div>
+          </div>
+          <div class="row actions"><button class="btn primary" id="en-go">Start enriching</button>
+            <span id="en-usage" class="muted"></span></div>
+          <div data-jobs="enrich" data-limit="3"></div>
+        </div>
+        <div class="card">
+          <h2>2. Judge fit</h2>
+          <p class="hint">An LLM reads your criteria and marks each lead Fits or Rejected. Anything it can't
+             judge stays blank and is retried next time.</p>
+          <p class="hint" id="ju-removal-note">Rejected leads are kept, not deleted &mdash; filter by Fit = No to review them.</p>
+          <div class="field"><label for="ju-campaign">Leads</label>
+            <select id="ju-campaign"><option value="">All campaigns</option></select></div>
+          <div class="row">
+            <label class="check"><input type="checkbox" id="ju-force"> Re-judge already-judged leads</label>
+          </div>
+          <div class="row actions"><button class="btn primary" id="ju-go">Start judging</button></div>
+          <div data-jobs="judge" data-limit="3"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Fit criteria</h2>
+        <p class="hint">Plain language: who's a good client, and what rules someone out. Each campaign can have its own;
+           leads in campaigns without their own use <b>default</b>.</p>
+        <div class="row">
+          <div class="field"><label for="cr-campaign">Campaign</label>
+            <select id="cr-campaign"></select></div>
+          <div class="field inline"><label for="cr-new">or new</label>
+            <input id="cr-new" placeholder="campaign name"></div>
+        </div>
+        <p class="hint" id="cr-status"></p>
+        <textarea id="cr-text" rows="14" aria-label="Criteria"></textarea>
+        <div class="row actions"><button class="btn primary" id="cr-save">Save criteria</button>
+          <button class="btn" id="cr-sample">Load the sample criteria</button></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ OUTREACH -->
+    <section id="view-outreach" class="view" hidden>
+      <header class="view-head"><h1>Outreach</h1>
+        <span class="muted" id="out-scope"></span></header>
+      <div id="out-warn" class="notice" hidden></div>
+      <div class="grid two">
+        <div class="card">
+          <h2>1. Draft messages</h2>
+          <p class="hint">Writes a message for every lead that doesn't have one yet (skipping rejected and do-not-contact leads).</p>
+          <div class="row">
+            <div class="field"><label for="dr-campaign">Campaign</label>
+              <select id="dr-campaign"><option value="">All campaigns</option></select></div>
+            <div class="field"><label for="dr-template">Template</label>
+              <select id="dr-template"></select></div>
+          </div>
+          <label class="check"><input type="checkbox" id="dr-force"> Redo existing drafts</label>
+          <div class="row actions"><button class="btn primary" id="dr-go">Draft messages</button></div>
+          <div data-jobs="draft" data-limit="2"></div>
+        </div>
+        <div class="card">
+          <h2>2. Send emails</h2>
+          <div id="em-status"></div>
+          <label class="check"><input type="checkbox" id="em-onlyfit"> Only leads judged as Fits</label>
+          <div class="row actions">
+            <button class="btn primary" id="em-send">Start sending</button>
+            <button class="btn" id="em-replies">Check for replies</button>
+          </div>
+          <div data-jobs="send_bulk" data-limit="2"></div>
+        </div>
+      </div>
+      <div class="card"><h2>Follow-ups due</h2><div id="fu-list"></div></div>
+      <div class="card">
+        <h2>Send by hand</h2>
+        <p class="hint">Yelp, Facebook, Instagram, WhatsApp and phone leads. <b>Copy &amp; open</b> copies the message and
+           opens the right page; you press send, then mark it sent.</p>
+        <div id="hand-list"></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ SETTINGS -->
+    <section id="view-settings" class="view" hidden>
+      <header class="view-head"><h1>Settings</h1><button class="btn primary" id="st-save">Save settings</button></header>
+      <div class="grid two">
+        <div class="card">
+          <h2>About you</h2>
+          <p class="hint">Who's sending, what you offer, price, tone. Given to the LLM with every draft.</p>
+          <textarea id="st-info" rows="8" aria-label="Business info"></textarea>
+        </div>
+        <div class="card">
+          <h2>How to reach a lead</h2>
+          <p class="hint">Order of preference. A lead gets the first channel you have contact details for.
+             (WhatsApp is only used for non-US numbers.)</p>
+          <div id="st-priority"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Message templates</h2>
+        <p class="hint">Structure and offer for each channel. The LLM personalises them per lead. Templates
+           matching a lead's channel are rotated through automatically.</p>
+        <div id="st-templates"></div>
+        <button class="btn small" id="st-tpl-add">Add template</button>
+      </div>
+      <div class="card">
+        <h2>Fit judging</h2>
+        <label class="check"><input type="checkbox" id="st-autoremove"> Automatically delete rejected leads
+          <span class="muted">(only ones with no notes, draft or activity yet &mdash; never touches a lead you've worked on)</span></label>
+        <p class="hint" id="st-autoremove-warn" style="margin:-4px 0 0" hidden>This permanently deletes leads the moment Judge fit rejects them. Off by default &mdash; rejected leads are normally kept so you can review why.</p>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <h2>Email sending</h2>
+          <div class="row">
+            <div class="field"><label for="st-limit">Daily limit</label><input id="st-limit" type="number" min="1"></div>
+            <div class="field"><label for="st-delay">Seconds between emails</label><input id="st-delay" type="number" min="0"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label for="st-fudays">Follow up after (days)</label><input id="st-fudays" type="number" min="1"></div>
+            <div class="field"><label for="st-fumax">Max follow-ups</label><input id="st-fumax" type="number" min="0"></div>
+          </div>
+          <label class="check"><input type="checkbox" id="st-warmup"> Ramp up gradually (10 &rarr; 20 &rarr; 30 a day) on a new account</label>
+          <div class="field"><label for="st-footer">Line added to every email</label>
+            <textarea id="st-footer" rows="3"></textarea></div>
+        </div>
+        <div class="card">
+          <h2>Do-not-contact list</h2>
+          <div class="row">
+            <div class="field grow"><label for="sp-value">Email, phone, or Instagram/Facebook URL</label>
+              <input id="sp-value"></div>
+            <button class="btn" id="sp-add">Add</button>
+          </div>
+          <div id="sp-list"></div>
+        </div>
+      </div>
+      <div class="card" id="st-storage-card" hidden>
+        <h2>Storage &amp; backups <span class="muted" style="font-weight:400">(admin)</span></h2>
+        <div id="st-storage"></div>
+        <div class="row actions">
+          <button class="btn small" id="stor-backup">Back up now</button>
+          <a class="btn small" href="/api/admin/backup.zip" download>Download a full backup</a>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Connections</h2>
+        <p class="hint">Your own keys and email account. They're stored encrypted, only used for <b>your</b> leads, and
+           never shown again after saving. Leave a box empty to keep what's saved.</p>
+        <div id="conn-unreadable" class="notice" hidden>Your saved keys couldn't be read &mdash; the server's secret key
+          changed since you saved them. Enter them again below (your old copy is kept aside), or ask the server owner to restore the old key.</div>
+        <div id="st-conn"></div>
+        <button class="btn primary" id="conn-save">Save connections</button>
+      </div>
+      <div class="grid two">
+        <div class="card">
+          <h2>Your account</h2>
+          <div class="field"><label for="ac-name">Name</label><input id="ac-name"></div>
+          <button class="btn small" id="ac-save">Save name</button>
+          <h2 style="margin-top:18px">Change password</h2>
+          <div class="field"><label for="pw-cur">Current password</label>
+            <div class="pw-wrap"><input id="pw-cur" type="password" autocomplete="current-password">
+              <button type="button" class="pw-eye" data-toggle="pw-cur" aria-label="Show password">&#128065;</button></div></div>
+          <div class="field"><label for="pw-new">New password (8+ characters)</label>
+            <div class="pw-wrap"><input id="pw-new" type="password" autocomplete="new-password">
+              <button type="button" class="pw-eye" data-toggle="pw-new" aria-label="Show password">&#128065;</button></div></div>
+          <div class="field"><label for="pw-confirm">Confirm new password</label>
+            <div class="pw-wrap"><input id="pw-confirm" type="password" autocomplete="new-password">
+              <button type="button" class="pw-eye" data-toggle="pw-confirm" aria-label="Show password">&#128065;</button></div></div>
+          <button class="btn small" id="pw-save">Change password</button>
+          <h2 style="margin-top:18px">Your data</h2>
+          <p class="hint">Download all your leads, campaigns, settings and activity as ordinary files. Passwords and API keys are never included.</p>
+          <a class="btn small" href="/api/export/my-data.zip" download>Download my data</a>
+        </div>
+        <div class="card" id="st-users-card" hidden>
+          <h2>People using this server</h2>
+          <p class="hint">Each person has their own separate database. Deleting someone permanently removes all of their data.</p>
+          <div id="st-users"></div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<datalist id="campaign-list"></datalist>
+
+<!-- ============================================================ LEAD DRAWER -->
+<div id="scrim" hidden></div>
+<aside id="drawer" aria-label="Lead details" aria-hidden="true">
+  <header class="drawer-head">
+    <div><h2 id="dw-title">Lead</h2><div id="dw-sub" class="muted"></div></div>
+    <button class="btn ghost" id="dw-close" aria-label="Close">Close</button>
+  </header>
+  <div class="drawer-body" id="dw-body"></div>
+  <footer class="drawer-foot">
+    <button class="btn danger ghost" id="dw-delete">Delete</button>
+    <span class="spacer"></span>
+    <button class="btn primary" id="dw-save">Save changes</button>
+  </footer>
+</aside>
+
+<div id="toasts" aria-live="polite"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

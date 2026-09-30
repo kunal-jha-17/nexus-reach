@@ -1,0 +1,17 @@
+# systemd unit for a Linux VM (Oracle Always Free, etc). UNTESTED template.
+#   sudo cp deploy/nexus-reach.service /etc/systemd/system/ && sudo systemctl enable --now nexus-reach
+# Put settings (SECRET_KEY, S3_*, TRUST_PROXY=1, COOKIE_SECURE=1 ...) in /etc/nexus-reach.env, mode 600.
+[Unit]
+Description=Nexus Reach
+After=network-online.target
+
+[Service]
+User=nexusreach
+WorkingDirectory=/opt/nexus-reach
+EnvironmentFile=/etc/nexus-reach.env
+ExecStart=/opt/nexus-reach/.venv/bin/gunicorn app:app --workers 1 --threads 8 --timeout 120 --bind 127.0.0.1:5000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

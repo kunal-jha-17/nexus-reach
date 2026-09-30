@@ -1,0 +1,1 @@
+boto3>=1.34      # only if you copy data to Supabase Storage / S3 (see README: free-tier guide)

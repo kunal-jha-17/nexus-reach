@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Nexus Reach</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="/static/img/favicon-64.png">
+<link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="auth-page">
+<main class="auth-card">
+  <img src="/static/img/app-icon.png" class="auth-logo" alt="Nexus Reach" width="64" height="64">
+  <h1>Nexus Reach</h1>
+  <p class="muted" id="auth-tagline">Find, qualify and reach local businesses — all in one place.</p>
+
+  <div class="tabs" role="tablist">
+    <button type="button" role="tab" id="tab-login" class="tab active" aria-selected="true">Sign in</button>
+    <button type="button" role="tab" id="tab-signup" class="tab" aria-selected="false">Create account</button>
+  </div>
+
+  <div id="first-user" class="notice" hidden>
+    No accounts exist yet. The first account you create becomes the <b>admin</b> and takes over any
+    leads already saved on this computer.
+  </div>
+
+  <form id="login-form" autocomplete="on">
+    <div class="field"><label for="li-email">Email</label>
+      <input id="li-email" type="email" autocomplete="email" required></div>
+    <div class="field"><label for="li-pw">Password</label>
+      <div class="pw-wrap"><input id="li-pw" type="password" autocomplete="current-password" required>
+        <button type="button" class="pw-eye" data-toggle="li-pw" aria-label="Show password">&#128065;</button></div></div>
+    <button class="btn primary wide" type="submit">Sign in</button>
+  </form>
+
+  <form id="signup-form" autocomplete="on" hidden>
+    <div class="field"><label for="su-name">Your name <span class="muted">(optional)</span></label>
+      <input id="su-name" type="text" autocomplete="name"></div>
+    <div class="field"><label for="su-email">Email</label>
+      <input id="su-email" type="email" autocomplete="email" required></div>
+    <div class="field"><label for="su-pw">Password <span class="muted">(at least 8 characters)</span></label>
+      <div class="pw-wrap"><input id="su-pw" type="password" autocomplete="new-password" minlength="8" required>
+        <button type="button" class="pw-eye" data-toggle="su-pw" aria-label="Show password">&#128065;</button></div></div>
+    <div class="field" id="su-code-field" hidden><label for="su-code">Sign-up code</label>
+      <input id="su-code" type="text" autocomplete="off"></div>
+    <button class="btn primary wide" type="submit">Create account</button>
+  </form>
+
+  <div id="auth-msg" class="result err" role="alert" hidden></div>
+</main>
+<script src="/static/login.js"></script>
+</body>
+</html>

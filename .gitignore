@@ -1,0 +1,7 @@
+.env
+data/
+hub.db
+hub.db-*
+__pycache__/
+*.pyc
+.venv/

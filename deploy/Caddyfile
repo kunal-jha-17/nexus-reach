@@ -1,0 +1,5 @@
+# Caddy gives you free HTTPS certificates automatically. UNTESTED template.
+# Replace leads.example.com with your domain (point its DNS at the VM first).
+leads.example.com {
+    reverse_proxy 127.0.0.1:5000
+}

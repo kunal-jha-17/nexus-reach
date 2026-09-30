@@ -1,0 +1,30 @@
+# Render Blueprint (free plan). UNTESTED template -- check it against Render's current docs.
+# Free plan: sleeps after ~15 min idle, disk is wiped on restart, outgoing SMTP (25/465/587) is blocked.
+services:
+  - type: web
+    name: nexus-reach
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt -r requirements-cloud.txt
+    startCommand: gunicorn app:app --workers 1 --threads 8 --timeout 120
+    healthCheckPath: /api/ping
+    autoDeploy: false
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: TRUST_PROXY
+        value: "1"
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: SECRET_KEY
+        generateValue: true          # copy the generated value into your password manager!
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_REGION
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
