@@ -20,7 +20,7 @@ EXACT = {
     # business
     "business_name": "business_name", "business": "business_name", "name": "business_name",
     "company": "business_name", "company_name": "business_name", "title": "business_name",
-    "organization": "business_name",
+    "organization": "business_name", "organisation": "business_name",
     # person
     "owner_name": "contact_name", "owner": "contact_name", "contact_name": "contact_name",
     "contact": "contact_name", "contact_person": "contact_name", "manager": "contact_name",
@@ -89,6 +89,12 @@ def _norm_header(h):
 def map_headers(headers):
     """Return ({header: canonical_field}, [unmapped headers])."""
     mapping, used_targets, unmapped = {}, set(), []
+    # A file with an explicit business column (Clinic Name, Company, Shop ...) AND a bare
+    # "Name" / "Title" column: the bare one is the person / their job title, not the business.
+    explicit_business = any(
+        k not in ("name", "title") and (EXACT.get(k) == "business_name"
+                                        or schema.name_header_target(k) == "business_name")
+        for k in map(_norm_header, headers))
     for h in headers:
         key = _norm_header(h)
         if key in MESSAGE_HEADERS or key in SUBJECT_HEADERS:
@@ -97,6 +103,11 @@ def map_headers(headers):
             unmapped.append(h)
             continue
         target = EXACT.get(key)
+        if explicit_business and key in ("name", "title"):
+            target = "contact_name" if key == "name" else None
+        if target is None and not any(w in key.split("_") for w in _TEXTY):
+            # any "<something> name" column: Clinic Name, Name of Practice, Shop, Owner Name ...
+            target = schema.name_header_target(key)
         if target is None and not any(w in key.split("_") for w in _TEXTY):
             for kw, tgt in KEYWORDS:
                 if kw.replace(" ", "_") in key or kw in key:
@@ -129,7 +140,7 @@ def import_rows(headers, rows, campaign="", source="import", query=""):
     summary = {"inserted": 0, "merged": 0, "skipped_empty": 0, "skipped_suppressed": 0,
                "column_mapping": mapping,
                "unmapped_columns": [h for h in unmapped if _norm_header(h) not in IGNORED],
-               "ids": []}
+               "missing_name": 0, "ids": []}
     for start in range(0, len(rows), 200):
         with db.batch():
             for row in rows[start:start + 200]:
@@ -173,6 +184,8 @@ def import_rows(headers, rows, campaign="", source="import", query=""):
                     break
                 summary["inserted" if is_new else "merged"] += 1
                 summary["ids"].append(lead_id)
+                if not norm["business_name"]:
+                    summary["missing_name"] += 1
 
                 # carry over any ready-made message that matches this lead's channel
                 if msg_cols:

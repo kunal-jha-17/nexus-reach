@@ -307,3 +307,12 @@ table.leads .chk { width: 34px; padding-right: 0; }
 }
 .pw-eye:hover { background: var(--paper); opacity: 0.85; }
 .pw-eye.is-showing { opacity: 1; color: var(--accent); }
+
+/* search suggestions (one shared dropdown, positioned under the active input) */
+.suggest {
+  position: absolute; z-index: 60; margin: 0; padding: 4px; list-style: none;
+  background: var(--surface); border: 1px solid var(--line-strong); border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(23, 26, 46, .12); max-height: 260px; overflow-y: auto;
+}
+.suggest li { padding: 6px 9px; border-radius: 4px; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.suggest li:hover, .suggest li.on { background: var(--accent-soft); color: var(--accent); }

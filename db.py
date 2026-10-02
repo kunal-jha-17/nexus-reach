@@ -6,6 +6,7 @@ judged, drafted, sent, replied. Everything else (jobs, schedules, suppression
 list, campaigns, events, settings) sits alongside it.
 """
 import json
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -263,6 +264,10 @@ def init_db():
             "WHERE status IN ('queued','running')",
             (schema.now_iso(),),
         )
+    try:
+        repair_missing_names()      # names an older import left in the notes (e.g. "Clinic Name: ...")
+    except Exception:  # noqa: BLE001 -- a tidy-up must never stop the app from opening a database
+        pass
 
 
 # ------------------------------------------------------------------ settings
@@ -594,6 +599,82 @@ def select_ids(filters=None, limit=None):
         sql += f" LIMIT {int(limit)}"
     with get_conn() as conn:
         return [r["id"] for r in conn.execute(sql, params).fetchall()]
+
+
+def repair_missing_names():
+    """Leads imported before name columns like "Clinic Name" were recognised have a blank
+    business name, with the real one parked in their notes as "Clinic Name: Acme Dental".
+    Move it back where it belongs. Safe to run any number of times. Returns how many were fixed."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT id, notes FROM leads WHERE business_name = '' AND notes LIKE '%:%'").fetchall()
+    fixed = 0
+    for r in rows:
+        parts = [p for p in (r["notes"] or "").split("; ")]
+        for i, part in enumerate(parts):
+            header, sep, value = part.partition(": ")
+            key = re.sub(r"[^a-z0-9]+", "_", header.strip().lower()).strip("_")
+            if sep and value.strip() and len(header) <= 60 and schema.name_header_target(key) == "business_name":
+                update_lead(r["id"], {"business_name": value.strip(),
+                                      "notes": "; ".join(parts[:i] + parts[i + 1:])})
+                fixed += 1
+                break
+    return fixed
+
+
+def listing_urls():
+    """Every Google Maps / Yelp listing URL already stored, so a scrape can skip
+    listings it has saved before instead of opening them again."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT google_maps_url g, yelp_url y FROM leads "
+                            "WHERE google_maps_url != '' OR yelp_url != ''").fetchall()
+    return [u for r in rows for u in (r["g"], r["y"]) if u]
+
+
+SUGGEST_FIELDS = ("scrape_query", "scrape_location", "lead_search")
+
+
+def suggest(field, q, limit=8):
+    """Autocomplete built only from this account's own history: past scrape searches and
+    locations, and the names / cities / trades of leads already here. No outside service."""
+    if field not in SUGGEST_FIELDS:
+        raise ValueError("Unknown suggestion field")
+    q = re.sub(r"\s+", " ", (q or "")).strip()
+    if len(q) < 3:
+        return []
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    limit = max(1, min(int(limit or 8), 20))
+    cands = []
+    with get_conn() as conn:
+        if field in ("scrape_query", "scrape_location"):
+            key = "query" if field == "scrape_query" else "location"
+            for r in conn.execute("SELECT params FROM jobs WHERE kind = 'scrape' ORDER BY id DESC LIMIT 300"):
+                try:
+                    cands.append((json.loads(r["params"] or "{}") or {}).get(key))
+                except (ValueError, AttributeError):
+                    continue
+            cands += [r["v"] for r in conn.execute(f"SELECT {key} v FROM schedules ORDER BY id DESC LIMIT 100")]
+            if field == "scrape_query":
+                cands += [r["v"] for r in conn.execute(
+                    "SELECT last_query v, COUNT(*) c FROM leads WHERE last_query LIKE ? ESCAPE '\\' "
+                    "GROUP BY last_query ORDER BY c DESC LIMIT 20", (like,))]
+            else:
+                cands += [f"{r['city']}, {r['state']}" if r["state"] else r["city"] for r in conn.execute(
+                    "SELECT city, state, COUNT(*) c FROM leads WHERE city LIKE ? ESCAPE '\\' "
+                    "GROUP BY city, state ORDER BY c DESC LIMIT 20", (like,))]
+        else:
+            for col in ("business_name", "city", "contact_name", "trade"):
+                cands += [r["v"] for r in conn.execute(
+                    f"SELECT {col} v, COUNT(*) c FROM leads WHERE {col} LIKE ? ESCAPE '\\' "
+                    f"GROUP BY {col} ORDER BY c DESC, {col} LIMIT ?", (like, limit))]
+    ql, seen, starts, contains = q.lower(), set(), [], []
+    for c in cands:
+        c = re.sub(r"\s+", " ", str(c or "")).strip()
+        cl = c.lower()
+        if not c or cl in seen or ql not in cl or cl == ql:
+            continue
+        seen.add(cl)
+        (starts if cl.startswith(ql) else contains).append(c[:120])
+    return (starts + contains)[:limit]
 
 
 # -------------------------------------------------------------------- events

@@ -123,7 +123,9 @@ def build_prompt(lead, settings, template_text=None, seed=0):
     parts.append(
         f"{length_rule}Be specific and human -- write like a real person messaging someone they're "
         "genuinely interested in, not a mail-merge. Vary sentence rhythm. Use ONLY the facts listed "
-        "below; never invent details (services, years in business, reviews, prices). "
+        "below; never invent details (services, years in business, reviews, prices). Never leave "
+        "a placeholder such as {name} or [Business Name] in the message -- use the real detail, or "
+        "reword so it isn't needed. "
         f"For this message, {style}. {note}\n\n"
         f"ABOUT THE LEAD:\n{lead_facts(lead)}\n\n"
         "Return only the message text, nothing else."
@@ -138,6 +140,19 @@ def _clean_message(text, channel):
     return t.strip()
 
 
+def final_message(lead, text=None):
+    """The message exactly as it will go out: every {name} / [Business Name] style placeholder
+    replaced with this lead's details. Refuses (SendError) while any placeholder is still
+    unfilled, so a message can never be sent reading 'Hi {name}' or 'Hi ,'."""
+    filled, missing = schema.fill_placeholders(lead["message"] if text is None else text, lead)
+    if missing:
+        raise SendError(
+            f"This message still contains {', '.join(missing[:4])} and "
+            f"{lead.get('business_name') or 'this lead'} has nothing to put there. Fill in the missing "
+            "detail on the lead (e.g. its business name) or edit the message, then send again.", 400)
+    return filled
+
+
 def draft_message(lead_id, selection="", index=0, settings=None):
     """Draft (or redraft) the message for one lead and save it."""
     lead = db.get_lead(lead_id)
@@ -146,9 +161,12 @@ def draft_message(lead_id, selection="", index=0, settings=None):
     # the lead's campaign may override the about-you text, templates and channel order
     settings = settings or db.effective_settings(lead["campaign"])
     name, body = resolve_template(settings.get("templates"), lead["channel"], selection, index)
+    if body:
+        body, _ = schema.fill_placeholders(body, lead)      # the AI sees real names, not {name}
     prompt = build_prompt(lead, settings, body, seed=index)
     text = _clean_message(llm.complete(prompt, task="draft", max_tokens=900, temperature=0.8),
                           lead["channel"])
+    text, _ = schema.fill_placeholders(text, lead)          # and anything it copied through
     db.update_lead(lead_id, {"message": text, "template_used": name or ""})
     db.add_event(lead_id, "drafted", name or "no template")
     return {"message": text, "template_used": name or ""}
@@ -361,7 +379,7 @@ def send_lead_email(lead_id, force=False):
         raise SendError("Already sent. Use a follow-up instead.", 400)
     _ensure_sending_started(settings)
 
-    subject, body = split_subject(lead["message"], lead)
+    subject, body = split_subject(final_message(lead), lead)
     msg = build_email(lead, subject, body, settings)
     try:
         _deliver(msg)
@@ -437,7 +455,8 @@ def send_followup(lead_id):
     prompt = (
         "Write a brief, friendly follow-up (1-2 sentences) to the earlier outreach message below, "
         "since there's been no reply. Light and low-pressure; don't repeat the whole pitch.\n"
-        f"Earlier message:\n{lead['message']}\n\nBusiness: {lead['business_name']}\n"
+        f"Earlier message:\n{schema.fill_placeholders(lead['message'], lead)[0]}\n\n"
+        f"Business: {lead['business_name']}\n"
         "Return only the follow-up text, nothing else."
     )
     try:
@@ -445,7 +464,8 @@ def send_followup(lead_id):
     except llm.LLMError as e:
         raise SendError(f"Couldn't write the follow-up: {e}", 502)
 
-    orig = _original_subject(lead_id) or f"Quick question for {lead['business_name']}"
+    text = final_message(lead, text)
+    orig = _original_subject(lead_id) or f"Quick question for {lead['business_name'] or 'you'}"
     subject = orig if orig.lower().startswith("re:") else f"Re: {orig}"
     msg = build_email(lead, subject, text, settings, in_reply_to=lead["email_message_id"])
     try:

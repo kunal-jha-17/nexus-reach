@@ -427,3 +427,108 @@ def to_bool_int(v):
     if isinstance(v, str):
         return 1 if v.strip().lower() in ("1", "true", "yes", "y", "on") else 0
     return 1 if v else 0
+
+
+# ------------------------------------------------------- name columns & placeholders
+
+# Bare column headers that mean "the business", whatever kind of business it is.
+ENTITY_HEADERS = {
+    "clinic", "practice", "shop", "store", "restaurant", "hospital", "firm", "agency", "salon",
+    "studio", "brand", "vendor", "merchant", "establishment", "organisation", "org", "account",
+    "dba", "venue", "hotel", "gym", "pharmacy", "office", "dealer", "dealership", "contractor",
+}
+# "<these> name" is a person, not the business.
+_PERSON_WORDS = {"first", "full", "contact", "owner", "person", "manager", "doctor", "dr", "dentist",
+                 "physician", "founder", "ceo", "director", "poc", "rep", "agent", "given"}
+# "<these> name" is neither (kept in notes like any other unmatched column).
+_NOT_A_NAME = {"last", "sur", "middle", "family", "nick", "maiden", "user", "file", "campaign",
+               "template", "domain", "host", "city", "state", "country", "street", "county", "category",
+               "source", "list", "sheet", "column", "product", "service", "plan", "package", "event",
+               "job", "role", "position", "email", "phone", "sender", "from", "my", "our", "your"}
+
+
+def name_header_target(key):
+    """Which lead field a column header names, judged only from the header text:
+    'business_name' for clinic_name / name_of_practice / shop / companyname ...,
+    'contact_name' for first_name / owner_name / doctor_name ..., else None.
+    `key` is a header lowercased with non-alphanumerics turned into underscores."""
+    key = (key or "").strip("_")
+    if not key:
+        return None
+    if key in ENTITY_HEADERS:
+        return "business_name"
+    tokens = [t for t in key.split("_") if t]
+    if "name" not in tokens:
+        if len(tokens) == 1 and key.endswith("name") and len(key) > 4:      # clinicname, firstname
+            tokens = [key[:-4], "name"]
+        elif len(tokens) == 1 and key in ("fname",):
+            return "contact_name"
+        else:
+            return None
+    rest = {t for t in tokens if t not in ("name", "of", "the", "s")}
+    if rest & _NOT_A_NAME:
+        return None
+    if rest & _PERSON_WORDS:
+        return "contact_name"
+    return "business_name"
+
+
+_PH_FIELDS = {
+    "business_name": "business_name", "business": "business_name", "company": "business_name",
+    "company_name": "business_name", "name": "business_name", "biz_name": "business_name",
+    "organization": "business_name", "organization_name": "business_name",
+    "contact_name": "contact_name", "contact": "contact_name", "owner": "contact_name",
+    "owner_name": "contact_name", "full_name": "contact_name",
+    "first_name": "first_name", "firstname": "first_name",
+    "city": "city", "state": "state", "trade": "trade", "phone": "phone", "email": "email",
+    "website": "website", "address": "address", "location": "location",
+}
+_PH_RE = re.compile(
+    r"\{\{\s*([^{}\n]{1,40}?)\s*\}\}"            # {{Clinic Name}}
+    r"|\{\s*([^{}\n]{1,40}?)\s*\}"               # {business_name}
+    r"|<<\s*([^<>\n]{1,40}?)\s*>>"               # <<name>>
+    r"|\[\s*([A-Za-z][A-Za-z _\-]{1,38}?)\s*\]"  # [Business Name]
+)
+
+
+def _placeholder_value(token, lead):
+    key = re.sub(r"[^a-z0-9]+", "_", token.lower()).strip("_")
+    field = _PH_FIELDS.get(key)
+    if field is None:
+        target = name_header_target(key)
+        field = {"business_name": "business_name", "contact_name": "contact_name"}.get(target)
+    if field is None:
+        return None, False                       # not a placeholder we know
+    if field == "first_name":
+        words = [w for w in (lead.get("contact_name") or "").split()
+                 if w.lower().strip(".") not in ("dr", "mr", "mrs", "ms", "miss", "prof", "sir")]
+        value = words[0] if words else ""
+    elif field == "location":
+        value = ", ".join(x for x in (lead.get("city"), lead.get("state")) if x)
+    elif field == "trade":
+        value = (lead.get("trade") or "").replace("_", " ")
+    else:
+        value = lead.get(field) or ""
+    return str(value).strip(), True
+
+
+def fill_placeholders(text, lead):
+    """Replace {name} / {{Clinic Name}} / [Business Name] / <<company>> style placeholders with
+    the lead's real details. Returns (text, unresolved): `unresolved` lists the placeholders that
+    are still in the text -- a known one whose value is blank for this lead, or any {curly} /
+    {{double curly}} / <<angle>> token that isn't recognised. Square brackets are only touched
+    when they hold a known placeholder, so ordinary [bracketed] text is left alone."""
+    unresolved = []
+
+    def sub(m):
+        token = next(g for g in m.groups() if g is not None)
+        square = m.group(4) is not None
+        value, known = _placeholder_value(token, lead or {})
+        if known and value:
+            return value
+        if known or not square:
+            if m.group(0) not in unresolved:
+                unresolved.append(m.group(0))
+        return m.group(0)
+
+    return _PH_RE.sub(sub, text or ""), unresolved

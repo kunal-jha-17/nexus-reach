@@ -466,6 +466,11 @@ def create_app(start_threads=True):
                                (b.get("campaign") or "").strip(), bool(b.get("only_no_website")))
         return jsonify({"job_id": job_id})
 
+    @app.route("/api/suggest")
+    def suggest():
+        # Autocomplete from the signed-in account's own history only (see db.suggest).
+        return jsonify({"suggestions": db.suggest(request.args.get("field", ""), request.args.get("q", ""))})
+
     @app.route("/api/schedules", methods=["GET"])
     def schedules_list():
         rows = db.list_schedules()
@@ -600,6 +605,12 @@ def create_app(start_threads=True):
             return jsonify(outreach.draft_message(lead_id, body().get("template", "")))
         except llm.LLMError as e:
             return jsonify({"error": f"The AI call failed: {e}"}), 502
+
+    @app.route("/api/leads/<int:lead_id>/final-message", methods=["POST"])
+    def lead_final_message(lead_id):
+        # What will actually be sent / pasted: placeholders filled, or a 400 saying what's missing.
+        text = body().get("message")
+        return jsonify({"message": outreach.final_message(need_lead(lead_id), text if isinstance(text, str) else None)})
 
     @app.route("/api/leads/<int:lead_id>/send-email", methods=["POST"])
     def lead_send_email(lead_id):

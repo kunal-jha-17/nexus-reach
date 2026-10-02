@@ -235,11 +235,92 @@ $('#imp-go').addEventListener('click', () => run(async () => {
       (r.skipped_empty ? `, ${r.skipped_empty} empty rows skipped` : '') +
       (r.skipped_suppressed ? `, ${r.skipped_suppressed} on do-not-contact skipped` : '') +
       `<div class="sub">Matched: ${esc(map || 'nothing')}${r.unmapped_columns.length ? ' · Not matched (kept in notes if short): ' + esc(r.unmapped_columns.join(', ')) : ''}</div>`;
+    if (r.missing_name) {
+      box.innerHTML += `<div class="sub bad-text"><b>${r.missing_name} of these have no business name.</b> No column looked like a name &mdash; rename that column to "Business Name" in the file and import it again (existing leads are updated, not duplicated).</div>`;
+    }
     box.hidden = false;
     $('#imp-file').value = '';
     loadCampaigns();
-  } catch (e) { box.className = 'result err'; box.textContent = e.message; box.hidden = false; }
+    toast(`Import finished: ${r.inserted} new, ${r.merged} already known` + (r.missing_name ? ` (${r.missing_name} without a name)` : '') + '.', r.missing_name ? 'err' : 'ok');
+  } catch (e) { box.className = 'result err'; box.textContent = e.message; box.hidden = false; toast('Import failed: ' + e.message, 'err'); }
 }));
+
+/* ------------------------------------------------------------ suggestions */
+// A dropdown of this account's own past searches / locations / lead names, shown after
+// 3+ characters. One shared list element, positioned under whichever input is active.
+const suggestBox = document.createElement('ul');
+suggestBox.className = 'suggest'; suggestBox.id = 'suggest-box'; suggestBox.hidden = true;
+suggestBox.setAttribute('role', 'listbox');
+document.body.appendChild(suggestBox);
+const sg = { input: null, items: [], active: -1, timer: null, seq: 0 };
+
+function hideSuggest() {
+  suggestBox.hidden = true; sg.items = []; sg.active = -1;
+  if (sg.input) sg.input.setAttribute('aria-expanded', 'false');
+}
+function placeSuggest() {
+  if (!sg.input || suggestBox.hidden) return;
+  const r = sg.input.getBoundingClientRect();
+  suggestBox.style.left = `${r.left + window.scrollX}px`;
+  suggestBox.style.top = `${r.bottom + window.scrollY + 2}px`;
+  suggestBox.style.width = `${r.width}px`;
+}
+function paintSuggest() {
+  suggestBox.innerHTML = sg.items.map((t, i) =>
+    `<li role="option" id="suggest-${i}" data-i="${i}" class="${i === sg.active ? 'on' : ''}" aria-selected="${i === sg.active}">${esc(t)}</li>`).join('');
+  if (sg.input) sg.input.setAttribute('aria-activedescendant', sg.active >= 0 ? `suggest-${sg.active}` : '');
+}
+function pickSuggest(i) {
+  const input = sg.input, value = sg.items[i];
+  if (!input || value == null) return;
+  input.value = value;
+  hideSuggest();
+  sg.skipNext = true;                                           // don't re-suggest for our own event
+  input.dispatchEvent(new Event('input', { bubbles: true }));   // so live filters re-run
+  sg.skipNext = false;
+}
+function attachSuggest(sel, field) {
+  const input = $(sel); if (!input) return;
+  input.setAttribute('autocomplete', 'off'); input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list'); input.setAttribute('aria-controls', 'suggest-box');
+  input.setAttribute('aria-expanded', 'false');
+  input.addEventListener('input', () => {
+    if (sg.skipNext) { sg.skipNext = false; return; }           // the input event we fired ourselves
+    clearTimeout(sg.timer);
+    const q = input.value.trim();
+    if (q.length < 3) { hideSuggest(); return; }
+    const seq = ++sg.seq;
+    sg.timer = setTimeout(async () => {
+      let r;
+      try { r = await api(`/api/suggest?field=${field}&q=${encodeURIComponent(q)}`); } catch (e) { return; }
+      if (seq !== sg.seq || document.activeElement !== input) return;   // a newer keystroke won
+      sg.input = input; sg.items = r.suggestions || []; sg.active = -1;
+      if (!sg.items.length) { hideSuggest(); return; }
+      suggestBox.hidden = false; input.setAttribute('aria-expanded', 'true');
+      paintSuggest(); placeSuggest();
+    }, 180);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (suggestBox.hidden || sg.input !== input) return;
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault();
+      const n = sg.items.length;
+      sg.active = e.key === 'ArrowDown' ? (sg.active + 1) % n : (sg.active - 1 + n) % n;
+      paintSuggest();
+    } else if (e.key === 'Enter' && sg.active >= 0) { e.preventDefault(); pickSuggest(sg.active); }
+    else if (e.key === 'Escape') { hideSuggest(); }
+  });
+  input.addEventListener('blur', () => setTimeout(() => { if (sg.input === input) hideSuggest(); }, 150));
+}
+suggestBox.addEventListener('mousedown', (e) => {               // mousedown: fires before the input's blur
+  const li = e.target.closest('li'); if (!li) return;
+  e.preventDefault(); pickSuggest(+li.dataset.i);
+});
+window.addEventListener('resize', placeSuggest);
+window.addEventListener('scroll', placeSuggest, true);
+attachSuggest('#sc-query', 'scrape_query');
+attachSuggest('#sc-location', 'scrape_location');
+attachSuggest('#f-q', 'lead_search');
 
 /* ------------------------------------------------------------ leads table */
 function filterValues() {
@@ -644,8 +725,11 @@ function channelUrl(l, msg) {
   }
 }
 async function copyAndOpen(l, msgOverride) {
-  const msg = msgOverride ?? l.message ?? '';
-  if (!msg.trim()) throw new Error('This lead has no message yet — generate one first.');
+  const raw = msgOverride ?? l.message ?? '';
+  if (!raw.trim()) throw new Error('This lead has no message yet — generate one first.');
+  // The server fills {name}-style placeholders with this lead's details, and refuses
+  // (with a message saying what's missing) rather than hand back a half-filled message.
+  const msg = (await api(`/api/leads/${l.id}/final-message`, { method: 'POST', body: { message: raw } })).message;
   try { await navigator.clipboard.writeText(msg); toast('Message copied — paste it in.', 'ok'); }
   catch (e) { toast('Could not copy automatically — select the text and copy it yourself.', 'err'); }
   const url = channelUrl(l, msg);

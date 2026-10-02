@@ -135,8 +135,9 @@
 
         <div class="card">
           <h2>Scrape now</h2>
-          <p class="hint">Runs a real browser in the background. Scrapers are untested against the live
-             sites &mdash; if a run returns 0 results, check the run log below.</p>
+          <p class="hint">Runs a real browser in the background and saves each lead as it's found, so nothing is
+             lost if a run is interrupted &mdash; start the same search again and it carries on. If a run returns
+             0 results, check the run log below.</p>
           <div id="sc-nobrowser" class="notice" hidden></div>
           <div class="row">
             <div class="field"><label for="sc-platform">Where</label>
@@ -147,7 +148,7 @@
               </select></div>
             <div class="field"><label for="sc-max">Listings to check</label><input id="sc-max" type="number" min="1" max="200" value="30"></div>
           </div>
-          <label class="check"><input type="checkbox" id="sc-nosite" checked> Only keep businesses with <b>no website</b> (skips the ones your offer wouldn't fit)</label>
+          <label class="check"><input type="checkbox" id="sc-nosite" checked> <span>Only keep businesses with <b>no website</b> (skips the ones your offer wouldn't fit)</span></label>
           <p class="hint" id="sc-nosite-hint" style="margin-top:-6px">With this on, "listings to check" is how many are looked at, not how many are kept &mdash;
              expect roughly a quarter to a half to survive.</p>
           <div class="field"><label for="sc-query" id="sc-query-label">Search</label>
