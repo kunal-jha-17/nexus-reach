@@ -22,12 +22,24 @@ import db
 import schema
 
 
+def safe_cell(v):
+    """A value for a CSV cell. Text that a spreadsheet would run as a formula ("=HYPERLINK(...)",
+    "@SUM(...)" -- a scraped business name can be anything) gets a leading apostrophe, which
+    Excel and Google Sheets show as plain text. Ordinary numbers and phone numbers (+1 214...) are
+    left alone, and the importer takes the apostrophe back off."""
+    if v is None:
+        return ""
+    if isinstance(v, str) and v and (v[0] in "=@\t\r" or (v[0] in "+-" and not v[1:2].isdigit() and v[1:2] != " ")):
+        return "'" + v
+    return v
+
+
 def _csv_bytes(header, rows):
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(header)
     for r in rows:
-        w.writerow(["" if v is None else v for v in r])
+        w.writerow([safe_cell(v) for v in r])
     return buf.getvalue().encode("utf-8")
 
 

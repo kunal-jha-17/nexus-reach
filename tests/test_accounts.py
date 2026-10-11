@@ -237,7 +237,7 @@ class TestJobsRunAsTheRightUser(AccountsBase):
             with self.ctx(u):
                 db.create_schedule("google_maps", q, "Dallas, TX", 10, "camp", 24)
         launched = []
-        jobs.run_scheduler_once(lambda platform, query, loc, n, camp:
+        jobs.run_scheduler_once(lambda platform, query, loc, n, camp, nosite:
                                 launched.append((userctx.get_user()["email"], query, camp)))
         self.assertEqual(sorted(launched), [("a@example.com", "plumbers", "camp"), ("b@example.com", "roofers", "camp")])
         launched.clear()

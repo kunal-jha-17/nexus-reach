@@ -16,7 +16,9 @@ const CHANNEL_LABEL = { email: 'Email', yelp: 'Yelp', facebook: 'Facebook', inst
 const TRADES = ['', 'hvac', 'plumbing', 'electrical', 'pest_control', 'roofing', 'other'];
 const TRADE_LABEL = { '': '—', hvac: 'HVAC', plumbing: 'Plumbing', electrical: 'Electrical',
   pest_control: 'Pest control', roofing: 'Roofing', other: 'Other' };
-const JOB_LABEL = { scrape: 'Scrape', enrich: 'Enrich', judge: 'Judge fit', draft: 'Draft', send_bulk: 'Send emails' };
+const JOB_LABEL = { scrape: 'Scrape', enrich: 'Enrich', judge: 'Judge fit', draft: 'Write messages', send_bulk: 'Send emails',
+  pipeline: 'Enrich → judge → draft', followups: 'Follow-ups' };
+const DAY_LABEL = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 const state = {
   view: 'dashboard', settings: null, config: null, campaigns: [], defaultCriteria: '',
@@ -30,24 +32,36 @@ async function api(path, { method = 'GET', body } = {}) {
   const opts = { method, headers: { 'X-Requested-With': 'fetch' } };
   if (body instanceof FormData) opts.body = body;
   else if (body !== undefined) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
-  const res = await fetch(path, opts);
+  let res;
+  try { res = await fetch(path, opts); }
+  catch (e) { setOffline(true); throw new Error("Can't reach the server — it may be restarting. Try again in a moment."); }
   if (res.status === 401) { location.href = '/login'; throw new Error('Please sign in.'); }
   let data = null;
   try { data = await res.json(); } catch (e) { /* not JSON */ }
+  // 502/503/504 with no message of our own = the host's "service unavailable" page: the app is restarting
+  const down = [502, 503, 504].includes(res.status) && !(data && data.error);
+  setOffline(down);
+  if (down) throw new Error('The server is restarting — give it a minute, then try again.');
   if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status})`);
   return data;
 }
+function setOffline(on) { const el = $('#offline'); if (el) el.hidden = !on; }
 
 function toast(msg, kind = '') {
+  // the same message twice in a row is one message (a restart used to stack six identical errors)
+  const dup = $$('#toasts .toast').find((t) => t.textContent === msg);
+  if (dup) { clearTimeout(dup._t); dup._t = setTimeout(() => dup.remove(), kind === 'err' ? 7000 : 3500); return; }
   const el = document.createElement('div');
   el.className = `toast ${kind}`;
   el.textContent = msg;
   $('#toasts').appendChild(el);
-  setTimeout(() => el.remove(), kind === 'err' ? 7000 : 3500);
+  el._t = setTimeout(() => el.remove(), kind === 'err' ? 7000 : 3500);
 }
 const fail = (e) => toast(e.message || String(e), 'err');
 async function run(fn) { try { return await fn(); } catch (e) { fail(e); } }
 
+function plural(n, one, many) { return `${n} ${n === 1 ? one : (many || one + 's')}`; }
+function badge(sel, n) { const el = $(sel); if (!el) return; el.hidden = !n; el.textContent = n; }
 function ago(iso) {
   if (!iso) return '';
   const s = (Date.now() - new Date(iso).getTime()) / 1000;
@@ -76,8 +90,15 @@ function route() {
   let [view, param] = parseHash();
   if (!VIEWS.includes(view)) view = 'dashboard';
   if (view === 'campaign' && !param) view = 'campaigns';
-  state.view = view;
+  const sameView = state.shown === view;
+  state.view = view; state.shown = view;
   if (view === 'campaign') state.campaign = param;
+  if (view === 'settings') {
+    showSettingsTab(param);
+    // Moving between Settings tabs must not reload the form: that would throw away
+    // whatever was typed on the tab just left, before it was saved.
+    if (sameView) return;
+  }
   VIEWS.forEach((v) => { $(`#view-${v}`).hidden = v !== view; });
   $$('.rail a[data-view]').forEach((a) => a.classList.toggle('active', a.dataset.view === view));
   renderRailCampaigns();
@@ -99,7 +120,7 @@ async function loadCampaigns() {
     el.innerHTML = opt('', 'All campaigns') + extra + list.map((c) => opt(c.name, `${c.name} (${c.leads})`, c.name === cur)).join('');
     if ([...el.options].some((o) => o.value === cur)) el.value = cur;
   };
-  ['#dash-campaign', '#en-campaign', '#ju-campaign', '#dr-campaign'].forEach((s) => fill(s, active));
+  ['#dash-campaign', '#en-campaign', '#ju-campaign', '#dr-campaign', '#pl-campaign'].forEach((s) => fill(s, active));
   fill('#f-campaign', d.campaigns, opt('__none__', `No campaign (${d.unassigned})`));
   $('#campaign-list').innerHTML = active.map((c) => `<option value="${esc(c.name)}">`).join('');
   renderRailCampaigns();
@@ -122,55 +143,77 @@ function templateOptions(selected = '', list = null) {
 }
 
 /* ------------------------------------------------------------ dashboard */
+function repliesHtml(list, emptyText) {
+  return list.length ? list.map((r) =>
+    `<div class="list-row"><div class="grow"><b>${esc(r.business_name || '(no name)')}</b>
+       ${r.campaign ? `<span class="chip">${esc(r.campaign)}</span>` : ''} <span class="muted">${ago(r.replied_at)}</span>
+       <div class="sub quote">${r.snippet ? '“' + esc(String(r.snippet).replace(/\s+/g, ' ').slice(0, 160)) + '”' : 'Marked as replied'}</div></div>
+     <button class="btn small primary" data-open="${r.id}">Open</button></div>`).join('')
+    : `<div class="empty small"><b>No replies waiting</b>${esc(emptyText)}</div>`;
+}
+
 async function loadDashboard() {
   await Promise.all([loadCampaigns(), loadSettings(), loadConfig()]);
-  const camp = $('#dash-campaign').value;
-  const s = await api('/api/stats' + (camp ? `?campaign=${encodeURIComponent(camp)}` : ''));
-  const st = s.by_stage, sent = s.by_send_status.sent || 0;
+  const camp = $('#dash-campaign').value, q = camp ? `?campaign=${encodeURIComponent(camp)}` : '';
+  const [s, replies] = await Promise.all([api('/api/stats' + q), api('/api/replies' + q)]);
+  const st = s.by_stage, sent = s.by_send_status.sent || 0, e = s.email;
+  const answered = (st.replied || 0) + (st.qualified || 0) + (st.won || 0);
   const tiles = [
-    ['Leads', s.total], ['Fit your criteria', s.fit.yes], ['Messages drafted', s.drafted],
-    ['Contacted', sent], ['Replied', st.replied || 0], ['Won', st.won || 0],
+    ['Leads', s.total], ['Fit your criteria', s.fit.yes], ['Messages written', s.drafted],
+    ['Contacted', sent], ['Replied', answered, sent ? `${Math.round((answered / sent) * 100)}% of contacted` : ''], ['Won', st.won || 0],
   ];
-  $('#dash-tiles').innerHTML = tiles.map(([l, n]) => `<div class="tile"><div class="n">${n}</div><div class="l">${esc(l)}</div></div>`).join('');
+  $('#dash-tiles').innerHTML = tiles.map(([l, n, sub]) =>
+    `<div class="tile"><div class="n">${n}</div><div class="l">${esc(l)}</div>${sub ? `<div class="s">${esc(sub)}</div>` : ''}</div>`).join('');
 
   const next = [];
-  if (!s.total) next.push(['Import a CSV or run a scrape to get your first leads.', 'Find leads', 'find']);
+  if (!s.total) next.push(['Import a list or run a scrape to get your first leads.', 'Find leads', 'find']);
   else {
-    if (s.total - s.enriched > 0) next.push([`${s.total - s.enriched} leads haven't been enriched yet.`, 'Enrich', 'pipeline']);
-    if (s.fit.unjudged > 0) next.push([`${s.fit.unjudged} leads haven't been judged against your criteria.`, 'Judge fit', 'pipeline']);
-    if (s.fit.yes > s.drafted) next.push([`${s.fit.yes - s.drafted} qualifying leads have no message yet.`, 'Draft messages', 'outreach']);
-    if (s.email.followups_due > 0) next.push([`${s.email.followups_due} follow-ups are due.`, 'Send follow-ups', 'outreach']);
-    if (!next.length) next.push(['Nothing waiting. Find more leads, or work the Outreach tab.', 'Outreach', 'outreach']);
+    if (replies.length) next.push([`${plural(replies.length, 'person', 'people')} replied and ${replies.length === 1 ? 'is' : 'are'} waiting for an answer.`, 'Answer them', 'outreach']);
+    const todo = (s.total - s.enriched) + s.fit.unjudged;
+    if (todo > 0) next.push([`${plural(s.total - s.enriched, 'lead')} to enrich and ${s.fit.unjudged} to judge.`, 'Run all steps', 'pipeline']);
+    if (s.fit.yes > s.drafted) next.push([`${plural(s.fit.yes - s.drafted, 'qualifying lead')} ${s.fit.yes - s.drafted === 1 ? 'has' : 'have'} no message yet.`, 'Write messages', 'outreach']);
+    if (e.followups_due + e.hand_followups_due > 0) next.push([`${plural(e.followups_due + e.hand_followups_due, 'follow-up')} due.`, 'Follow up', 'outreach']);
+    if (!next.length) next.push(['Nothing waiting. Find more leads, or work the Outreach tab.', 'Find leads', 'find']);
   }
-  $('#dash-next').innerHTML = next.slice(0, 4).map(([t, b, v]) =>
+  $('#dash-next').innerHTML = next.slice(0, 5).map(([t, b, v]) =>
     `<div class="next-item"><span>${esc(t)}</span><a class="btn small" href="#${v}">${esc(b)}</a></div>`).join('');
+
+  badge('#dash-replies-n', replies.length);
+  $('#dash-replies').innerHTML = repliesHtml(replies.slice(0, 5), e.imap_configured
+    ? 'Replies to your emails show up here on their own.' : 'Connect your inbox under Settings → Connections and replies show up here on their own.');
 
   const maxStage = Math.max(1, ...STAGES.map((k) => st[k] || 0));
   $('#dash-stages').innerHTML = STAGES.map((k) =>
     `<div class="stagebar"><span>${k}</span><span class="track"><i style="width:${((st[k] || 0) / maxStage) * 100}%"></i></span><span class="num">${st[k] || 0}</span></div>`).join('');
 
   const active = state.campaigns.filter((c) => c.status !== 'archived');
-  $('#dash-campaigns').innerHTML = active.length ? active.map((c) =>
-    `<div class="qrow"><a href="${campaignHash(c.name)}"><b>${esc(c.name)}</b></a>
-       <span class="muted">${c.leads} leads · ${c.contacted} contacted · ${c.replied} replied · ${c.won} won</span></div>`).join('')
-    : '<div class="empty"><b>No campaigns yet</b>Create one in <a href="#campaigns">Campaigns</a> — or import a CSV with a campaign name and it appears automatically.</div>';
+  $('#dash-campaigns').innerHTML = active.length ? `<div class="camp-table"><div class="camp-row head"><span>Campaign</span><span>Leads</span><span>Fit</span><span>Contacted</span><span>Replied</span><span>Won</span></div>` + active.map((c) =>
+    `<a class="camp-row" href="${campaignHash(c.name)}"><span><b>${esc(c.name)}</b></span><span>${c.leads}</span><span>${c.fit_yes}</span>
+       <span>${c.contacted}</span><span>${c.replied}</span><span>${c.won}</span></a>`).join('') + '</div>'
+    : '<div class="empty small"><b>No campaigns yet</b>Create one in <a href="#campaigns">Campaigns</a> — or import a list with a campaign name and it appears automatically.</div>';
 
-  const e = s.email;
+  const checked = !e.imap_configured ? 'inbox not connected' : !e.reply_check_minutes ? 'only when you press Check'
+    : e.last_reply_check_at ? `checked ${ago(e.last_reply_check_at)}` : `every ${e.reply_check_minutes} min`;
   $('#dash-budgets').innerHTML =
     `<div class="kv"><span>Emails sent today</span><b>${e.sent_today} of ${e.daily_limit}${e.warmup_active ? ' (warming up)' : ''}</b></div>` +
-    `<div class="kv"><span>Follow-ups due</span><b>${e.followups_due}</b></div>` +
+    (e.window_open ? '' : `<div class="kv"><span>Sending hours</span><b class="warn-text">closed right now</b></div>`) +
+    `<div class="kv"><span>Follow-ups due</span><b>${e.followups_due} by email · ${e.hand_followups_due} by hand</b></div>` +
+    `<div class="kv"><span>Replies</span><b>${esc(checked)}</b></div>` +
     `<div class="kv"><span>Web searches this month</span><b>${s.serpapi_used} of ${s.serpapi_limit}</b></div>` +
     `<div class="kv"><span>On do-not-contact</span><b>${s.dnc}</b></div>`;
 }
 $('#dash-campaign').addEventListener('change', () => run(loadDashboard));
+$('#view-dashboard').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-open]'); if (b) run(() => openLead(+b.dataset.open));
+});
 
 /* ------------------------------------------------------------ find leads */
 function syncScrapeForm() {
   const p = $('#sc-platform').value;
   $('#sc-query-label').textContent = p === 'instagram' ? 'Hashtag' : 'Search';
-  $('#sc-query').placeholder = p === 'instagram' ? 'dallasrealestate' : 'plumbers';
+  $('#sc-query').placeholder = p === 'instagram' ? 'dallasrealestate' : 'AC repair; furnace repair';
   $('#sc-location').closest('.field').hidden = p === 'instagram';
-  $('#sc-location').placeholder = p === 'yelp' ? 'Dallas, TX (required)' : 'Dallas, TX';
+  $('#sc-location').placeholder = p === 'yelp' ? 'Dallas, TX (required)' : 'Garland, TX; Mesquite, TX';
 }
 $('#sc-platform').addEventListener('change', syncScrapeForm);
 
@@ -194,20 +237,21 @@ async function loadFind() {
   const list = await api('/api/schedules');
   $('#schedule-list').innerHTML = list.length ? list.map((s) =>
     `<div class="list-row"><div class="grow"><b>${esc(s.query)}</b> ${esc(s.location || '')}
-       <div class="sub">${esc(s.platform.replace('_', ' '))} · every ${s.interval_hours} h · ${s.last_run_at ? 'last ran ' + ago(s.last_run_at) : 'not run yet'}${s.campaign ? ' · ' + esc(s.campaign) : ''}</div></div>
+       <div class="sub">${esc(s.platform.replace('_', ' '))} · up to ${s.max_results} each · every ${s.interval_hours} h${s.only_no_website ? ' · no-website only' : ''} · ${s.last_run_at ? 'last ran ' + ago(s.last_run_at) : 'not run yet'}${s.campaign ? ' · ' + esc(s.campaign) : ''}${s.active ? '' : ' · <b>paused</b>'}</div></div>
      <button class="btn small" data-sched-toggle="${s.id}" data-active="${s.active}">${s.active ? 'Pause' : 'Resume'}</button>
      <button class="btn small danger" data-sched-del="${s.id}">Delete</button></div>`).join('')
-    : '<div class="empty"><b>No recurring scrapes</b>Use "Schedule" above to repeat a search automatically.</div>';
+    : '<div class="empty small"><b>No recurring scrapes</b>Use "Schedule" above to repeat a search automatically.</div>';
 }
 
 function scrapeBody() {
-  return { platform: $('#sc-platform').value, query: $('#sc-query').value.trim(), location: $('#sc-location').value.trim(),
+  const tidy = (v) => v.split(/[;\n]+/).map((x) => x.trim()).filter(Boolean).join('; ');
+  return { platform: $('#sc-platform').value, query: tidy($('#sc-query').value), location: tidy($('#sc-location').value),
     max_results: +$('#sc-max').value || 30, campaign: $('#sc-campaign').value.trim(),
-    only_no_website: $('#sc-nosite').checked };
+    only_no_website: $('#sc-nosite').checked, then_pipeline: $('#sc-then').checked };
 }
 $('#sc-go').addEventListener('click', () => run(async () => {
-  await api('/api/scrape', { method: 'POST', body: scrapeBody() });
-  toast('Scrape started -- progress appears under Scrape runs.', 'ok'); refreshJobs();
+  const r = await api('/api/scrape', { method: 'POST', body: scrapeBody() });
+  toast(`Scrape started${r.searches > 1 ? ` (${r.searches} searches)` : ''} — progress appears under Scrape runs.`, 'ok'); refreshJobs();
 }));
 $('#sc-schedule').addEventListener('click', () => run(async () => {
   await api('/api/schedules', { method: 'POST', body: { ...scrapeBody(), interval_hours: +$('#sc-hours').value || 24 } });
@@ -223,7 +267,7 @@ $('#schedule-list').addEventListener('click', (e) => run(async () => {
 
 $('#imp-go').addEventListener('click', () => run(async () => {
   const f = $('#imp-file').files[0];
-  if (!f) throw new Error('Choose a CSV file first');
+  if (!f) throw new Error('Choose a CSV or Excel file first');
   const fd = new FormData();
   fd.append('file', f); fd.append('campaign', $('#imp-campaign').value.trim()); fd.append('source', $('#imp-source').value.trim() || 'import');
   const box = $('#imp-result');
@@ -273,7 +317,10 @@ function paintSuggest() {
 function pickSuggest(i) {
   const input = sg.input, value = sg.items[i];
   if (!input || value == null) return;
-  input.value = value;
+  if (input.dataset.multi) {                                    // keep earlier entries, replace the one being typed
+    const done = input.value.split(';').slice(0, -1).map((x) => x.trim()).filter(Boolean);
+    input.value = done.concat(value).join('; ') + '; ';
+  } else input.value = value;
   hideSuggest();
   sg.skipNext = true;                                           // don't re-suggest for our own event
   input.dispatchEvent(new Event('input', { bubbles: true }));   // so live filters re-run
@@ -287,12 +334,12 @@ function attachSuggest(sel, field) {
   input.addEventListener('input', () => {
     if (sg.skipNext) { sg.skipNext = false; return; }           // the input event we fired ourselves
     clearTimeout(sg.timer);
-    const q = input.value.trim();
+    const q = (input.dataset.multi ? input.value.split(';').pop() : input.value).trim();
     if (q.length < 3) { hideSuggest(); return; }
     const seq = ++sg.seq;
     sg.timer = setTimeout(async () => {
       let r;
-      try { r = await api(`/api/suggest?field=${field}&q=${encodeURIComponent(q)}`); } catch (e) { return; }
+      try { r = await api(`/api/suggest?field=${field}&q=${encodeURIComponent(q)}` + (input.dataset.multi ? `&context=${encodeURIComponent(input.value)}` : '')); } catch (e) { return; }
       if (seq !== sg.seq || document.activeElement !== input) return;   // a newer keystroke won
       sg.input = input; sg.items = r.suggestions || []; sg.active = -1;
       if (!sg.items.length) { hideSuggest(); return; }
@@ -318,14 +365,30 @@ suggestBox.addEventListener('mousedown', (e) => {               // mousedown: fi
 });
 window.addEventListener('resize', placeSuggest);
 window.addEventListener('scroll', placeSuggest, true);
+$('#sc-query').dataset.multi = '1'; $('#sc-location').dataset.multi = '1';
 attachSuggest('#sc-query', 'scrape_query');
 attachSuggest('#sc-location', 'scrape_location');
+// "3 searches x 4 places = 12 searches" under the form, so the size of a run is never a surprise
+const splitMulti = (v) => [...new Set(v.split(/[;\n]+/).map((x) => x.trim().replace(/\s+/g, ' ')).filter(Boolean).map((x) => x.toLowerCase()))];
+function updateScrapePlan() {
+  const el = $('#sc-plan'); if (!el) return;
+  const q = splitMulti($('#sc-query').value).length;
+  const l = $('#sc-platform').value === 'instagram' ? 0 : splitMulti($('#sc-location').value).length;
+  const n = q * Math.max(l, 1), max = +$('#sc-max').value || 30;
+  if (n <= 1) { el.hidden = true; return; }
+  el.hidden = false;
+  el.className = 'hint' + (n > 40 ? ' bad-text' : '');
+  el.textContent = n > 40
+    ? `That's ${n} searches — the most one run can do is 40. Remove some, or split it into two runs.`
+    : `${q} search term${q === 1 ? '' : 's'}${l ? ` × ${l} place${l === 1 ? '' : 's'}` : ''} = ${n} searches, run one after another, up to ${max} listings each (${n * max} listings checked at most).`;
+}
+['#sc-query', '#sc-location', '#sc-max', '#sc-platform'].forEach((s) => ['input', 'change'].forEach((ev) => $(s).addEventListener(ev, updateScrapePlan)));
 attachSuggest('#f-q', 'lead_search');
 
 /* ------------------------------------------------------------ leads table */
 function filterValues() {
   const f = { q: $('#f-q').value.trim(), campaign: $('#f-campaign').value, stage: $('#f-stage').value,
-    fit: $('#f-fit').value, channel: $('#f-channel').value };
+    fit: $('#f-fit').value, channel: $('#f-channel').value, has: $('#f-has').value, sent: $('#f-sent').value };
   Object.keys(f).forEach((k) => { if (f[k] === '') delete f[k]; });
   return f;
 }
@@ -341,7 +404,7 @@ async function loadLeads() {
   const L = state.leads;
   if (state.pendingFilter) {
     const p = state.pendingFilter; state.pendingFilter = null;
-    if (p.campaign !== undefined) $('#f-campaign').value = p.campaign;
+    ['q', 'campaign', 'stage', 'fit', 'channel', 'has', 'sent'].forEach((k) => { $(`#f-${k}`).value = p[k] !== undefined ? p[k] : ''; });
     L.page = 0; L.selected.clear(); L.allMatching = false;
   }
   const p = new URLSearchParams({ ...filterValues(), sort: $('#f-sort').value, limit: L.size, offset: L.page * L.size });
@@ -354,19 +417,20 @@ async function loadLeads() {
 
 function reachChips(l) {
   const c = [];
-  if (l.email) c.push('email'); if (l.phone || l.phone_raw) c.push('phone'); if (l.has_website) c.push('site');
-  if (l.facebook_url) c.push('fb'); if (l.instagram_url) c.push('ig'); if (l.yelp_url) c.push('yelp');
-  return c.length ? `<div class="reach">${c.map((x) => `<span class="chip">${x}</span>`).join('')}</div>` : '<span class="muted">—</span>';
+  if (l.email) c.push(['email', l.email]); if (l.phone || l.phone_raw) c.push(['phone', l.phone || l.phone_raw]);
+  if (l.has_website) c.push(['site', l.website]); if (l.facebook_url) c.push(['fb', 'Facebook page']);
+  if (l.instagram_url) c.push(['ig', 'Instagram profile']); if (l.yelp_url) c.push(['yelp', 'Yelp page']);
+  return c.length ? `<div class="reach">${c.map(([x, t]) => `<span class="chip" title="${esc(t)}">${x}</span>`).join('')}</div>` : '<span class="muted dash">—</span>';
 }
 function fitChip(l) {
   if (l.fit === 1) return `<span class="chip ok" title="${esc(l.fit_reason)}">Fits</span>`;
   if (l.fit === 0) return `<span class="chip bad" title="${esc(l.fit_reason)}">Rejected</span>`;
-  return '<span class="muted">—</span>';
+  return '<span class="muted dash">—</span>';
 }
 function sentChip(l) {
   if (l.send_status === 'sent') return `<span class="chip info">Sent${l.follow_up_count ? ' +' + l.follow_up_count : ''}</span>`;
-  if (l.send_status === 'failed') return '<span class="chip bad">Failed</span>';
-  return l.message ? '<span class="chip">Drafted</span>' : '<span class="muted">—</span>';
+  if (l.send_status === 'failed') return '<span class="chip bad" title="The email could not be delivered">Failed</span>';
+  return l.message ? '<span class="chip warn">Drafted</span>' : '<span class="muted dash">—</span>';
 }
 
 function renderLeads() {
@@ -376,13 +440,13 @@ function renderLeads() {
     const sub = [TRADE_LABEL[l.trade] && l.trade ? TRADE_LABEL[l.trade] : '', place].filter(Boolean).join(' · ');
     return `<tr data-id="${l.id}" class="${L.selected.has(l.id) ? 'selected' : ''}">
       <td class="chk"><input type="checkbox" data-sel="${l.id}" ${L.selected.has(l.id) ? 'checked' : ''} aria-label="Select ${esc(l.business_name)}"></td>
-      <td><div class="bizname">${esc(l.business_name || '(no name)')}${l.do_not_contact ? ' <span class="chip bad">do not contact</span>' : ''}</div><div class="sub">${esc(sub)}</div></td>
-      <td>${reachChips(l)}</td>
-      <td class="num" title="${esc(l.score_reasons)}">${l.score}</td>
-      <td>${fitChip(l)}</td>
-      <td>${esc(CHANNEL_LABEL[l.channel] || l.channel)}${l.channel_locked ? ' <span class="muted" title="Chosen by hand">•</span>' : ''}</td>
-      <td><span class="chip stage-${l.stage}">${l.stage}</span></td>
-      <td>${sentChip(l)}</td></tr>`;
+      <td class="c-biz"><div class="bizname">${esc(l.business_name || '(no name)')}${l.do_not_contact ? ' <span class="chip bad">do not contact</span>' : ''}</div><div class="sub">${esc(sub)}</div></td>
+      <td data-l="Reach">${reachChips(l)}</td>
+      <td class="num" data-l="Score" title="${esc(l.score_reasons)}">${l.score}</td>
+      <td data-l="Fit">${fitChip(l)}</td>
+      <td class="nowrap" data-l="Channel">${esc(CHANNEL_LABEL[l.channel] || l.channel)}${l.channel_locked ? ' <span class="muted" title="Chosen by hand">•</span>' : ''}</td>
+      <td data-l="Stage"><span class="chip stage-${l.stage}">${l.stage}</span></td>
+      <td data-l="Outreach">${sentChip(l)}</td></tr>`;
   }).join('');
   const empty = $('#leads-empty');
   empty.hidden = L.rows.length > 0;
@@ -413,7 +477,7 @@ function updateBulkBar() {
 
 const reloadLeads = debounce(() => { state.leads.page = 0; state.leads.selected.clear(); state.leads.allMatching = false; run(loadLeads); }, 250);
 ['#f-q'].forEach((s) => $(s).addEventListener('input', reloadLeads));
-['#f-campaign', '#f-stage', '#f-fit', '#f-channel', '#f-sort'].forEach((s) => $(s).addEventListener('change', reloadLeads));
+['#f-campaign', '#f-stage', '#f-fit', '#f-channel', '#f-has', '#f-sent', '#f-sort'].forEach((s) => $(s).addEventListener('change', reloadLeads));
 $('#pg-prev').addEventListener('click', () => { state.leads.page--; run(loadLeads); });
 $('#pg-next').addEventListener('click', () => { state.leads.page++; run(loadLeads); });
 
@@ -451,7 +515,8 @@ $('#bulkbar').addEventListener('click', (e) => run(async () => {
   const b = e.target.closest('[data-bulk]'); if (!b) return;
   const n = state.leads.allMatching ? state.leads.total : state.leads.selected.size;
   const kind = b.dataset.bulk;
-  if (kind === 'enrich') { await api('/api/enrich', { method: 'POST', body: { ...bulkPayload(), force: true } }); toast('Enrichment started.', 'ok'); refreshJobs(); }
+  if (kind === 'pipeline') { await api('/api/pipeline', { method: 'POST', body: bulkPayload() }); toast(`Enriching, judging and drafting ${plural(n, 'lead')} — see Recent runs on the Dashboard.`, 'ok'); refreshJobs(); }
+  else if (kind === 'enrich') { await api('/api/enrich', { method: 'POST', body: { ...bulkPayload(), force: true } }); toast('Enrichment started.', 'ok'); refreshJobs(); }
   else if (kind === 'judge') { await api('/api/judge', { method: 'POST', body: { ...bulkPayload(), force: true } }); toast('Judging started.', 'ok'); refreshJobs(); }
   else if (kind === 'draft') { await api('/api/draft', { method: 'POST', body: { ...bulkPayload(), template: '' } }); toast('Drafting started (leads that already have a message are skipped).', 'ok'); refreshJobs(); }
   else if (kind === 'campaign') {
@@ -585,11 +650,17 @@ async function loadCampaignView(name) {
     : '<div class="empty"><b>No leads in this campaign yet</b>Use <b>Add leads</b> above to import a CSV or start a scrape into it.</div>';
 
   const q = d.queue;
+  q.replies = (d.replies || []).length;
   const qrows = [
+    ['replies', 'replied and need an answer', 'Answer'],
     ['needs_enrich', 'need contact details found', 'Enrich'], ['needs_judge', "haven't been judged", 'Judge fit'],
-    ['needs_draft', 'need a message', 'Draft messages'], ['ready_email', 'emails ready to send', 'Send emails'],
-    ['hand_queue', 'to send by hand', 'Open queue'], ['followups_due', 'follow-ups due', 'Follow up'],
+    ['needs_draft', 'need a message', 'Write messages'], ['ready_email', 'emails ready to send', 'Send emails'],
+    ['hand_queue', 'to send by hand', 'Open queue'], ['followups_due', 'email follow-ups due', 'Follow up'],
+    ['hand_followups_due', 'follow-ups due by hand', 'Follow up'],
   ];
+  $('#cd-pipeline').disabled = !(q.needs_enrich || q.needs_judge || q.needs_draft);
+  $('#cd-replies-card').hidden = !q.replies;
+  $('#cd-replies').innerHTML = q.replies ? repliesHtml(d.replies, '') : '';
   $('#cd-queue').innerHTML = qrows.map(([k, text, label]) =>
     `<div class="qrow"><span><span class="count">${q[k]}</span>${esc(text)}</span>` +
     (q[k] ? `<button class="btn small" data-q="${k}">${esc(label)}</button>` : '<span class="done">All done</span>') + '</div>').join('');
@@ -620,10 +691,11 @@ function fillCampaignSettings(d) {
   $('#cs-prio-on').checked = prioOn; state.csPrio.set(prioOn ? c.channel_priority : d.global.channel_priority); $('#cs-prio').hidden = !prioOn;
   const tplOn = !!(c.templates && c.templates.length);
   $('#cs-tpl-on').checked = tplOn; state.csTpl.set(tplOn ? c.templates : d.global.templates);
-  $('#cs-tpl').hidden = !tplOn; $('#cs-tpl-add').hidden = !tplOn;
+  $('#cs-tpl').hidden = !tplOn; $('#cs-tpl-add').hidden = !tplOn; $('#cs-tpl-help').hidden = !tplOn;
+  $('#cs-tpl-help').innerHTML = placeholderHelp();
 }
 $('#cs-prio-on').addEventListener('change', (e) => { $('#cs-prio').hidden = !e.target.checked; });
-$('#cs-tpl-on').addEventListener('change', (e) => { $('#cs-tpl').hidden = !e.target.checked; $('#cs-tpl-add').hidden = !e.target.checked; });
+$('#cs-tpl-on').addEventListener('change', (e) => { ['#cs-tpl', '#cs-tpl-add', '#cs-tpl-help'].forEach((x) => { $(x).hidden = !e.target.checked; }); });
 $('#cs-tpl-add').addEventListener('click', () => state.csTpl.add());
 $('#cs-save').addEventListener('click', () => run(async () => {
   const d = state.cd, val = $('#cs-criteria').value.trim();
@@ -658,6 +730,7 @@ $('#cd-queue').addEventListener('click', (e) => run(async () => {
   if (k === 'needs_enrich') await api('/api/enrich', { method: 'POST', body: { campaign: camp } });
   else if (k === 'needs_judge') await api('/api/judge', { method: 'POST', body: { campaign: camp } });
   else if (k === 'needs_draft') await api('/api/draft', { method: 'POST', body: { campaign: camp, template: '' } });
+  else if (k === 'replies') { state.pendingFilter = { campaign: camp, stage: 'replied' }; location.hash = '#leads'; return; }
   else if (k === 'ready_email') {
     if (!confirm(`Send the drafted emails in "${camp}", paced by your daily limit and delay?`)) return;
     await api('/api/send-bulk', { method: 'POST', body: { campaign: camp } });
@@ -665,8 +738,12 @@ $('#cd-queue').addEventListener('click', (e) => run(async () => {
   toast('Started — progress appears under Recent runs.', 'ok'); refreshJobs();
 }));
 $('#view-campaign').addEventListener('click', (e) => {
-  const a = e.target.closest('a[data-open]'); if (a) { e.preventDefault(); run(() => openLead(+a.dataset.open)); }
+  const a = e.target.closest('[data-open]'); if (a) { e.preventDefault(); run(() => openLead(+a.dataset.open)); }
 });
+$('#cd-pipeline').addEventListener('click', () => run(async () => {
+  await api('/api/pipeline', { method: 'POST', body: { campaign: state.campaign } });
+  toast('Enriching, judging and drafting — progress appears under Recent runs.', 'ok'); refreshJobs();
+}));
 
 /* ------------------------------------------------------------- pipeline */
 async function loadPipeline() {
@@ -698,6 +775,10 @@ $('#cr-save').addEventListener('click', () => run(async () => {
   $('#cr-new').value = '';
   toast(`Criteria saved for "${name}".`, 'ok');
   await loadPipeline(); $('#cr-campaign').value = name; loadCriteria();
+}));
+$('#pl-go').addEventListener('click', () => run(async () => {
+  await api('/api/pipeline', { method: 'POST', body: { campaign: $('#pl-campaign').value } });
+  toast('Started — enrich, then judge, then draft.', 'ok'); refreshJobs();
 }));
 $('#en-go').addEventListener('click', () => run(async () => {
   await api('/api/enrich', { method: 'POST', body: { campaign: $('#en-campaign').value, force: $('#en-force').checked, limit: $('#en-limit').value || null } });
@@ -743,66 +824,114 @@ async function loadOutreach() {
     $('#dr-campaign').value = state.pendingOutreachCampaign; delete state.pendingOutreachCampaign;
   }
   const camp = $('#dr-campaign').value, q = camp ? `campaign=${encodeURIComponent(camp)}` : '';
-  $('#out-scope').textContent = camp ? `Campaign: ${camp}` : 'All campaigns';
   const eff = await api('/api/settings' + (q ? `?${q}` : ''));
   $('#dr-template').innerHTML = templateOptions($('#dr-template').value, eff.templates);
+  if (state.exactTouched === undefined) $('#dr-exact').checked = !!eff.exact_templates;
+  const ai = state.config.llm.draft.ready;
   const warn = [];
-  if (!state.config.llm.draft.ready) warn.push('No AI key is set, so drafting is off. Add one under Settings → Connections.');
+  if (!ai && !eff.templates.length) warn.push('To write messages you need either an AI key (Settings → Connections) or a template to fill in (Settings → Messaging).');
+  else if (!ai) warn.push('No AI key is set, so messages can only be made from your templates exactly as written. Add a key under Settings → Connections to have each one rewritten for the lead.');
   if (!state.config.smtp) warn.push('Email sending is off until you add your email details under Settings → Connections.');
   $('#out-warn').hidden = !warn.length; $('#out-warn').innerHTML = warn.map(esc).join('<br>');
+  if (!ai) { $('#dr-exact').checked = true; $('#dr-exact').disabled = true; } else $('#dr-exact').disabled = false;
 
-  const handParams = { send_status: 'unsent', drafted: 'yes', dnc: 'no', not_rejected: '1', sort: 'score', limit: 300 };
+  const handParams = { send_status: 'unsent', drafted: 'yes', dnc: 'no', not_rejected: '1', hand: '1', open_stage: '1', sort: 'score', limit: 200 };
   if (camp) handParams.campaign = camp;
-  const [es, fu, hand] = await Promise.all([
-    api('/api/email-status'), api('/api/followups-due' + (q ? `?${q}` : '')),
-    api('/api/leads?' + new URLSearchParams(handParams)),
+  const amp = q ? `&${q}` : '';
+  const [es, fu, hfu, hand, replies] = await Promise.all([
+    api('/api/email-status'), api('/api/followups-due' + (q ? `?${q}` : '')), api('/api/followups-due?kind=hand' + amp),
+    api('/api/leads?' + new URLSearchParams(handParams)), api('/api/replies' + (q ? `?${q}` : '')),
   ]);
+  const checked = !es.imap_configured ? 'inbox not connected' : !es.reply_check_minutes ? 'only when you press Check'
+    : `automatic, every ${es.reply_check_minutes} min` + (es.last_reply_check_at ? ` (last ${ago(es.last_reply_check_at)})` : '');
   $('#em-status').innerHTML =
     `<div class="kv"><span>Sent today (all campaigns)</span><b>${es.sent_today} of ${es.daily_limit}</b></div>` +
     (es.warmup_active ? `<div class="kv"><span>Warm-up</span><b>capped below your ${es.max_limit}/day limit for now</b></div>` : '') +
-    `<div class="kv"><span>Reply checking</span><b>${es.imap_configured ? 'ready' : 'not set up'}</b></div>`;
-  $('#em-send').disabled = !es.smtp_configured;
+    (es.window_open ? '' : `<div class="kv"><span>Sending hours</span><b class="warn-text">closed right now</b></div>`) +
+    `<div class="kv"><span>Reply checking</span><b>${esc(checked)}</b></div>` +
+    (es.window_open ? '' : `<p class="hint" style="margin-top:8px">${esc(es.window_note)}</p>`);
+  $('#em-send').disabled = !es.smtp_configured || !es.window_open;
   $('#em-replies').disabled = !es.imap_configured;
 
-  $('#fu-list').innerHTML = fu.length ? fu.map((l) =>
-    `<div class="list-row"><div class="grow"><b>${esc(l.business_name)}</b> <span class="muted">${esc(l.email)}</span>
-       <div class="sub">emailed ${ago(l.last_sent_at)} · ${l.follow_up_count} follow-up${l.follow_up_count === 1 ? '' : 's'} sent</div></div>
-     <button class="btn small" data-open="${l.id}">Open</button>
-     <button class="btn small primary" data-followup="${l.id}">Send follow-up</button></div>`).join('')
-    : '<div class="empty"><b>No follow-ups due</b>Leads that haven\'t replied show up here after your follow-up delay.</div>';
+  badge('#rp-n', replies.length);
+  $('#rp-list').innerHTML = repliesHtml(replies, es.imap_configured
+    ? 'Replies to your emails appear here on their own. For WhatsApp, Instagram and the rest, open the lead and set its stage to “replied”.'
+    : 'Connect your inbox under Settings → Connections to have email replies picked up automatically.');
 
-  const queue = hand.leads.filter((l) => !['email', 'unknown'].includes(l.channel) && ['new', 'contacted'].includes(l.stage));
+  badge('#fu-n', fu.length);
+  $('#fu-all').hidden = !fu.length; $('#fu-all').disabled = !es.smtp_configured || !es.window_open;
+  $('#fu-all').textContent = `Send all ${fu.length} due`;
+  $('#fu-list').innerHTML = fu.length ? fu.map((l) =>
+    `<div class="list-row"><div class="grow"><b>${esc(l.business_name || '(no name)')}</b> <span class="muted">${esc(l.email)}</span>
+       <div class="sub">emailed ${ago(l.last_sent_at)} · ${plural(l.follow_up_count, 'follow-up')} sent</div></div>
+     <button class="btn small" data-open="${l.id}">Open</button>
+     <button class="btn small" data-followup="${l.id}">Send follow-up</button></div>`).join('')
+    : '<div class="empty small"><b>No email follow-ups due</b>Leads that haven\'t replied show up here after your follow-up delay.</div>';
+
+  const queue = hand.leads;
+  badge('#hand-n', hand.total);
   $('#hand-list').innerHTML = queue.length ? queue.map((l) =>
-    `<div class="list-row"><div class="grow"><b>${esc(l.business_name)}</b> <span class="chip">${esc(CHANNEL_LABEL[l.channel])}</span>
+    `<div class="list-row" data-row="${l.id}"><div class="grow"><b>${esc(l.business_name || '(no name)')}</b> <span class="chip">${esc(CHANNEL_LABEL[l.channel])}</span>
        <div class="sub">${esc((l.message || '').replace(/\s+/g, ' ').slice(0, 140))}${(l.message || '').length > 140 ? '…' : ''}</div></div>
      <button class="btn small" data-open="${l.id}">Open</button>
      <button class="btn small primary" data-copyopen="${l.id}">Copy &amp; open</button>
      <button class="btn small" data-marksent="${l.id}">Mark sent</button></div>`).join('')
-    : '<div class="empty"><b>Nothing to send by hand</b>Draft messages first; leads reachable only via Yelp, Facebook, Instagram or phone appear here.</div>';
-  state.handQueue = Object.fromEntries(queue.map((l) => [l.id, l]));
+    + (hand.total > queue.length ? `<p class="hint" style="margin-top:8px">Showing the first ${queue.length} of ${hand.total}.</p>` : '')
+    : '<div class="empty small"><b>Nothing to send by hand</b>Write messages first; leads reachable only via Yelp, Facebook, Instagram, WhatsApp or phone appear here.</div>';
+
+  badge('#hfu-n', hfu.length);
+  $('#hfu-list').innerHTML = hfu.length ? hfu.map((l) =>
+    `<div class="list-row" data-row="${l.id}"><div class="grow"><b>${esc(l.business_name || '(no name)')}</b> <span class="chip">${esc(CHANNEL_LABEL[l.channel])}</span>
+       <div class="sub">messaged ${ago(l.last_sent_at)} · ${plural(l.follow_up_count, 'follow-up')} so far</div></div>
+     <button class="btn small" data-open="${l.id}">Open</button>
+     <button class="btn small primary" data-hfu="${l.id}">Copy follow-up &amp; open</button>
+     <button class="btn small" data-hfudone="${l.id}">Mark followed up</button></div>`).join('')
+    : '<div class="empty small"><b>No follow-ups due by hand</b>Leads you messaged who haven\'t replied show up here after your follow-up delay.</div>';
+  state.handQueue = Object.fromEntries([...queue, ...hfu].map((l) => [l.id, l]));
 }
 $('#dr-campaign').addEventListener('change', () => run(loadOutreach));
+$('#dr-exact').addEventListener('change', () => { state.exactTouched = true; });
 $('#dr-go').addEventListener('click', () => run(async () => {
-  await api('/api/draft', { method: 'POST', body: { campaign: $('#dr-campaign').value, template: $('#dr-template').value, force: $('#dr-force').checked } });
-  toast('Drafting started.', 'ok'); refreshJobs();
+  await api('/api/draft', { method: 'POST', body: { campaign: $('#dr-campaign').value, template: $('#dr-template').value,
+    force: $('#dr-force').checked, exact: $('#dr-exact').checked } });
+  toast('Writing messages…', 'ok'); refreshJobs();
 }));
 $('#em-send').addEventListener('click', () => run(async () => {
   const camp = $('#dr-campaign').value;
-  if (!confirm(`Start sending emails to every drafted lead${camp ? ` in "${camp}"` : ''}, paced by your delay and daily limit?`)) return;
+  if (!confirm(`Start sending emails to every lead with a message${camp ? ` in "${camp}"` : ''}, paced by your delay and daily limit?`)) return;
   await api('/api/send-bulk', { method: 'POST', body: { campaign: camp, only_fit: $('#em-onlyfit').checked } });
   toast('Sending started.', 'ok'); refreshJobs();
 }));
 $('#em-replies').addEventListener('click', () => run(async () => {
-  const r = await api('/api/check-replies', { method: 'POST' });
-  toast(`Checked ${r.checked} unread messages: ${r.replied} replies` + (r.suppressed ? `, ${r.suppressed} opted out` : '') + (r.auto_replies ? `, ${r.auto_replies} auto-replies ignored` : ''), 'ok');
-  loadOutreach();
+  const b = $('#em-replies'); b.disabled = true; b.textContent = 'Checking…';
+  try {
+    const r = await api('/api/check-replies', { method: 'POST' });
+    toast(`Looked at ${plural(r.checked, 'new message')}: ${plural(r.replied, 'reply', 'replies')}` + (r.suppressed ? `, ${r.suppressed} opted out` : '')
+      + (r.bounced ? `, ${r.bounced} bounced` : '') + (r.auto_replies ? `, ${plural(r.auto_replies, 'auto-reply', 'auto-replies')} ignored` : ''), 'ok');
+  } finally { b.textContent = 'Check for replies'; await loadOutreach(); }
+}));
+$('#fu-all').addEventListener('click', () => run(async () => {
+  const camp = $('#dr-campaign').value;
+  if (!confirm(`Send every follow-up that's due${camp ? ` in "${camp}"` : ''}? Your inbox is checked for replies first.`)) return;
+  await api('/api/followups', { method: 'POST', body: { campaign: camp } });
+  toast('Sending follow-ups.', 'ok'); refreshJobs();
 }));
 $('#view-outreach').addEventListener('click', (e) => run(async () => {
   const b = e.target.closest('button'); if (!b) return;
   if (b.dataset.open) return openLead(+b.dataset.open);
-  if (b.dataset.followup) { await api(`/api/leads/${b.dataset.followup}/followup`, { method: 'POST' }); toast('Follow-up sent.', 'ok'); return loadOutreach(); }
-  if (b.dataset.copyopen) return copyAndOpen(state.handQueue[b.dataset.copyopen]);
+  if (b.dataset.followup) { b.disabled = true; await api(`/api/leads/${b.dataset.followup}/followup`, { method: 'POST' }); toast('Follow-up sent.', 'ok'); return loadOutreach(); }
+  if (b.dataset.copyopen) { await copyAndOpen(state.handQueue[b.dataset.copyopen]); b.closest('.list-row').classList.add('touched'); return; }
   if (b.dataset.marksent) { await api(`/api/leads/${b.dataset.marksent}/mark-sent`, { method: 'POST', body: {} }); toast('Marked as sent.', 'ok'); return loadOutreach(); }
+  if (b.dataset.hfu) {
+    const l = state.handQueue[b.dataset.hfu];
+    b.disabled = true;
+    try {
+      const r = await api(`/api/leads/${l.id}/followup-text`, { method: 'POST', body: {} });
+      await copyAndOpen(l, r.message); b.closest('.list-row').classList.add('touched');
+    } finally { b.disabled = false; }
+    return;
+  }
+  if (b.dataset.hfudone) { await api(`/api/leads/${b.dataset.hfudone}/mark-sent`, { method: 'POST', body: { followup: true } }); toast('Follow-up recorded.', 'ok'); return loadOutreach(); }
 }));
 
 /* ---------------------------------------------------------------- editors */
@@ -860,6 +989,11 @@ function PriorityEditor(root) {
     get() { return items.filter((p) => p.on).map((p) => p.c); },
   };
 }
+function placeholderHelp() {
+  const list = ((state.config && state.config.placeholders) || '').split(/\s+/).filter(Boolean);
+  return 'Blanks you can use: ' + list.map((p) => `<code>${esc(p)}</code>`).join(' ')
+    + '. Add a fallback after a bar for when a lead has nothing there: <code>{first_name|there}</code>.';
+}
 state.tplEditor = TemplateEditor($('#st-templates'));
 state.prioEditor = PriorityEditor($('#st-priority'));
 state.csTpl = TemplateEditor($('#cs-tpl'));
@@ -868,28 +1002,33 @@ $('#st-tpl-add').addEventListener('click', () => state.tplEditor.add());
 
 /* ------------------------------------------------------------- settings */
 const CONN_GROUPS = [
-  { title: 'AI (drafting, judging, enrichment)', ready: (c) => c.llm.draft.ready, test: 'llm',
-    help: 'Pick one provider and paste its key. Free tiers work (Groq or Google Gemini).',
-    fields: ['LLM_PROVIDER', 'GROQ_API_KEY', 'GROQ_MODEL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'GEMINI_API_KEY', 'GEMINI_MODEL'] },
+  { title: 'AI (writing, judging, enrichment)', ready: (c) => c.llm.draft.ready, test: 'llm',
+    help: 'Pick one provider and paste its key. Free tiers work (Groq or Google Gemini). The model boxes are optional.',
+    fields: ['LLM_PROVIDER', null, 'GROQ_API_KEY', 'GROQ_MODEL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'GEMINI_API_KEY', 'GEMINI_MODEL'] },
   { title: 'Email sending', ready: (c) => c.smtp, test: 'smtp',
     help: 'For Gmail: turn on 2-step verification, then create an App Password at myaccount.google.com/apppasswords and paste it here (not your normal password).',
-    fields: ['SMTP_USER', 'SMTP_PASS', 'SMTP_FROM_NAME', 'SMTP_HOST', 'SMTP_PORT'] },
+    fields: ['SMTP_USER', 'SMTP_PASS', 'SMTP_FROM_NAME', null, 'SMTP_HOST', 'SMTP_PORT'] },
   { title: 'Reply checking', ready: (c) => c.imap, test: 'imap', help: 'Leave these blank to reuse your email details above.',
     fields: ['IMAP_USER', 'IMAP_PASS', 'IMAP_HOST'] },
+  { title: 'Phone numbers', ready: () => true, readyLabel: (c) => `+${c.country_code}`,
+    help: 'The country calling code assumed for numbers written without one: 1 = US/Canada, 44 = UK, 91 = India, 61 = Australia. Numbers that start with + are always read as written.',
+    fields: ['DEFAULT_COUNTRY_CODE'] },
   { title: 'Web search for enrichment', ready: (c) => c.serpapi, help: 'serpapi.com, free plan: 100 searches a month. Optional.',
     fields: ['SERPAPI_KEY', 'SERPAPI_MONTHLY_LIMIT'] },
   { title: 'Instagram scraping', ready: (c) => c.instagram_login, help: 'Use a burner account, never your real one. Optional.',
     fields: ['IG_USERNAME', 'IG_PASSWORD'] },
 ];
 const CONN_LABEL = {
-  LLM_PROVIDER: 'Which AI to use', GROQ_API_KEY: 'Groq API key', GROQ_MODEL: 'Groq model (optional)',
-  OPENAI_API_KEY: 'OpenAI API key', OPENAI_MODEL: 'OpenAI model (optional)', GEMINI_API_KEY: 'Gemini API key',
-  GEMINI_MODEL: 'Gemini model (optional)', SMTP_USER: 'Your email address', SMTP_PASS: 'App password',
+  LLM_PROVIDER: 'Which AI to use', GROQ_API_KEY: 'Groq API key', GROQ_MODEL: 'Groq model',
+  OPENAI_API_KEY: 'OpenAI API key', OPENAI_MODEL: 'OpenAI model', GEMINI_API_KEY: 'Gemini API key',
+  GEMINI_MODEL: 'Gemini model', SMTP_USER: 'Your email address', SMTP_PASS: 'App password',
   SMTP_FROM_NAME: 'Sender name', SMTP_HOST: 'Mail server (SMTP)', SMTP_PORT: 'Mail server port',
   IMAP_USER: 'Inbox login', IMAP_PASS: 'Inbox password', IMAP_HOST: 'Inbox server (IMAP)',
   SERPAPI_KEY: 'SerpAPI key', SERPAPI_MONTHLY_LIMIT: 'Searches per month', IG_USERNAME: 'Burner username', IG_PASSWORD: 'Burner password',
+  DEFAULT_COUNTRY_CODE: 'Default country code',
 };
-const CONN_PLACEHOLDER = { SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '587', IMAP_HOST: 'imap.gmail.com', SERPAPI_MONTHLY_LIMIT: '100' };
+const CONN_PLACEHOLDER = { SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '587', IMAP_HOST: 'imap.gmail.com', SERPAPI_MONTHLY_LIMIT: '100',
+  GROQ_MODEL: 'default', OPENAI_MODEL: 'default', GEMINI_MODEL: 'default', DEFAULT_COUNTRY_CODE: '1', SMTP_FROM_NAME: 'e.g. Kunal from NeuroSpark' };
 
 function renderConnections(fields) {
   const by = Object.fromEntries(fields.map((f) => [f.name, f]));
@@ -897,6 +1036,7 @@ function renderConnections(fields) {
   $('#st-conn').innerHTML = CONN_GROUPS.map((g) => {
     const ok = g.ready(state.config);
     const inputs = g.fields.map((n) => {
+      if (n === null) return '<div class="field spacer-cell"></div>';      // keeps pairs side by side
       const f = by[n]; if (!f) return '';
       let input;
       if (n === 'LLM_PROVIDER') {
@@ -911,9 +1051,10 @@ function renderConnections(fields) {
         : f.secret && f.source === 'account' ? `<div class="hint"><button class="linklike" data-conn-clear="${n}">Remove the saved value</button></div>` : '';
       return `<div class="field"><label>${esc(CONN_LABEL[n] || n)}</label>${input}${note}</div>`;
     }).join('');
-    return `<div class="conn-group"><h3>${esc(g.title)} <span class="chip ${ok ? 'ok' : 'warn'}">${ok ? 'Ready' : 'Not set'}</span></h3>
+    const label = g.readyLabel ? g.readyLabel(state.config) : (ok ? 'Ready' : 'Not set');
+    return `<div class="conn-group"><h3>${esc(g.title)} <span class="chip ${g.readyLabel ? 'info' : ok ? 'ok' : 'warn'}">${esc(label)}</span></h3>
       <div class="hint">${esc(g.help)}</div><div class="conn-grid">${inputs}</div>
-      ${g.test ? `<div class="row actions" style="margin:-4px 0 10px"><button class="btn small" data-conn-test="${g.test}">Save &amp; test this connection</button>
+      ${g.test ? `<div class="row actions conn-test"><button class="btn small" data-conn-test="${g.test}">Save &amp; test this connection</button>
         <span class="hint" data-conn-result="${g.test}">Saves any changes above, then tests the connection.</span></div>` : ''}</div>`;
   }).join('');
 }
@@ -932,6 +1073,7 @@ async function saveConnections() {
   if (!Object.keys(set).length && !clear.length) return null;
   const r = await api('/api/connections', { method: 'PUT', body: { set, clear } });
   await loadConfig(); renderConnections(r.fields); $('#conn-unreadable').hidden = !r.unreadable;
+  if (r.phones_fixed) toast(`${plural(r.phones_fixed, 'phone number')} that couldn't be read before can be now.`, 'ok');
   return r;
 }
 
@@ -965,7 +1107,24 @@ $('#conn-save').addEventListener('click', () => run(async () => {
   toast(r ? 'Connections saved.' : 'Nothing changed.');
 }));
 
+const SETTINGS_TABS = ['messaging', 'sending', 'connections', 'account'];
+function showSettingsTab(name) {
+  const tab = SETTINGS_TABS.includes(name) ? name : 'messaging';
+  $$('#view-settings .tabpane').forEach((p) => { p.hidden = p.dataset.pane !== tab; });
+  $$('#view-settings .subtabs a').forEach((a) => {
+    a.classList.toggle('active', a.dataset.tab === tab); a.setAttribute('aria-selected', a.dataset.tab === tab);
+  });
+  $('#st-save').hidden = !['messaging', 'sending'].includes(tab);     // the other two tabs have their own save buttons
+}
+
+const hourLabel = (h) => (h === 0 || h === 24 ? 'midnight' : h === 12 ? 'noon' : h < 12 ? `${h} am` : `${h - 12} pm`);
 async function loadSettingsView() {
+  // Until the saved values have arrived the form can't be typed in -- otherwise they would land
+  // on top of (and wipe out) whatever had been typed in the meantime.
+  $('#view-settings').classList.add('loading');
+  try { await fillSettingsView(); } finally { $('#view-settings').classList.remove('loading'); }
+}
+async function fillSettingsView() {
   await Promise.all([loadSettings(), loadConfig()]);
   const s = state.settings;
   $('#st-info').value = s.business_info;
@@ -974,9 +1133,19 @@ async function loadSettingsView() {
   $('#st-warmup').checked = !!s.warmup_enabled; $('#st-footer').value = s.email_footer;
   $('#st-autoremove').checked = !!s.auto_remove_rejected;
   $('#st-autoremove-warn').hidden = !s.auto_remove_rejected;
+  $('#st-exact').checked = !!s.exact_templates; $('#st-followup').value = s.followup_template || '';
+  $('#st-window').checked = !!s.send_window_enabled; $('#st-tz').value = s.timezone || '';
+  $('#st-start').innerHTML = Array.from({ length: 24 }, (_, h) => opt(h, hourLabel(h), h === s.send_start_hour)).join('');
+  $('#st-end').innerHTML = Array.from({ length: 24 }, (_, i) => opt(i + 1, hourLabel(i + 1), i + 1 === s.send_end_hour)).join('');
+  $('#st-days').innerHTML = DAY_LABEL.map((d, i) =>
+    `<label><input type="checkbox" value="${i}" ${(s.send_days || []).includes(i) ? 'checked' : ''}><span>${d}</span></label>`).join('');
+  const rm = $('#st-replymin'), want = String(s.reply_check_minutes ?? 30);
+  if (![...rm.options].some((o) => o.value === want)) rm.insertAdjacentHTML('afterbegin', opt(want, `${want} minutes`));
+  rm.value = want;
+  $('#st-tpl-help').innerHTML = placeholderHelp();
   $('#ju-removal-note').textContent = s.auto_remove_rejected
-    ? 'Auto-remove is ON \u2014 a rejected lead with no notes, draft or activity is deleted immediately.'
-    : 'Rejected leads are kept, not deleted \u2014 filter by Fit = No to review them.';
+    ? 'Auto-remove is ON — a rejected lead with no notes, draft or activity is deleted immediately.'
+    : 'Rejected leads are kept, not deleted — filter by Fit = Rejected to review them.';
   state.tplEditor.set(s.templates); state.prioEditor.set(s.channel_priority);
   $('#ac-name').value = (state.me && state.me.name) || '';
   await renderSuppression();
@@ -988,16 +1157,27 @@ async function loadSettingsView() {
 }
 
 $('#st-autoremove').addEventListener('change', (e) => { $('#st-autoremove-warn').hidden = !e.target.checked; });
+$('#st-tz-mine').addEventListener('click', () => {
+  try { $('#st-tz').value = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { /* very old browser */ }
+});
 $('#st-save').addEventListener('click', () => run(async () => {
+  const num = (sel, fallback) => { const v = $(sel).value.trim(); return v === '' || Number.isNaN(+v) ? fallback : +v; };
   const body = {
     business_info: $('#st-info').value, email_footer: $('#st-footer').value, templates: state.tplEditor.get(),
     channel_priority: state.prioEditor.get(),
-    email_daily_limit: +$('#st-limit').value || 40, email_send_delay_seconds: +$('#st-delay').value || 0,
-    followup_delay_days: +$('#st-fudays').value || 3, max_followups: +$('#st-fumax').value || 0,
+    email_daily_limit: num('#st-limit', 40), email_send_delay_seconds: num('#st-delay', 45),
+    followup_delay_days: num('#st-fudays', 3), max_followups: num('#st-fumax', 2),
     warmup_enabled: $('#st-warmup').checked, auto_remove_rejected: $('#st-autoremove').checked,
+    exact_templates: $('#st-exact').checked, followup_template: $('#st-followup').value,
+    send_window_enabled: $('#st-window').checked, send_start_hour: +$('#st-start').value, send_end_hour: +$('#st-end').value,
+    send_days: $$('#st-days input:checked').map((c) => +c.value), timezone: $('#st-tz').value.trim(),
+    reply_check_minutes: +$('#st-replymin').value,
   };
+  const dropped = state.tplEditor.get().filter((t) => !(t.name || '').trim() || !(t.body || '').trim()).length;
   state.settings = await api('/api/settings', { method: 'PUT', body });
-  toast('Settings saved.', 'ok'); loadSettingsView();
+  state.exactTouched = undefined;
+  toast(dropped ? `Settings saved — ${plural(dropped, 'template')} without a name or text ${dropped === 1 ? 'was' : 'were'} left out.` : 'Settings saved.', dropped ? '' : 'ok');
+  loadSettingsView();
 }));
 
 async function renderSuppression() {
@@ -1005,7 +1185,7 @@ async function renderSuppression() {
   $('#sp-list').innerHTML = list.length ? list.map((s) =>
     `<div class="list-row"><div class="grow">${esc(s.value)} <span class="sub">${esc(s.kind)} · ${esc(s.reason)}</span></div>
       <button class="btn small" data-sp-del="${esc(s.value)}">Remove</button></div>`).join('')
-    : '<div class="empty"><b>Empty</b>People who ask to stop are added automatically.</div>';
+    : '<div class="empty small"><b>Nobody yet</b>People who reply asking you to stop are added automatically.</div>';
 }
 $('#sp-add').addEventListener('click', () => run(async () => {
   await api('/api/suppression', { method: 'POST', body: { value: $('#sp-value').value, reason: 'added by hand' } });
@@ -1014,7 +1194,7 @@ $('#sp-add').addEventListener('click', () => run(async () => {
 $('#sp-list').addEventListener('click', (e) => run(async () => {
   const b = e.target.closest('[data-sp-del]'); if (!b) return;
   await api('/api/suppression', { method: 'DELETE', body: { value: b.dataset.spDel } });
-  renderSuppression();
+  toast('Removed — leads it had flagged can be contacted again.'); renderSuppression();
 }));
 
 $('#ac-save').addEventListener('click', () => run(async () => {
@@ -1093,7 +1273,8 @@ let pollTimer = null;
 async function refreshJobs() {
   clearTimeout(pollTimer);
   try {
-    const jobs = await api('/api/jobs?limit=40');
+    // whole logs only for the runs whose "Log" is open; a few closing lines for the rest
+    const jobs = await api(`/api/jobs?limit=40&logs=${[...state.openLogs].join(',')}`);
     const finished = [];
     jobs.forEach((j) => {
       const active = ['queued', 'running'].includes(j.status);
@@ -1105,10 +1286,9 @@ async function refreshJobs() {
     renderJobs();
     finished.forEach((j) => {
       toast(`${JOB_LABEL[j.kind] || j.kind}: ${j.summary || j.status}`, j.status === 'error' ? 'err' : 'ok');
-      if (state.view === 'leads') loadLeads(); else if (state.view === 'dashboard') loadDashboard();
-      else if (state.view === 'outreach') loadOutreach(); else if (state.view === 'find') loadCampaigns();
-      else if (state.view === 'campaign') loadCampaignView(state.campaign);
-      else if (state.view === 'campaigns') loadCampaignsView();
+      const again = { leads: loadLeads, dashboard: loadDashboard, outreach: loadOutreach, find: loadCampaigns,
+        campaign: () => loadCampaignView(state.campaign), campaigns: loadCampaignsView, pipeline: loadCampaigns }[state.view];
+      if (again) Promise.resolve(again()).catch(() => {});
     });
   } catch (e) { /* server restarting -- try again */ }
   const anyActive = state.jobs.some((j) => ['queued', 'running'].includes(j.status));
@@ -1126,7 +1306,7 @@ function jobCard(j) {
       ${active ? `<button class="btn small" data-stop="${j.id}">Stop</button>` : ''}</div>
     ${active ? `<div class="bar"><i style="width:${pct}%"></i></div><div class="sub">${j.progress}${j.total ? ' of ' + j.total : ''}</div>` : ''}
     ${j.summary ? `<div class="summary">${esc(j.summary)}</div>` : ''}
-    ${log ? `<details data-log="${j.id}" ${state.openLogs.has(j.id) ? 'open' : ''}><summary>Log</summary><pre>${esc(log)}</pre></details>` : ''}</div>`;
+    ${log ? `<details data-log="${j.id}" ${state.openLogs.has(j.id) ? 'open' : ''}><summary>Log</summary><pre>${j.log_more ? '…\n' : ''}${esc(log)}</pre></details>` : ''}</div>`;
 }
 function renderJobs() {
   $$(`#view-${state.view} [data-jobs]`).forEach((box) => {
@@ -1134,7 +1314,10 @@ function renderJobs() {
     const limit = +box.dataset.limit || 5;
     const scoped = box.dataset.campaignJobs !== undefined;
     const list = state.jobs.filter((j) => (!kinds || kinds.includes(j.kind)) && (!scoped || j.campaign === state.campaign)).slice(0, limit);
-    box.innerHTML = list.length ? list.map(jobCard).join('') : '<div class="hint" style="margin-top:8px">Nothing has run yet.</div>';
+    box.innerHTML = list.length ? list.map(jobCard).join('')
+      : box.dataset.quiet ? '' : '<div class="hint" style="margin-top:8px">Nothing has run yet.</div>';
+    // keep an open log scrolled to its newest line while the run is going
+    $$('details[open] pre', box).forEach((p) => { p.scrollTop = p.scrollHeight; });
   });
 }
 document.addEventListener('click', (e) => run(async () => {
@@ -1145,6 +1328,7 @@ document.addEventListener('click', (e) => run(async () => {
 document.addEventListener('toggle', (e) => {
   const d = e.target; if (!d.dataset || !d.dataset.log) return;
   d.open ? state.openLogs.add(+d.dataset.log) : state.openLogs.delete(+d.dataset.log);
+  if (d.open) refreshJobs();                    // fetch the whole log now that someone wants to read it
 }, true);
 
 /* ---------------------------------------------------------------- drawer */
@@ -1187,6 +1371,23 @@ function drawerHtml(lead, events) {
     lead.dnc_reason ? `<div><b>Do-not-contact reason:</b> ${esc(lead.dnc_reason)}</div>` : '',
   ].join('');
 
+  const digits = (lead.phone || '').replace(/\D/g, '');
+  const links = [
+    lead.phone || lead.phone_raw ? `<a class="btn small" href="tel:${esc(lead.phone || lead.phone_raw)}">Call</a>` : '',
+    digits ? `<a class="btn small" href="https://wa.me/${digits}" target="_blank" rel="noopener">WhatsApp</a>` : '',
+    lead.email ? `<a class="btn small" href="mailto:${esc(lead.email)}">Email</a>` : '',
+    lead.website ? `<a class="btn small" href="${esc(lead.website)}" target="_blank" rel="noopener">Website</a>` : '',
+    lead.google_maps_url ? `<a class="btn small" href="${esc(lead.google_maps_url)}" target="_blank" rel="noopener">Maps</a>` : '',
+    lead.facebook_url ? `<a class="btn small" href="${esc(lead.facebook_url)}" target="_blank" rel="noopener">Facebook</a>` : '',
+    lead.instagram_url ? `<a class="btn small" href="${esc(lead.instagram_url)}" target="_blank" rel="noopener">Instagram</a>` : '',
+    lead.yelp_url ? `<a class="btn small" href="${esc(lead.yelp_url)}" target="_blank" rel="noopener">Yelp</a>` : '',
+  ].filter(Boolean).join('');
+  const nextStages = { new: ['contacted', 'replied'], contacted: ['replied', 'dead'], replied: ['qualified', 'won', 'lost'],
+    qualified: ['won', 'lost'], won: [], lost: ['new'], dead: ['new'] }[lead.stage] || [];
+  const quick = `<section class="dw-section"><div class="quick">
+      <span class="chip stage-${lead.stage}">${lead.stage}</span>
+      ${nextStages.map((st) => `<button class="btn small" data-stage="${st}">Mark ${st}</button>`).join('')}
+      <span class="spacer"></span>${links}</div></section>`;
   const canEmail = lead.email && state.config && state.config.smtp;
   const followable = lead.email_message_id && lead.send_status === 'sent' && lead.stage === 'contacted';
   const msg = `<section class="dw-section"><h3>Message</h3>
@@ -1195,7 +1396,7 @@ function drawerHtml(lead, events) {
     <textarea id="dw-message" rows="9" aria-label="Message">${esc(lead.message)}</textarea>
     <div class="msg-actions">
       ${lead.channel === 'email' || lead.email ? `<button class="btn primary small" id="dw-send" ${canEmail && lead.send_status !== 'sent' ? '' : 'disabled'}
-          title="${!lead.email ? 'No email address' : !state.config.smtp ? 'Email isn\'t set up (.env)' : lead.send_status === 'sent' ? 'Already sent' : ''}">Send email</button>` : ''}
+          title="${!lead.email ? 'No email address' : !state.config.smtp ? 'Email isn\'t set up yet (Settings → Connections)' : lead.send_status === 'sent' ? 'Already sent' : ''}">Send email</button>` : ''}
       <button class="btn small" id="dw-copy">Copy &amp; open</button>
       <button class="btn small" id="dw-mark" ${lead.send_status === 'sent' ? 'disabled' : ''}>Mark sent</button>
       ${followable ? '<button class="btn small" id="dw-follow">Send follow-up</button>' : ''}
@@ -1207,7 +1408,7 @@ function drawerHtml(lead, events) {
     return `<div class="ev"><span class="muted">${ago(ev.created_at)}</span><span><b>${esc(ev.kind.replace('_', ' '))}</b> ${esc(String(d).slice(0, 220))}</span></div>`;
   }).join('') || '<div class="muted">No activity yet.</div>';
 
-  return `<section class="dw-section"><div class="facts">${facts}</div></section>${secs}${msg}
+  return `${quick}<section class="dw-section"><div class="facts">${facts}</div></section>${secs}${msg}
     <section class="dw-section"><h3>Activity</h3><div class="timeline">${evs}</div></section>`;
 }
 
@@ -1299,13 +1500,20 @@ async function refreshDrawer() {
 $('#dw-body').addEventListener('click', (e) => run(async () => {
   const b = e.target.closest('button'); if (!b) return;
   const id = state.drawer.id;
-  if (b.id === 'dw-gen') {
+  if (b.dataset.stage) {
+    await saveDrawer(true);
+    await api(`/api/leads/${id}`, { method: 'PATCH', body: { stage: b.dataset.stage } });
+    toast(`Marked ${b.dataset.stage}.`, 'ok'); await refreshDrawer();
+    if (state.view === 'dashboard') loadDashboard();
+  } else if (b.id === 'dw-gen') {
     const tpl = $('#dw-tpl').value;
     await saveDrawer(true);
     b.disabled = true; b.textContent = 'Writing…';
-    try { await api(`/api/leads/${id}/draft`, { method: 'POST', body: { template: tpl } }); }
+    let r;
+    try { r = await api(`/api/leads/${id}/draft`, { method: 'POST', body: { template: tpl } }); }
     finally { await refreshDrawer(); }
-    toast('Draft written.', 'ok');
+    if (r.unfilled && r.unfilled.length) toast(`Written, but ${r.unfilled.join(', ')} had nothing to fill it — edit the message or the lead before sending.`, 'err');
+    else toast('Message written.', 'ok');
   } else if (b.id === 'dw-send') {
     await saveDrawer(true);
     const r = await api(`/api/leads/${id}/send-email`, { method: 'POST', body: {} });

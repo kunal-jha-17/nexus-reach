@@ -16,14 +16,17 @@ How a run works:
     the same search after an interruption simply carries on where it stopped
   * with "only keep businesses with no website" on, a Google Maps result whose
     card already shows a Website button is skipped without opening its page
-  * images are not downloaded, detail pages load two at a time
-    in reused tabs, and tabs are recycled regularly to keep memory flat
+  * images are not downloaded, listing pages reuse tabs that are recycled regularly, and the
+    run watches its own memory: on a small server it stops growing the list / reopens tabs /
+    ends cleanly instead of being killed and restarted
   * never runs two browsers at once (jobs.SCRAPE_LOCK)
 
 Tunable with environment variables (all optional):
   SCRAPER_SCROLL_DELAY_MIN / _MAX   pause between scrolls of the results list   (0.7 / 1.3 s)
   SCRAPER_DETAIL_DELAY_MIN / _MAX   pause between batches of listing pages      (0.4 / 0.9 s)
-  SCRAPER_DETAIL_TABS               listing pages loaded at once, 1-4           (2)
+  SCRAPER_DETAIL_TABS               listing pages loaded at once, 1-4           (1)
+  SCRAPER_MEMORY_LIMIT_MB           the server's memory; the scraper backs off at 85% of it
+                                    (container limit if reported, 512 on Render, 0 = off)
   SCRAPER_RECYCLE_EVERY             open fresh tabs after this many listings    (20)
   SCRAPER_BLOCK_MEDIA               don't download images                       (true)
 Lower delays and more tabs are faster but raise the odds of a CAPTCHA.
@@ -54,13 +57,19 @@ YELP_BASE_URL = "https://www.yelp.com"
 # Keeps Chromium small and stable inside a container: Docker's /dev/shm is only 64 MB, and a
 # long results list overflows it (the tab crashes) unless shared memory is moved to /tmp.
 _BROWSER_ARGS = ["--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions",
-                 "--disable-background-networking", "--mute-audio", "--no-first-run"]
+                 "--disable-background-networking", "--mute-audio", "--no-first-run",
+                 # one renderer per tab instead of one per embedded site: far fewer processes
+                 "--disable-site-isolation-trials", "--disable-features=IsolateOrigins,site-per-process"]
 # Photos are most of a listing page's weight and none of its data.
 _NO_IMAGES_ARG = "--blink-settings=imagesEnabled=false"
 
 
 class ScrapeBlocked(RuntimeError):
     """The site is showing a CAPTCHA / login wall / checkpoint."""
+
+
+class ScrapeOutOfMemory(RuntimeError):
+    """The server is at its memory limit; this search was ended early (its leads are saved)."""
 
 
 class BrowserNotInstalled(RuntimeError):
@@ -142,7 +151,7 @@ def _new_page(p):
         raise BrowserNotInstalled()
     browser = p.chromium.launch(**kwargs)
     context = browser.new_context(user_agent=USER_AGENT, locale="en-US",
-                                  viewport={"width": 1200, "height": 850})
+                                  viewport={"width": 1000, "height": 720})
     context.set_default_timeout(15000)      # no single click/read may hang a run for 30 s
     return browser, context
 
@@ -155,6 +164,120 @@ def _blocked(page, needles, who):
     if any(n in html for n in needles):
         raise ScrapeBlocked(f"{who} is showing a CAPTCHA / verification page. Wait a while, "
                             f"lower max results, or scrape by hand and import the CSV instead.")
+
+
+# ------------------------------------------------------------ memory guard
+# A small server (Render's 512 MB instances) is killed and restarted outright when the app plus
+# the browser outgrow it -- which is what "Interrupted by a restart" on a large scrape is. So the
+# scraper watches its own footprint and backs off BEFORE that point: it stops growing the results
+# list, reopens tabs, or ends the run cleanly with everything found so far already saved.
+
+def _tree_mb():
+    """Memory used by this process and everything it started (the browser), in MB.
+    Uses proportional size where the kernel offers it, so shared pages aren't counted twice.
+    Returns 0 where /proc isn't available (macOS / Windows) -- the guard is then off."""
+    try:
+        parents = {}
+        for name in os.listdir("/proc"):
+            if name.isdigit():
+                try:
+                    with open(f"/proc/{name}/stat") as f:
+                        parents[int(name)] = int(f.read().rsplit(")", 1)[1].split()[1])
+                except (OSError, ValueError, IndexError):
+                    continue
+        tree, grew = {os.getpid()}, True
+        while grew:
+            grew = False
+            for pid, ppid in parents.items():
+                if ppid in tree and pid not in tree:
+                    tree.add(pid)
+                    grew = True
+        kb = 0
+        for pid in tree:
+            got = None
+            try:
+                with open(f"/proc/{pid}/smaps_rollup") as f:
+                    for line in f:
+                        if line.startswith("Pss:"):
+                            got = int(line.split()[1])
+                            break
+            except (OSError, ValueError):
+                pass
+            if got is None:
+                try:
+                    with open(f"/proc/{pid}/statm") as f:
+                        got = int(f.read().split()[1]) * (os.sysconf("SC_PAGE_SIZE") // 1024)
+                except (OSError, ValueError, IndexError):
+                    got = 0
+            kb += got
+        return kb / 1024
+    except OSError:
+        return 0
+
+
+def _memory_limit_mb():
+    """How much memory this server may use. SCRAPER_MEMORY_LIMIT_MB sets it (0 = no guard);
+    otherwise the container's own limit if it reports one; otherwise 512 on Render; otherwise none."""
+    raw = config.env("SCRAPER_MEMORY_LIMIT_MB", "")
+    if raw != "":
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            with open(path) as f:
+                v = f.read().strip()
+            if v.isdigit() and int(v) < (64 << 30):
+                return int(v) / (1 << 20)
+        except OSError:
+            continue
+    return 512.0 if os.environ.get("RENDER") else 0.0
+
+
+def _container_mb():
+    """What the container itself reports as in use (the number its out-of-memory killer goes by),
+    in MB -- or 0 when it reports no limit of its own, since the figure would then be for the
+    whole machine. Cache that the kernel can drop at will isn't counted."""
+    for limit_path, used_path, stat_path, key in (
+            ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "inactive_file"),
+            ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+             "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")):
+        try:
+            with open(limit_path) as f:
+                limit = f.read().strip()
+            if not (limit.isdigit() and int(limit) < (64 << 30)):
+                continue
+            with open(used_path) as f:
+                used = int(f.read().strip())
+            try:
+                with open(stat_path) as f:
+                    for line in f:
+                        if line.startswith(key + " "):
+                            used -= int(line.split()[1])
+                            break
+            except (OSError, ValueError):
+                pass
+            return max(0, used) / (1 << 20)
+        except (OSError, ValueError):
+            continue
+    return 0.0
+
+
+def _used_mb():
+    """Memory in use, by the stricter of two measures: our own process tree, and the container's count."""
+    return max(_tree_mb(), _container_mb())
+
+
+def _memory_tight():
+    limit = _memory_limit_mb()
+    return bool(limit) and _used_mb() > limit * 0.85
+
+
+def _memory_note():
+    """'412 MB of 512' for the run log, or '' when there's no limit to compare against."""
+    limit = _memory_limit_mb()
+    return f"{int(_used_mb())} MB of {int(limit)}" if limit else ""
 
 
 def listing_key(url):
@@ -295,7 +418,8 @@ def _scrape_details(context, links, extract, finish, results, progress, ctx, on_
     is skipped; several in a row means the site is refusing us, and the run stops with a
     clear message -- everything read up to that point is already saved."""
     total = len(links)
-    n_tabs = min(_env_count("SCRAPER_DETAIL_TABS", 2, 1, 4), max_tabs)
+    n_tabs = min(_env_count("SCRAPER_DETAIL_TABS", 1, 1, 4), max_tabs)
+    tight_rounds = 0
     recycle = _env_count("SCRAPER_RECYCLE_EVERY", 20, 5, 500)
     pause = _delay_range("DETAIL", 0.4, 0.9)
     tabs, since_recycle, done, fails = [], 0, 0, 0
@@ -346,7 +470,8 @@ def _scrape_details(context, links, extract, finish, results, progress, ctx, on_
                 fails = 0
                 finish(row, link)
                 results.append(row)
-                progress(f"Scraped {done}/{total}: {row['business_name']}")
+                progress(f"Scraped {done}/{total}: {row['business_name']}"
+                         + (f"  [memory {_memory_note()}]" if done % 10 == 0 and _memory_note() else ""))
                 _report(ctx, done, total)
                 if on_row is not None and on_row(row) is False:
                     keep_going = False
@@ -359,6 +484,18 @@ def _scrape_details(context, links, extract, finish, results, progress, ctx, on_
                 raise ScrapeBlocked(f"{fails} listings in a row wouldn't load -- {who} is probably rate-limiting "
                                     f"this server. Wait a while and run the same search again; it carries on "
                                     f"from where this one stopped.")
+            if _memory_tight():
+                # Fresh tabs give back what the old ones had accumulated. If that isn't enough twice
+                # running, end here on our own terms rather than let the server be killed mid-run.
+                tight_rounds += 1
+                _close_all(tabs)
+                tabs, n_tabs = [], 1
+                time.sleep(1.0)
+                if tight_rounds >= 2 and _memory_tight():
+                    raise ScrapeOutOfMemory(f"Stopped at listing {done} of {total}: this server is at its memory limit "
+                                        f"({int(_used_mb())} MB in use)")
+            else:
+                tight_rounds = 0
             _delay(ctx, *pause)
     finally:
         _close_all(tabs)
@@ -411,6 +548,11 @@ def scrape_google_maps(query, location="", max_results=30, progress=None, ctx=No
                     progress(f"Found {shown} listings so far...")
                 if len(cards) >= max_results:
                     break
+                if _memory_tight():
+                    progress(f"Stopping the list at {len(cards)} listings: this server is close to its memory "
+                             f"limit ({int(_used_mb())} MB in use). Carrying on with these -- run another, "
+                             f"narrower search for more.")
+                    break
                 if snap["end"]:
                     progress(f"Google has no more results for this search ({len(cards)} in total). "
                              f"For more, run another search term or a neighbouring town.")
@@ -440,10 +582,10 @@ def scrape_google_maps(query, location="", max_results=30, progress=None, ctx=No
             if known or had_site:
                 progress(f"Of {len(cards)} listings: {known} already in your leads, {had_site} show a website "
                          f"on their card -- opening the other {len(todo)}.")
-            try:
-                page.goto("about:blank")                # the long results list is no longer needed; free it
-            except Exception:  # noqa: BLE001
-                pass
+            before_close = _memory_note()
+            _close_all([page])                          # the long results list is no longer needed; free it
+            if before_close:
+                progress(f"Server memory: {before_close} with the results list open, {_memory_note()} after closing it.")
 
             def finish(row, link):
                 row["google_maps_url"] = link
@@ -597,18 +739,55 @@ def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=Non
 
 # --------------------------------------------------------------- job entry
 
+MAX_SEARCHES_PER_RUN = 40
+
+
+def split_multi(value):
+    """'AC repair; furnace repair' (or a list) -> ['AC repair', 'furnace repair'].
+    Entries are separated by ';' or a new line -- never by a comma, because places
+    are written 'Dallas, TX'. Blank and repeated entries are dropped."""
+    parts = value if isinstance(value, (list, tuple)) else re.split(r"[;\n]+", str(value or ""))
+    out, seen = [], set()
+    for p in parts:
+        p = re.sub(r"\s+", " ", str(p or "")).strip()
+        if p and p.lower() not in seen:
+            seen.add(p.lower())
+            out.append(p)
+    return out
+
+
+def plan_searches(params):
+    """Every (search term, place) pair a scrape request asks for, in the order they'll run:
+    all the terms for the first place, then all the terms for the next place, and so on."""
+    queries = split_multi(params.get("queries") or params.get("query"))
+    locations = split_multi(params.get("locations") or params.get("location"))
+    if params.get("platform") == "instagram":
+        locations = []
+    if not queries:
+        raise ValueError("Enter a search query")
+    pairs = [(q, loc) for loc in (locations or [""]) for q in queries]
+    if len(pairs) > MAX_SEARCHES_PER_RUN:
+        raise ValueError(f"That's {len(pairs)} searches ({len(queries)} terms x {len(locations)} places). "
+                         f"The most one run can do is {MAX_SEARCHES_PER_RUN} -- split it into two runs.")
+    return pairs
+
+
 def run_scrape(ctx, params):
-    """Background job: scrape one platform, saving each lead the moment it's found."""
+    """Background job: scrape one platform, saving each lead the moment it's found.
+
+    Several search terms and/or several places (separated by ';') are run one after another,
+    each as its own browser session -- so memory is handed back between searches, and a server
+    too small for one 100-listing search can still work through many 30-40 listing ones."""
     platform = params["platform"]
-    query = (params.get("query") or "").strip()
-    location = (params.get("location") or "").strip()
     max_results = int(params.get("max_results") or 30)
     campaign = (params.get("campaign") or "").strip()
     only_no_website = bool(params.get("only_no_website"))
-    if not query:
-        raise ValueError("Enter a search query")
+    searches = plan_searches(params)
+    if platform not in ("google_maps", "yelp", "instagram"):
+        raise ValueError(f"Unknown platform '{platform}'")
     if ctx.stopped:
         return "Stopped before starting"
+    cur = {"query": searches[0][0]}
 
     st = {"checked": 0, "kept": 0, "inserted": 0, "merged": 0, "skipped_suppressed": 0,
           "known": 0, "limit": ""}
@@ -627,7 +806,7 @@ def run_scrape(ctx, params):
             # and AI budget on it. Drop it here instead.
             return True
         st["kept"] += 1
-        s = importer.import_leads([row], campaign=campaign, source=platform, query=query)
+        s = importer.import_leads([row], campaign=campaign, source=platform, query=cur["query"])
         for k in ("inserted", "merged", "skipped_suppressed"):
             st[k] += s[k]
         if s.get("stopped_at_limit"):
@@ -652,44 +831,71 @@ def run_scrape(ctx, params):
             return True
         return False
 
-    ctx.log(f"Starting {platform} scrape for '{query}' {location}".strip())
-    rows = []
-    try:
+    def one_search(query, location):
+        rows = []
         if platform == "google_maps":
             rows = scrape_google_maps(query, location, max_results, ctx.log, ctx,
                                       on_row=save, skip_known=skip_known, skip_site=skip_site)
         elif platform == "yelp":
             rows = scrape_yelp(query, location, max_results, ctx.log, ctx, on_row=save, skip_known=skip_known)
-        elif platform == "instagram":
+        else:
             user, pw = config.env("IG_USERNAME"), config.env("IG_PASSWORD")
             if not user or not pw:
                 raise RuntimeError("Set IG_USERNAME and IG_PASSWORD (a burner account) in .env first")
             rows = scrape_instagram(query, user, pw, max_results, ctx.log, ctx, on_row=save)
-        else:
-            raise ValueError(f"Unknown platform '{platform}'")
-    except ImportError:
-        raise RuntimeError("Playwright isn't installed. Run: pip install playwright && "
-                           "python3 -m playwright install chromium")
-    except BrowserNotInstalled:
-        raise RuntimeError(
-            "The scraping browser isn't installed on this server. This is expected on most free "
-            "hosts (Render's native Python service doesn't let a build step install a browser) -- "
-            "run scrapes on your own computer instead, then import the resulting CSV here under "
-            "Find leads. If you deployed with the included Dockerfile, this shouldn't happen; check "
-            "the build logs for a Playwright install error.")
-    except ValueError:
-        raise
-    except Exception as e:  # noqa: BLE001
-        if st["checked"] or st["known"]:
-            # Nothing found so far is lost: say so, and say how to carry on.
-            raise RuntimeError(f"{_short(e, 300)} -- stopped after checking {st['checked']} listings; "
-                               f"{st['inserted']} new leads were already saved. Run the same search "
-                               f"again to carry on from here.") from e
-        raise
+        for r in rows or []:             # anything a scraper returned without reporting as it went
+            if id(r) not in handled and not st["limit"]:
+                save(r)
 
-    for r in rows or []:                 # anything a scraper returned without reporting as it went
-        if id(r) not in handled and not st["limit"]:
-            save(r)
+    many, failed, ran = len(searches) > 1, [], 0
+    if many:
+        ctx.log(f"{len(searches)} searches to run, up to {max_results} listings each.")
+    for n, (query, location) in enumerate(searches, 1):
+        if ctx.stopped or st["limit"]:
+            break
+        cur["query"] = query
+        label = f"'{query}' {location}".strip()
+        ctx.log((f"Search {n} of {len(searches)}: " if many else f"Starting {platform} scrape for ") + label)
+        before = st["inserted"]
+        ran += 1
+        try:
+            one_search(query, location)
+        except ImportError:
+            raise RuntimeError("Playwright isn't installed. Run: pip install playwright && "
+                               "python3 -m playwright install chromium")
+        except BrowserNotInstalled:
+            raise RuntimeError(
+                "The scraping browser isn't installed on this server. This is expected on most free "
+                "hosts (Render's native Python service doesn't let a build step install a browser) -- "
+                "run scrapes on your own computer instead, then import the resulting CSV here under "
+                "Find leads. If you deployed with the included Dockerfile, this shouldn't happen; check "
+                "the build logs for a Playwright install error.")
+        except ValueError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # A CAPTCHA will meet the next search too, so it ends the run. Anything else (one search
+            # running out of memory, a page that wouldn't load) only costs that one search: the next
+            # starts with a fresh browser.
+            last = n == len(searches)
+            if many and not isinstance(e, ScrapeBlocked) and not last:
+                failed.append(label)
+                ctx.log(f"  This search ended early: {_short(e, 240)}. Moving on to the next one.")
+            elif many and not isinstance(e, ScrapeBlocked):
+                failed.append(label)
+                ctx.log(f"  This search ended early: {_short(e, 240)}.")
+            elif st["checked"] or st["known"]:
+                # Nothing found so far is lost: say so, and say how to carry on.
+                raise RuntimeError(f"{_short(e, 300)} -- stopped after checking {st['checked']} listings; "
+                                   f"{st['inserted']} new leads were already saved. Run the same search "
+                                   f"again to carry on from here.") from e
+            else:
+                raise
+        if many:
+            ctx.log(f"  -> {st['inserted'] - before} new leads from this search ({st['inserted']} so far).")
+            if n < len(searches) and not ctx.stopped:
+                _delay(ctx, 2, 4)
+    if many and failed and len(failed) == ran:
+        raise RuntimeError(f"All {ran} searches ended early -- see the log. {st['inserted']} new leads were saved.")
 
     checked, kept = st["checked"], st["kept"]
     if only_no_website:
@@ -701,6 +907,10 @@ def run_scrape(ctx, params):
     ctx.log(f"{kept} scraped -> {tail}")
     msg = (f"{checked} checked, {kept} had no website -> {tail}" if only_no_website
            else f"{kept} scraped -> {tail}")
+    if many:
+        msg = f"{ran} of {len(searches)} searches run: " + msg
+        if failed:
+            msg += f" -- {len(failed)} ended early ({'; '.join(failed[:3])}{'...' if len(failed) > 3 else ''})"
     if st["limit"]:
         msg += f" -- stopped early: {st['limit']}"
     if not checked and not st["known"]:

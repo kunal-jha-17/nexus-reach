@@ -48,8 +48,10 @@ QUERY_TEMPLATES = {
     "address": "{n}{l} address",
 }
 
-_JUNK_EMAIL_PARTS = ("noreply", "no-reply", "wixpress", "sentry", "example.", "yourdomain",
-                     "domain.com", "email.com", "@2x", "u003e")
+_JUNK_EMAIL_PARTS = ("noreply", "no-reply", "donotreply", "do-not-reply", "wixpress", "sentry", "example.",
+                     "yourdomain", "yourname", "domain.com", "email.com", "@2x", "u003e", "godaddy.com",
+                     "squarespace.com", "wix.com", "weebly.com", "wordpress.", "cloudflare", "schema.org",
+                     "your@", "name@", "user@", "test@", "abuse@", "privacy@", "webmaster@", "hostmaster@")
 
 
 # --------------------------------------------------------------- helpers
@@ -281,7 +283,7 @@ def enrich_lead(lead, max_searches=None):
     # 3. web searches for what's still missing
     still = [f for f in missing if f not in updates]
     serp_results = []
-    if config.env("SERPAPI_KEY") and max_searches > 0:
+    if config.env("SERPAPI_KEY") and max_searches > 0 and (lead.get("business_name") or "").strip():
         for f in still:
             if searches >= max_searches or serp_remaining() <= 0:
                 break
@@ -296,8 +298,8 @@ def enrich_lead(lead, max_searches=None):
                 f"{r['title']} | {r['link']} | {r['snippet']}" for r in res))
         if searches and serp_remaining() <= 0:
             notes.append("monthly search budget used up")
-    elif still:
-        notes.append("no SERPAPI_KEY -- web search skipped")
+    elif still and not config.env("SERPAPI_KEY"):
+        notes.append("no web-search key -- only free sources were used")
 
     corpus = "\n\n".join(corpus_parts)[:14000]
     still = [f for f in missing if f not in updates]
@@ -361,6 +363,9 @@ def run_enrich(ctx, params):
             ctx.log("Stopped.")
             break
         lead = db.get_lead(lead_id)
+        if lead is None:                 # deleted by something else while this run was going
+            ctx.progress(i)
+            continue
         try:
             res = enrich_lead(lead)
         except Exception as e:  # noqa: BLE001 -- one bad lead shouldn't stop the batch
@@ -371,8 +376,8 @@ def run_enrich(ctx, params):
         fields = dict(res["updates"])
         fields["enriched_at"] = schema.now_iso()
         note = res["notes"]
-        if note:
-            fields["enrichment_notes"] = ((lead.get("enrichment_notes") or "") + " " + note).strip()
+        if note:                          # what the latest run found -- not an ever-growing pile
+            fields["enrichment_notes"] = note[:600]
         db.update_lead(lead_id, fields)
         if res["updates"]:
             db.add_event(lead_id, "enriched", ", ".join(res["updates"]))

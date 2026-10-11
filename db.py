@@ -13,6 +13,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 
 import config
+import directory
 import persistence
 import schema
 import userctx
@@ -185,7 +186,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     interval_hours INTEGER DEFAULT 24,
     last_run_at TEXT,
     next_run_at TEXT,
-    active INTEGER DEFAULT 1
+    active INTEGER DEFAULT 1,
+    only_no_website INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS suppression (
@@ -231,6 +233,7 @@ def _migrate(conn):
                       "business_info": "TEXT DEFAULT ''", "templates": "TEXT DEFAULT ''",
                       "channel_priority": "TEXT DEFAULT ''"},
         "jobs": {"campaign": "TEXT DEFAULT ''"},
+        "schedules": {"only_no_website": "INTEGER DEFAULT 0"},
     }.items():
         have = _columns(conn, table)
         for col, ddl in cols.items():
@@ -264,6 +267,8 @@ def init_db():
             "WHERE status IN ('queued','running')",
             (schema.now_iso(),),
         )
+        # Run history is for looking back a little, not forever: keep the newest 300.
+        conn.execute("DELETE FROM jobs WHERE id <= (SELECT MAX(id) FROM jobs) - 300")
     try:
         repair_missing_names()      # names an older import left in the notes (e.g. "Clinic Name: ...")
     except Exception:  # noqa: BLE001 -- a tidy-up must never stop the app from opening a database
@@ -285,6 +290,16 @@ DEFAULT_SETTINGS = {
     "sending_started_at": "",
     "default_criteria": "",   # fit criteria for leads whose campaign has none of its own
     "auto_remove_rejected": False,   # delete a lead outright the moment Judge fit rejects it
+    "exact_templates": False,        # draft by filling in the template's blanks, with no AI rewriting
+    "followup_template": "",         # fixed follow-up text (placeholders allowed); blank = the AI writes one
+    "reply_check_minutes": 30,       # look for replies on a timer when the inbox is connected; 0 = only by hand
+    "last_reply_check_at": "",
+    "imap_state": {},                # where the last inbox check got to
+    "timezone": "",                  # e.g. America/Chicago; blank = UTC. Used for "today" and sending hours
+    "send_window_enabled": False,    # bulk sends only inside the hours below
+    "send_days": [0, 1, 2, 3, 4],    # Monday = 0
+    "send_start_hour": 8,
+    "send_end_hour": 18,
 }
 
 
@@ -546,10 +561,11 @@ def _where(f):
         clauses.append(f"id IN ({','.join('?' for _ in f['ids'])})")
         params += list(f["ids"])
     if f.get("q"):
-        like = f"%{f['q']}%"
-        clauses.append("(business_name LIKE ? OR email LIKE ? OR phone LIKE ? OR city LIKE ? "
-                       "OR notes LIKE ? OR contact_name LIKE ?)")
-        params += [like] * 6
+        q = str(f["q"]).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        like = f"%{q}%"
+        clauses.append("(" + " OR ".join(f"{c} LIKE ? ESCAPE '\\'" for c in (
+            "business_name", "email", "phone", "phone_raw", "city", "notes", "contact_name")) + ")")
+        params += [like] * 7
     if f.get("campaign") == "__none__":          # leads that aren't in any campaign
         clauses.append("campaign = ''")
     for col in ("campaign", "stage", "channel", "source", "trade", "send_status"):
@@ -577,6 +593,30 @@ def _where(f):
         params.append(int(f["min_score"]))
     if f.get("dnc") == "no":
         clauses.append("do_not_contact = 0")
+    has = f.get("has")
+    if has == "email":
+        clauses.append("email != ''")
+    elif has == "phone":
+        clauses.append("(phone != '' OR phone_raw != '')")
+    elif has == "no_email":
+        clauses.append("email = ''")
+    elif has == "website":
+        clauses.append("has_website = 1")
+    elif has == "no_website":
+        clauses.append("has_website = 0")
+    if f.get("sent") == "drafted":                # written, not sent yet
+        clauses.append("message != '' AND send_status = 'unsent'")
+    elif f.get("sent") == "none":                 # nothing written
+        clauses.append("message = '' AND send_status = 'unsent'")
+    elif f.get("sent") in ("sent", "failed"):
+        clauses.append("send_status = ?")
+        params.append(f["sent"])
+    if f.get("hand"):                             # reachable, but not by email: sent by a person
+        clauses.append("channel NOT IN ('email', 'unknown')")
+    if f.get("open_stage"):
+        clauses.append("stage IN ('new', 'contacted')")
+    if f.get("reachable"):
+        clauses.append("channel != 'unknown'")
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
@@ -621,6 +661,45 @@ def repair_missing_names():
     return fixed
 
 
+def renormalize_phones():
+    """Re-read every phone number that couldn't be understood before (for instance after the
+    default country code changes). Returns how many now have a usable number."""
+    with get_conn() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM leads WHERE phone = '' AND phone_raw != ''").fetchall()]
+    fixed = 0
+    with batch():
+        for i in ids:
+            lead = update_lead(i, {})
+            fixed += bool(lead and lead["phone"])
+    return fixed
+
+
+def replies_waiting(campaign="", limit=25):
+    """Leads who answered and haven't been dealt with yet (stage is still 'replied'),
+    newest reply first, each with the opening of what they wrote."""
+    where, params = "l.stage = 'replied' AND l.do_not_contact = 0", []
+    if campaign:
+        where += " AND l.campaign = ?"
+        params.append(campaign)
+    with get_conn() as conn:
+        rows = conn.execute(
+            f"""SELECT l.id, l.business_name, l.campaign, l.channel, l.email, l.phone, l.updated_at,
+                       (SELECT e.detail FROM events e WHERE e.lead_id = l.id AND e.kind = 'reply'
+                        ORDER BY e.id DESC LIMIT 1) AS reply,
+                       (SELECT e.created_at FROM events e WHERE e.lead_id = l.id AND e.kind IN ('reply', 'stage')
+                        ORDER BY e.id DESC LIMIT 1) AS replied_at
+                FROM leads l WHERE {where} ORDER BY replied_at DESC, l.id DESC LIMIT ?""", (*params, limit)).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["snippet"] = (json.loads(d.pop("reply") or "{}") or {}).get("snippet", "")
+        except (ValueError, AttributeError):
+            d["snippet"] = ""
+        out.append(d)
+    return out
+
+
 def listing_urls():
     """Every Google Maps / Yelp listing URL already stored, so a scrape can skip
     listings it has saved before instead of opening them again."""
@@ -633,9 +712,10 @@ def listing_urls():
 SUGGEST_FIELDS = ("scrape_query", "scrape_location", "lead_search")
 
 
-def suggest(field, q, limit=8):
-    """Autocomplete built only from this account's own history: past scrape searches and
-    locations, and the names / cities / trades of leads already here. No outside service."""
+def suggest(field, q, limit=8, context=""):
+    """Autocomplete with no outside service. Search terms and places come first from this
+    account's own past scrapes and leads, then from the built-in directory (business types;
+    ~57,000 places). The All leads box suggests names / cities / trades of leads already here."""
     if field not in SUGGEST_FIELDS:
         raise ValueError("Unknown suggestion field")
     q = re.sub(r"\s+", " ", (q or "")).strip()
@@ -649,10 +729,13 @@ def suggest(field, q, limit=8):
             key = "query" if field == "scrape_query" else "location"
             for r in conn.execute("SELECT params FROM jobs WHERE kind = 'scrape' ORDER BY id DESC LIMIT 300"):
                 try:
-                    cands.append((json.loads(r["params"] or "{}") or {}).get(key))
-                except (ValueError, AttributeError):
+                    p = json.loads(r["params"] or "{}") or {}
+                except ValueError:
                     continue
-            cands += [r["v"] for r in conn.execute(f"SELECT {key} v FROM schedules ORDER BY id DESC LIMIT 100")]
+                if isinstance(p, dict):       # a run can hold several terms / places: "a; b; c"
+                    cands += re.split(r"[;\n]+", str(p.get(key) or ""))
+            for r in conn.execute(f"SELECT {key} v FROM schedules ORDER BY id DESC LIMIT 100"):
+                cands += re.split(r"[;\n]+", str(r["v"] or ""))
             if field == "scrape_query":
                 cands += [r["v"] for r in conn.execute(
                     "SELECT last_query v, COUNT(*) c FROM leads WHERE last_query LIKE ? ESCAPE '\\' "
@@ -674,7 +757,21 @@ def suggest(field, q, limit=8):
             continue
         seen.add(cl)
         (starts if cl.startswith(ql) else contains).append(c[:120])
-    return (starts + contains)[:limit]
+    out = starts + contains
+    if field != "lead_search" and len(out) < limit:
+        if field == "scrape_query":
+            extra = directory.services(q, limit * 2)
+        else:
+            # places this account already works in (", TX" / ", India") are listed first
+            # ...and so are places like the ones already typed into the box (`context`)
+            typed = re.split(r"[;\n]+", str(context or ""))[:-1]
+            prefer = {c.rsplit(", ", 1)[-1] for c in list(map(str, cands)) + typed if ", " in c}
+            extra = directory.places(q, limit * 2, prefer={p.strip() for p in prefer})
+        for c in extra:
+            if c.lower() not in seen and c.lower() != ql:
+                seen.add(c.lower())
+                out.append(c)
+    return out[:limit]
 
 
 # -------------------------------------------------------------------- events
@@ -702,13 +799,27 @@ def event_exists(kind, needle):
         ).fetchone() is not None
 
 
-def count_events_today(kinds):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def local_zone(settings=None):
+    """The account's time zone (Settings > Sending), UTC when none is set or it isn't recognised."""
+    name = ((settings if settings is not None else get_settings()).get("timezone") or "").strip()
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return ZoneInfo(name)
+        except Exception:  # noqa: BLE001 -- unknown name, or no time-zone data on this machine
+            pass
+    return timezone.utc
+
+
+def count_events_today(kinds, settings=None):
+    """How many of these events happened today -- "today" being the account's own calendar day."""
+    now = datetime.now(local_zone(settings))
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
     q = ",".join("?" for _ in kinds)
     with get_conn() as conn:
         return conn.execute(
-            f"SELECT COUNT(*) c FROM events WHERE kind IN ({q}) AND created_at LIKE ?",
-            (*kinds, f"{today}%"),
+            f"SELECT COUNT(*) c FROM events WHERE kind IN ({q}) AND created_at >= ?",
+            (*kinds, start.isoformat(timespec="seconds")),
         ).fetchone()["c"]
 
 
@@ -1028,8 +1139,22 @@ def list_suppression():
 
 
 def remove_suppression(value):
+    """Take an entry off the list, and un-flag the leads it had flagged -- unless another
+    entry (say their phone number) still covers them."""
+    v = (value or "").strip().lower()
     with get_conn() as conn:
-        return conn.execute("DELETE FROM suppression WHERE value = ?", (value.strip().lower(),)).rowcount
+        row = conn.execute("SELECT kind FROM suppression WHERE value = ?", (v,)).fetchone()
+        n = conn.execute("DELETE FROM suppression WHERE value = ?", (v,)).rowcount
+        col = {"email": "email", "phone": "phone", "instagram": "instagram_url",
+               "facebook": "facebook_url"}.get(row["kind"] if row else "")
+        leads = [dict(r) for r in conn.execute(
+            f"SELECT * FROM leads WHERE do_not_contact = 1 AND lower({col}) = ?", (v,)).fetchall()] if col else []
+    for lead in leads:
+        if not is_suppressed(lead):
+            with get_conn() as conn:
+                conn.execute("UPDATE leads SET do_not_contact = 0, dnc_reason = '', updated_at = ? WHERE id = ?",
+                             (schema.now_iso(), lead["id"]))
+    return n
 
 
 # ---------------------------------------------------------------------- jobs
@@ -1059,7 +1184,13 @@ def get_job(job_id):
         return _d(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
 
-def list_jobs(kinds=None, limit=15, campaign=None):
+LOG_TAIL_LINES = 12
+
+
+def list_jobs(kinds=None, limit=15, campaign=None, full_logs=None):
+    """Recent runs, newest first. full_logs: None = every log in full; otherwise a set of job ids
+    whose whole log is wanted -- the rest carry only their last few lines (log_more = True), which
+    keeps the page's every-two-seconds refresh small."""
     clauses, params = [], []
     if kinds:
         clauses.append(f"kind IN ({','.join('?' for _ in kinds)})")
@@ -1070,18 +1201,25 @@ def list_jobs(kinds=None, limit=15, campaign=None):
     where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
     with get_conn() as conn:
         rows = conn.execute(f"SELECT * FROM jobs{where} ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    if full_logs is not None:
+        for j in out:
+            lines = (j["log"] or "").split("\n")
+            j["log_more"] = j["id"] not in full_logs and len(lines) > LOG_TAIL_LINES
+            if j["log_more"]:
+                j["log"] = "\n".join(lines[-LOG_TAIL_LINES:])
+    return out
 
 
 # ----------------------------------------------------------------- schedules
 
-def create_schedule(platform, query, location, max_results, campaign, interval_hours):
+def create_schedule(platform, query, location, max_results, campaign, interval_hours, only_no_website=False):
     now = schema.now_iso()
     with get_conn() as conn:
         return conn.execute(
-            "INSERT INTO schedules(platform, query, location, max_results, campaign, interval_hours, next_run_at, active) "
-            "VALUES(?,?,?,?,?,?,?,1)",
-            (platform, query, location, max_results, campaign, interval_hours, now),
+            "INSERT INTO schedules(platform, query, location, max_results, campaign, interval_hours, next_run_at, "
+            "active, only_no_website) VALUES(?,?,?,?,?,?,?,1,?)",
+            (platform, query, location, max_results, campaign, interval_hours, now, 1 if only_no_website else 0),
         ).lastrowid
 
 

@@ -79,6 +79,11 @@ class TestScrapeFlow(Base):
                                        "only_no_website": only_no_website})
         return msg, ctx
 
+    def seen_cards(self):
+        """How many result cards the run has logged finding so far."""
+        found = [l for l in self.ctx.lines if l.startswith("Found ")]
+        return int(found[-1].split()[1]) if found else 0
+
     def opened(self):
         return sum(1 for h in fake_maps.hits if "/maps/place/" in h)
 
@@ -135,6 +140,59 @@ class TestScrapeFlow(Base):
         self.assertGreaterEqual(n, 6)
         self.assertLess(n, 30)
 
+    def test_a_server_near_its_memory_limit_gets_a_shorter_list_not_a_crash(self):
+        # memory "fills up" as the list grows past ~20 cards, then is fine again once the list is closed
+        self.serve(60)
+        self.ctx = Ctx()
+        state = {"list_open": True}
+        real_close = scraper._close_all
+
+        def close(pages):
+            state["list_open"] = False
+            real_close(pages)
+
+        def used():
+            return 470 if state["list_open"] and self.seen_cards() >= 20 else 300
+
+        with mock.patch.object(scraper, "_memory_limit_mb", return_value=512), \
+                mock.patch.object(scraper, "_used_mb", side_effect=used), \
+                mock.patch.object(scraper, "_close_all", side_effect=close):
+            msg, ctx = self.run_it(60, only_no_website=False, ctx=self.ctx)
+        n = len(self.leads())
+        self.assertGreaterEqual(n, 20)
+        self.assertLess(n, 60)                                             # the list was cut short...
+        self.assertIn(f"{n} scraped -> {n} new", msg)                      # ...and the run still finished normally
+        self.assertTrue(any("close to its memory limit" in l for l in ctx.lines))
+        self.assertTrue(any(l.startswith("Server memory:") for l in ctx.lines))
+
+    def test_memory_that_stays_full_ends_the_run_cleanly_with_leads_saved(self):
+        self.serve(20)
+        calls = {"n": 0}
+
+        def used():                                                        # fine during the list, full from then on
+            calls["n"] += 1
+            return 300 if not any(l.startswith("Scraped 4/") for l in self.ctx.lines) else 500
+
+        self.ctx = Ctx()
+        with mock.patch.object(scraper, "_memory_limit_mb", return_value=512), \
+                mock.patch.object(scraper, "_used_mb", side_effect=used), \
+                mock.patch.object(scraper.time, "sleep"):
+            with self.assertRaises(RuntimeError) as cm:
+                self.run_it(20, only_no_website=False, ctx=self.ctx)
+        self.assertIn("memory limit", str(cm.exception))
+        self.assertIn("already saved", str(cm.exception))
+        self.assertGreaterEqual(len(self.leads()), 4)
+
+    def test_the_guard_is_off_without_a_limit_and_measures_real_memory(self):
+        with mock.patch.dict(os.environ, {"SCRAPER_MEMORY_LIMIT_MB": "0"}):
+            self.serve(1)
+            self.assertFalse(scraper._memory_tight())
+        with mock.patch.dict(os.environ, {"SCRAPER_MEMORY_LIMIT_MB": "1"}):
+            self.assertTrue(scraper._memory_tight())                       # this test process alone is over 1 MB
+        self.assertGreater(scraper._tree_mb(), 10)
+        self.assertGreaterEqual(scraper._used_mb(), scraper._tree_mb())
+        self.assertEqual(scraper._container_mb(), 0)          # this machine reports no limit of its own
+
     def test_the_per_account_lead_limit_stops_the_run_instead_of_crashing_it(self):
         self.serve(20)
         with mock.patch.dict(os.environ, {"MAX_LEADS_PER_USER": "5"}):
@@ -166,6 +224,92 @@ class TestListingKey(unittest.TestCase):
             self.assertEqual(scraper._delay_range("DETAIL", 0.4, 0.9), (3.0, 3.0))
 
 
+class TestManySearchesInOneRun(Base):
+    """Several terms x several places, with the browser part replaced by a stand-in."""
+
+    def run_many(self, fake, **params):
+        ctx = Ctx()
+        p = {"platform": "google_maps", "query": "AC repair; furnace repair", "location": "Garland, TX; Mesquite, TX",
+             "max_results": 40, "campaign": "c", "only_no_website": False}
+        p.update(params)
+        with mock.patch.object(scraper, "scrape_google_maps", side_effect=fake) as m, \
+                mock.patch.object(scraper, "_delay", return_value=False):
+            try:
+                return scraper.run_scrape(ctx, p), ctx, m
+            except Exception as e:  # noqa: BLE001
+                return e, ctx, m
+
+    @staticmethod
+    def rows(query, location, n=2):
+        return [{"business_name": f"{query} {location} {i}", "phone": f"(214) 555-{abs(hash((query, location, i))) % 9000 + 1000}",
+                 "address": f"{i} Main St, {location}"} for i in range(n)]
+
+    def test_every_term_is_searched_in_every_place(self):
+        def fake(query, location, *a, **k):
+            return self.rows(query, location)
+        msg, ctx, m = self.run_many(fake)
+        self.assertEqual([c.args[:2] for c in m.call_args_list],
+                         [("AC repair", "Garland, TX"), ("furnace repair", "Garland, TX"),
+                          ("AC repair", "Mesquite, TX"), ("furnace repair", "Mesquite, TX")])
+        self.assertIn("4 of 4 searches run: 8 scraped -> 8 new", msg)
+        leads = db.list_leads({}, limit=50)[0]
+        self.assertEqual(len(leads), 8)
+        self.assertEqual({l["last_query"] for l in leads}, {"AC repair", "furnace repair"})   # each lead knows its own search
+        self.assertTrue(any(l.startswith("Search 3 of 4: 'AC repair' Mesquite, TX") for l in ctx.lines))
+
+    def test_one_search_failing_does_not_stop_the_others(self):
+        def fake(query, location, *a, **k):
+            if (query, location) == ("furnace repair", "Garland, TX"):
+                raise scraper.ScrapeOutOfMemory("Stopped at listing 3 of 30: this server is at its memory limit")
+            return self.rows(query, location)
+        msg, ctx, m = self.run_many(fake)
+        self.assertEqual(m.call_count, 4)
+        self.assertIn("4 of 4 searches run: 6 scraped -> 6 new", msg)
+        self.assertIn("1 ended early ('furnace repair' Garland, TX)", msg)
+
+    def test_a_captcha_stops_the_whole_run_but_keeps_what_was_saved(self):
+        def fake(query, location, *a, **k):
+            if location == "Mesquite, TX":
+                raise scraper.ScrapeBlocked("Google is showing a CAPTCHA")
+            for r in self.rows(query, location):
+                k["on_row"](r)
+            return []
+        err, ctx, m = self.run_many(fake)
+        self.assertIsInstance(err, RuntimeError)
+        self.assertIn("4 new leads were already saved", str(err))
+        self.assertEqual(m.call_count, 3)                                  # the 4th search was not attempted
+
+    def test_lists_and_strings_split_the_same_way_and_never_on_commas(self):
+        self.assertEqual(scraper.split_multi(" Dallas, TX ;Garland, TX;\n dallas, tx ;; "), ["Dallas, TX", "Garland, TX"])
+        self.assertEqual(scraper.split_multi(["a", "b ", "A"]), ["a", "b"])
+        self.assertEqual(scraper.plan_searches({"platform": "google_maps", "query": "plumbers", "location": "Dallas, TX"}),
+                         [("plumbers", "Dallas, TX")])
+        self.assertEqual(scraper.plan_searches({"platform": "instagram", "query": "a;b", "location": "x;y"}), [("a", ""), ("b", "")])
+
+    def test_too_many_searches_is_refused_up_front(self):
+        with self.assertRaises(ValueError) as cm:
+            scraper.plan_searches({"platform": "google_maps", "query": ";".join(f"t{i}" for i in range(7)),
+                                   "location": ";".join(f"p{i}" for i in range(6))})
+        self.assertIn("42 searches", str(cm.exception))
+
+
+class TestScrapeRoute(ApiBase):
+    def test_the_route_accepts_several_terms_and_places(self):
+        with mock.patch.object(jobs, "start_job", return_value=7) as start, \
+                mock.patch.object(scraper, "browser_available", return_value=True):
+            r = self.client.post("/api/scrape", json={"platform": "google_maps", "query": "AC repair;furnace repair ; ",
+                                                      "location": "Garland, TX; Mesquite, TX", "max_results": 40})
+        self.assertEqual(r.status_code, 200, r.get_json())
+        params = next(a for a in list(start.call_args[0]) + list(start.call_args[1].values()) if isinstance(a, dict))
+        self.assertEqual((params["query"], params["location"]), ("AC repair; furnace repair", "Garland, TX; Mesquite, TX"))
+
+    def test_the_route_refuses_an_oversized_or_empty_request(self):
+        r = self.client.post("/api/scrape", json={"platform": "google_maps", "query": ";".join(f"t{i}" for i in range(41))})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.client.post("/api/scrape", json={"platform": "google_maps", "query": " ; "}).status_code, 400)
+        self.assertEqual(self.client.post("/api/scrape", json={"platform": "yelp", "query": "plumbers"}).status_code, 400)
+
+
 class TestSuggest(ApiBase):
     def setUp(self):
         super().setUp()
@@ -182,21 +326,52 @@ class TestSuggest(ApiBase):
         return r.get_json()["suggestions"]
 
     def test_past_searches(self):
-        self.assertEqual(self.ask("scrape_query", "rep"), ["furnace repair", "AC repair"])
-        self.assertEqual(self.ask("scrape_query", "heat"), ["heating and air conditioning"])
+        self.assertEqual(self.ask("scrape_query", "rep")[:2], ["furnace repair", "AC repair"])   # own history first
+        self.assertEqual(self.ask("scrape_query", "heat")[0], "heating and air conditioning")
 
     def test_past_locations_and_lead_cities(self):
         got = self.ask("scrape_location", "gar")
         self.assertEqual(got[0], "Garland, TX")
         self.assertEqual(len(got), len({g.lower() for g in got}))            # no duplicates
         self.assertIn("Irving, TX", self.ask("scrape_location", "irv"))      # from a lead's city
-        self.assertEqual(self.ask("scrape_location", "prairie"), ["Grand Prairie, TX"])
+        self.assertEqual(self.ask("scrape_location", "prairie")[0], "Grand Prairie, TX")
 
     def test_lead_search_matches_names_and_cities(self):
         got = self.ask("lead_search", "gar")
         self.assertIn("Garcia Heating & Air", got)
         self.assertIn("Garland Comfort Pros", got)
         self.assertIn("Garland", got)
+
+    def test_the_built_in_directory_fills_in_what_history_doesnt_have(self):
+        self.assertIn("Dentist", self.ask("scrape_query", "dent"))                  # never searched before
+        self.assertIn("Plumber", self.ask("scrape_query", "plum"))
+        self.assertEqual(self.ask("scrape_location", "mesq")[0], "Mesquite, TX")
+        self.assertEqual(self.ask("scrape_location", "fort wor")[0], "Fort Worth, TX")
+        self.assertEqual(self.ask("scrape_location", "garland t"), ["Garland, TX"])   # typed without the comma
+        self.assertIn("São Paulo, Brazil", self.ask("scrape_location", "sao pau"))    # accents not needed
+        got = self.ask("scrape_location", "spring")
+        self.assertEqual(len(got), 8)
+        self.assertTrue(got[0].endswith(", TX"), got)        # this account works in Texas, so Texas places lead
+        self.assertEqual(self.ask("lead_search", "dent"), [])                        # the leads box stays history-only
+
+    def test_a_new_account_with_no_history_still_gets_suggestions(self):
+        other = self.signup("fresh@example.com")
+        r = other.get("/api/suggest", query_string={"field": "scrape_location", "q": "bhop"})
+        self.assertEqual(r.get_json()["suggestions"][0], "Bhopal, India")
+        r = other.get("/api/suggest", query_string={"field": "scrape_query", "q": "hvac"})
+        self.assertEqual(r.get_json()["suggestions"], ["HVAC contractor"])
+
+    def test_places_like_the_ones_already_typed_come_first(self):
+        other = self.signup("fresh2@example.com")
+        ask = lambda ctx: other.get("/api/suggest", query_string={"field": "scrape_location", "q": "irvi", "context": ctx}).get_json()["suggestions"][0]
+        self.assertEqual(ask("irvi"), "Irvine, CA")                               # biggest, with nothing else to go on
+        self.assertEqual(ask("Garland, TX; Mesquite, TX; irvi"), "Irving, TX")
+
+    def test_history_holding_several_terms_is_suggested_one_term_at_a_time(self):
+        db.create_job("scrape", {"platform": "google_maps", "query": "boiler servicing; chimney lining",
+                                 "location": "Rowlett, TX; Sachse, TX"})
+        self.assertEqual(self.ask("scrape_query", "chimney l"), ["chimney lining"])
+        self.assertEqual(self.ask("scrape_location", "sach")[0], "Sachse, TX")
 
     def test_needs_three_characters_and_treats_wildcards_literally(self):
         self.assertEqual(self.ask("scrape_query", "re"), [])

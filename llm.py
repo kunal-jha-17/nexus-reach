@@ -67,7 +67,7 @@ def complete(prompt, task="draft", system=None, max_tokens=700, temperature=0.7,
         raise LLMError(f"{KEY_VARS[provider]} is not set")
     model = model_for(provider)
 
-    last_err = None
+    last_err, wait_hint = None, 0.0
     for attempt in range(3):
         try:
             if provider == "gemini":
@@ -94,7 +94,11 @@ def complete(prompt, task="draft", system=None, max_tokens=700, temperature=0.7,
                 resp = requests.post(url, headers={"Authorization": f"Bearer {key}"},
                                      json=body, timeout=timeout)
             if resp.status_code in (429, 500, 502, 503, 504):
-                raise LLMError(f"{provider} returned {resp.status_code}")
+                # A free tier that's rate-limiting says how long to wait; a short pause and one more
+                # try is the difference between "judged" and "could not judge" for most of a batch.
+                wait_hint = _retry_after(resp)
+                raise LLMError(f"{provider} returned {resp.status_code}"
+                               + (" (rate limit -- too many requests for this key's plan)" if resp.status_code == 429 else ""))
             if resp.status_code >= 400:
                 raise LLMError(f"{provider} error {resp.status_code}: {resp.text[:300]}")
             data = resp.json()
@@ -111,8 +115,21 @@ def complete(prompt, task="draft", system=None, max_tokens=700, temperature=0.7,
             last_err = e
             if isinstance(e, LLMError) and "error 4" in str(e) and "429" not in str(e):
                 break  # a 4xx other than rate-limit won't fix itself
-            time.sleep(2 * (attempt + 1))
+            if attempt < 2:                      # no point waiting after the last try
+                time.sleep(max(2 * (attempt + 1), min(wait_hint, MAX_RETRY_WAIT)))
+            wait_hint = 0.0
     raise LLMError(str(last_err))
+
+
+MAX_RETRY_WAIT = 20.0      # seconds; longer than this and the lead is left for the next run
+
+
+def _retry_after(resp):
+    """Seconds the provider asked us to wait (Retry-After header), or 0."""
+    try:
+        return max(0.0, float(resp.headers.get("Retry-After", "") or 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def extract_json(text):

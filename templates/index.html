@@ -44,13 +44,15 @@
       <div id="dash-tiles" class="tiles"></div>
       <div class="grid two">
         <div class="card"><h2>What to do next</h2><div id="dash-next"></div></div>
+        <div class="card"><h2>Replies to answer <span class="count-badge" id="dash-replies-n" hidden></span></h2>
+          <div id="dash-replies"></div></div>
+      </div>
+      <div class="grid two">
         <div class="card"><h2>Where leads are</h2><div id="dash-stages"></div></div>
+        <div class="card"><h2>Today</h2><div id="dash-budgets"></div></div>
       </div>
       <div class="card"><h2>Campaigns</h2><div id="dash-campaigns"></div></div>
-      <div class="grid two">
-        <div class="card"><h2>Budgets</h2><div id="dash-budgets"></div></div>
-        <div class="card"><h2>Recent activity</h2><div data-jobs="" data-limit="6"></div></div>
-      </div>
+      <div class="card"><h2>Recent runs</h2><div data-jobs="" data-limit="5"></div></div>
     </section>
 
     <!-- ============================================================ CAMPAIGNS -->
@@ -89,13 +91,17 @@
       <div id="cd-tiles" class="tiles"></div>
       <div class="card"><h2>Funnel</h2><div id="cd-funnel"></div></div>
       <div class="grid two">
-        <div class="card"><h2>What needs doing</h2><div id="cd-queue"></div></div>
+        <div class="card">
+          <div class="card-head"><h2>What needs doing</h2>
+            <button class="btn small primary" id="cd-pipeline" title="Enrich, judge and draft everything that still needs it. Nothing is sent.">Run all steps</button></div>
+          <div id="cd-queue"></div></div>
         <div class="card"><h2>Last 14 days</h2><div id="cd-chart"></div></div>
       </div>
       <div class="grid two">
         <div class="card"><h2>Who's in it</h2><div id="cd-breakdown"></div></div>
         <div class="card"><h2>Recent activity</h2><div id="cd-recent"></div></div>
       </div>
+      <div class="card" id="cd-replies-card" hidden><h2>Replies to answer</h2><div id="cd-replies"></div></div>
       <div class="card"><h2>Recent runs</h2><div data-jobs="" data-campaign-jobs="1" data-limit="6"></div></div>
       <div class="card" id="cd-settings">
         <h2>Campaign settings</h2>
@@ -109,7 +115,8 @@
         <div class="field"><label class="check"><input type="checkbox" id="cs-prio-on"> Use a different channel order for this campaign</label>
           <div id="cs-prio"></div></div>
         <div class="field"><label class="check"><input type="checkbox" id="cs-tpl-on"> Use different message templates for this campaign</label>
-          <div id="cs-tpl"></div><button class="btn small" id="cs-tpl-add" hidden>Add template</button></div>
+          <div id="cs-tpl"></div><button class="btn small" id="cs-tpl-add" hidden>Add template</button>
+          <p class="hint placeholder-help" hidden id="cs-tpl-help"></p></div>
         <button class="btn primary" id="cs-save">Save campaign settings</button>
       </div>
     </section>
@@ -119,10 +126,12 @@
       <header class="view-head"><h1>Find leads</h1></header>
       <div class="grid two">
         <div class="card">
-          <h2>Import a CSV</h2>
-          <p class="hint">Outscraper, Instant Data Scraper, your own sheets, the old scraper's export &mdash;
-             columns are matched automatically. Duplicates are merged, never overwritten.</p>
-          <div class="field"><label for="imp-file">CSV file</label><input type="file" id="imp-file" accept=".csv,text/csv"></div>
+          <h2>Import a list</h2>
+          <p class="hint">A CSV or Excel file from Outscraper, Instant Data Scraper, Google Sheets or your own list.
+             Columns are matched automatically (any &ldquo;&hellip; name&rdquo; column is read as the business name).
+             Duplicates are merged, never overwritten.</p>
+          <div class="field"><label for="imp-file">CSV or Excel file</label>
+            <input type="file" id="imp-file" accept=".csv,.xlsx,.xlsm,.tsv,.txt,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></div>
           <div class="row">
             <div class="field"><label for="imp-campaign">Campaign</label>
               <input id="imp-campaign" list="campaign-list" placeholder="e.g. dfw-trades"></div>
@@ -148,21 +157,26 @@
               </select></div>
             <div class="field"><label for="sc-max">Listings to check</label><input id="sc-max" type="number" min="1" max="200" value="30"></div>
           </div>
-          <label class="check"><input type="checkbox" id="sc-nosite" checked> <span>Only keep businesses with <b>no website</b> (skips the ones your offer wouldn't fit)</span></label>
-          <p class="hint" id="sc-nosite-hint" style="margin-top:-6px">With this on, "listings to check" is how many are looked at, not how many are kept &mdash;
-             expect roughly a quarter to a half to survive.</p>
           <div class="field"><label for="sc-query" id="sc-query-label">Search</label>
-            <input id="sc-query" placeholder="plumbers"></div>
+            <input id="sc-query" placeholder="AC repair; furnace repair"></div>
           <div class="field"><label for="sc-location">Location</label>
-            <input id="sc-location" placeholder="Dallas, TX"></div>
+            <input id="sc-location" placeholder="Garland, TX; Mesquite, TX"></div>
+          <p class="hint">Several at once: separate them with a semicolon ( ; ). Every search term is run in every place. Start typing for suggestions.</p>
+          <p class="hint" id="sc-plan" hidden></p>
           <div class="field"><label for="sc-campaign">Campaign</label>
             <input id="sc-campaign" list="campaign-list" placeholder="e.g. dfw-trades"></div>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="sc-nosite" checked> <span>Only keep businesses with <b>no website</b>
+              <span class="muted">&mdash; &ldquo;listings to check&rdquo; is then how many are looked at, not how many are kept</span></span></label>
+            <label class="check"><input type="checkbox" id="sc-then"> <span>When it finishes, <b>enrich, judge and draft</b> what it found
+              <span class="muted">&mdash; nothing is sent</span></span></label>
+          </div>
           <div class="row actions">
             <button class="btn primary" id="sc-go">Start scrape</button>
-            <span class="muted">or repeat every</span>
-            <input id="sc-hours" type="number" min="1" value="24" class="narrow" aria-label="Hours between runs">
-            <span class="muted">hours</span>
-            <button class="btn" id="sc-schedule">Schedule</button>
+            <span class="repeat"><span class="muted">or repeat every</span>
+              <input id="sc-hours" type="number" min="1" value="24" class="narrow" aria-label="Hours between runs">
+              <span class="muted">hours</span>
+              <button class="btn" id="sc-schedule">Schedule</button></span>
           </div>
         </div>
       </div>
@@ -188,6 +202,14 @@
           <option value="">Any fit</option><option value="1">Fits</option>
           <option value="0">Rejected</option><option value="null">Not judged</option></select>
         <select id="f-channel" aria-label="Channel"><option value="">Any channel</option></select>
+        <select id="f-has" aria-label="Contact details">
+          <option value="">Any contact details</option><option value="email">Has an email</option>
+          <option value="no_email">No email</option><option value="phone">Has a phone</option>
+          <option value="no_website">No website</option><option value="website">Has a website</option></select>
+        <select id="f-sent" aria-label="Outreach">
+          <option value="">Any outreach</option><option value="none">Nothing written</option>
+          <option value="drafted">Drafted, not sent</option><option value="sent">Sent</option>
+          <option value="failed">Failed / bounced</option></select>
         <select id="f-sort" aria-label="Sort">
           <option value="score">Best score first</option><option value="newest">Newest first</option>
           <option value="oldest">Oldest first</option><option value="name">Name A&ndash;Z</option></select>
@@ -196,6 +218,7 @@
         <span id="bulk-count"></span>
         <button class="linklike" id="bulk-all" hidden></button>
         <span class="spacer"></span>
+        <button class="btn small primary" data-bulk="pipeline" title="Enrich, judge and draft the selected leads">Run all steps</button>
         <button class="btn small" data-bulk="enrich">Enrich</button>
         <button class="btn small" data-bulk="judge">Judge fit</button>
         <button class="btn small" data-bulk="draft">Draft messages</button>
@@ -209,7 +232,7 @@
           <thead><tr>
             <th class="chk"><input type="checkbox" id="sel-page" aria-label="Select this page"></th>
             <th>Business</th><th>Reach</th><th class="num">Score</th><th>Fit</th>
-            <th>Channel</th><th>Stage</th><th>Sent</th>
+            <th>Channel</th><th>Stage</th><th>Outreach</th>
           </tr></thead>
           <tbody id="leads-body"></tbody>
         </table>
@@ -222,6 +245,14 @@
     <!-- ============================================================ PIPELINE -->
     <section id="view-pipeline" class="view" hidden>
       <header class="view-head"><h1>Enrich &amp; judge</h1></header>
+      <div class="card accent">
+        <div class="card-head"><div><h2>Do all of it in one run</h2>
+          <p class="hint" style="margin:0">Enrich &rarr; judge fit &rarr; draft messages, each step only for the leads that still need it. Nothing is sent.</p></div>
+          <div class="row-tight">
+            <select id="pl-campaign" aria-label="Campaign"><option value="">All campaigns</option></select>
+            <button class="btn primary" id="pl-go">Run all steps</button></div></div>
+        <div data-jobs="pipeline" data-limit="2" data-quiet="1"></div>
+      </div>
       <div class="grid two">
         <div class="card">
           <h2>1. Enrich</h2>
@@ -241,7 +272,7 @@
           <h2>2. Judge fit</h2>
           <p class="hint">An LLM reads your criteria and marks each lead Fits or Rejected. Anything it can't
              judge stays blank and is retried next time.</p>
-          <p class="hint" id="ju-removal-note">Rejected leads are kept, not deleted &mdash; filter by Fit = No to review them.</p>
+          <p class="hint" id="ju-removal-note">Rejected leads are kept, not deleted &mdash; filter by Fit = Rejected to review them.</p>
           <div class="field"><label for="ju-campaign">Leads</label>
             <select id="ju-campaign"><option value="">All campaigns</option></select></div>
           <div class="row">
@@ -271,135 +302,216 @@
     <!-- ============================================================ OUTREACH -->
     <section id="view-outreach" class="view" hidden>
       <header class="view-head"><h1>Outreach</h1>
-        <span class="muted" id="out-scope"></span></header>
+        <select id="dr-campaign" aria-label="Campaign"><option value="">All campaigns</option></select></header>
       <div id="out-warn" class="notice" hidden></div>
       <div class="grid two">
         <div class="card">
-          <h2>1. Draft messages</h2>
-          <p class="hint">Writes a message for every lead that doesn't have one yet (skipping rejected and do-not-contact leads).</p>
-          <div class="row">
-            <div class="field"><label for="dr-campaign">Campaign</label>
-              <select id="dr-campaign"><option value="">All campaigns</option></select></div>
-            <div class="field"><label for="dr-template">Template</label>
-              <select id="dr-template"></select></div>
+          <h2>1. Write the messages</h2>
+          <p class="hint">One for every lead that doesn't have one yet (rejected, do-not-contact and unreachable leads are skipped).</p>
+          <div class="field"><label for="dr-template">Template</label>
+            <select id="dr-template"></select></div>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="dr-exact"> <span>Use my templates <b>exactly as written</b>
+              <span class="muted">&mdash; just fill in the blanks, no AI rewriting</span></span></label>
+            <label class="check"><input type="checkbox" id="dr-force"> <span>Redo messages that are already written</span></label>
           </div>
-          <label class="check"><input type="checkbox" id="dr-force"> Redo existing drafts</label>
-          <div class="row actions"><button class="btn primary" id="dr-go">Draft messages</button></div>
-          <div data-jobs="draft" data-limit="2"></div>
+          <div class="row actions"><button class="btn primary" id="dr-go">Write messages</button></div>
+          <div data-jobs="draft" data-limit="2" data-quiet="1"></div>
         </div>
         <div class="card">
-          <h2>2. Send emails</h2>
+          <h2>2. Send the emails</h2>
           <div id="em-status"></div>
-          <label class="check"><input type="checkbox" id="em-onlyfit"> Only leads judged as Fits</label>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="em-onlyfit"> <span>Only leads judged as Fits</span></label>
+          </div>
           <div class="row actions">
             <button class="btn primary" id="em-send">Start sending</button>
             <button class="btn" id="em-replies">Check for replies</button>
           </div>
-          <div data-jobs="send_bulk" data-limit="2"></div>
+          <div data-jobs="send_bulk,followups" data-limit="2" data-quiet="1"></div>
         </div>
       </div>
-      <div class="card"><h2>Follow-ups due</h2><div id="fu-list"></div></div>
       <div class="card">
-        <h2>Send by hand</h2>
+        <h2>Replies to answer <span class="count-badge" id="rp-n" hidden></span></h2>
+        <p class="hint">People who wrote back. Open one to read the thread, then move it to Qualified, Won or Lost.</p>
+        <div id="rp-list"></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Email follow-ups due <span class="count-badge" id="fu-n" hidden></span></h2>
+          <button class="btn small primary" id="fu-all" hidden>Send all due</button></div>
+        <p class="hint">Emailed, no reply, and your follow-up delay has passed. Each goes out as a reply in the same thread.</p>
+        <div id="fu-list"></div>
+      </div>
+      <div class="card">
+        <h2>Send by hand <span class="count-badge" id="hand-n" hidden></span></h2>
         <p class="hint">Yelp, Facebook, Instagram, WhatsApp and phone leads. <b>Copy &amp; open</b> copies the message and
            opens the right page; you press send, then mark it sent.</p>
         <div id="hand-list"></div>
+      </div>
+      <div class="card">
+        <h2>Follow up by hand <span class="count-badge" id="hfu-n" hidden></span></h2>
+        <p class="hint">Messaged by hand, no reply recorded, and your follow-up delay has passed.</p>
+        <div id="hfu-list"></div>
       </div>
     </section>
 
     <!-- ============================================================ SETTINGS -->
     <section id="view-settings" class="view" hidden>
       <header class="view-head"><h1>Settings</h1><button class="btn primary" id="st-save">Save settings</button></header>
-      <div class="grid two">
-        <div class="card">
-          <h2>About you</h2>
-          <p class="hint">Who's sending, what you offer, price, tone. Given to the LLM with every draft.</p>
-          <textarea id="st-info" rows="8" aria-label="Business info"></textarea>
-        </div>
-        <div class="card">
-          <h2>How to reach a lead</h2>
-          <p class="hint">Order of preference. A lead gets the first channel you have contact details for.
-             (WhatsApp is only used for non-US numbers.)</p>
-          <div id="st-priority"></div>
-        </div>
+      <div class="subtabs" role="tablist" aria-label="Settings sections">
+        <a href="#settings/messaging" role="tab" data-tab="messaging">Messaging</a>
+        <a href="#settings/sending" role="tab" data-tab="sending">Sending</a>
+        <a href="#settings/connections" role="tab" data-tab="connections">Connections</a>
+        <a href="#settings/account" role="tab" data-tab="account">Account</a>
       </div>
-      <div class="card">
-        <h2>Message templates</h2>
-        <p class="hint">Structure and offer for each channel. The LLM personalises them per lead. Templates
-           matching a lead's channel are rotated through automatically.</p>
-        <div id="st-templates"></div>
-        <button class="btn small" id="st-tpl-add">Add template</button>
-      </div>
-      <div class="card">
-        <h2>Fit judging</h2>
-        <label class="check"><input type="checkbox" id="st-autoremove"> Automatically delete rejected leads
-          <span class="muted">(only ones with no notes, draft or activity yet &mdash; never touches a lead you've worked on)</span></label>
-        <p class="hint" id="st-autoremove-warn" style="margin:-4px 0 0" hidden>This permanently deletes leads the moment Judge fit rejects them. Off by default &mdash; rejected leads are normally kept so you can review why.</p>
-      </div>
-      <div class="grid two">
-        <div class="card">
-          <h2>Email sending</h2>
-          <div class="row">
-            <div class="field"><label for="st-limit">Daily limit</label><input id="st-limit" type="number" min="1"></div>
-            <div class="field"><label for="st-delay">Seconds between emails</label><input id="st-delay" type="number" min="0"></div>
+
+      <!-- ......................................................... messaging -->
+      <div class="tabpane" data-pane="messaging">
+        <div class="grid two">
+          <div class="card">
+            <h2>About you</h2>
+            <p class="hint">Who's sending, what you offer, price, tone. Given to the AI with every draft.</p>
+            <textarea id="st-info" rows="8" aria-label="Business info"></textarea>
           </div>
-          <div class="row">
-            <div class="field"><label for="st-fudays">Follow up after (days)</label><input id="st-fudays" type="number" min="1"></div>
-            <div class="field"><label for="st-fumax">Max follow-ups</label><input id="st-fumax" type="number" min="0"></div>
+          <div class="card">
+            <h2>How to reach a lead</h2>
+            <p class="hint">Order of preference. A lead gets the first channel you have contact details for.
+               (WhatsApp is only used for numbers outside the US.)</p>
+            <div id="st-priority"></div>
           </div>
-          <label class="check"><input type="checkbox" id="st-warmup"> Ramp up gradually (10 &rarr; 20 &rarr; 30 a day) on a new account</label>
-          <div class="field"><label for="st-footer">Line added to every email</label>
-            <textarea id="st-footer" rows="3"></textarea></div>
         </div>
         <div class="card">
-          <h2>Do-not-contact list</h2>
-          <div class="row">
-            <div class="field grow"><label for="sp-value">Email, phone, or Instagram/Facebook URL</label>
-              <input id="sp-value"></div>
-            <button class="btn" id="sp-add">Add</button>
+          <h2>Message templates</h2>
+          <p class="hint">One or more per channel. Templates matching a lead's channel are rotated through automatically.</p>
+          <div id="st-templates"></div>
+          <button class="btn small" id="st-tpl-add">Add template</button>
+          <p class="hint placeholder-help" id="st-tpl-help"></p>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="st-exact"> <span>Use my templates <b>exactly as written</b>
+              <span class="muted">&mdash; fill in the blanks and change nothing else. Off: the AI rewrites each one for the lead (needs an AI key).</span></span></label>
           </div>
-          <div id="sp-list"></div>
         </div>
-      </div>
-      <div class="card" id="st-storage-card" hidden>
-        <h2>Storage &amp; backups <span class="muted" style="font-weight:400">(admin)</span></h2>
-        <div id="st-storage"></div>
-        <div class="row actions">
-          <button class="btn small" id="stor-backup">Back up now</button>
-          <a class="btn small" href="/api/admin/backup.zip" download>Download a full backup</a>
-        </div>
-      </div>
-      <div class="card">
-        <h2>Connections</h2>
-        <p class="hint">Your own keys and email account. They're stored encrypted, only used for <b>your</b> leads, and
-           never shown again after saving. Leave a box empty to keep what's saved.</p>
-        <div id="conn-unreadable" class="notice" hidden>Your saved keys couldn't be read &mdash; the server's secret key
-          changed since you saved them. Enter them again below (your old copy is kept aside), or ask the server owner to restore the old key.</div>
-        <div id="st-conn"></div>
-        <button class="btn primary" id="conn-save">Save connections</button>
-      </div>
-      <div class="grid two">
         <div class="card">
-          <h2>Your account</h2>
-          <div class="field"><label for="ac-name">Name</label><input id="ac-name"></div>
-          <button class="btn small" id="ac-save">Save name</button>
-          <h2 style="margin-top:18px">Change password</h2>
-          <div class="field"><label for="pw-cur">Current password</label>
-            <div class="pw-wrap"><input id="pw-cur" type="password" autocomplete="current-password">
-              <button type="button" class="pw-eye" data-toggle="pw-cur" aria-label="Show password">&#128065;</button></div></div>
-          <div class="field"><label for="pw-new">New password (8+ characters)</label>
-            <div class="pw-wrap"><input id="pw-new" type="password" autocomplete="new-password">
-              <button type="button" class="pw-eye" data-toggle="pw-new" aria-label="Show password">&#128065;</button></div></div>
-          <div class="field"><label for="pw-confirm">Confirm new password</label>
-            <div class="pw-wrap"><input id="pw-confirm" type="password" autocomplete="new-password">
-              <button type="button" class="pw-eye" data-toggle="pw-confirm" aria-label="Show password">&#128065;</button></div></div>
-          <button class="btn small" id="pw-save">Change password</button>
-          <h2 style="margin-top:18px">Your data</h2>
-          <p class="hint">Download all your leads, campaigns, settings and activity as ordinary files. Passwords and API keys are never included.</p>
-          <a class="btn small" href="/api/export/my-data.zip" download>Download my data</a>
+          <h2>Follow-up message</h2>
+          <p class="hint">Sent to leads who haven't answered. Blanks like <code>{business_name}</code> work here too.
+             Leave it empty and the AI writes a short nudge for each lead instead.</p>
+          <textarea id="st-followup" rows="3" placeholder="Hi {first_name|there}, just floating this back up — is a website something you'd want for {business_name}?"></textarea>
+        </div>
+      </div>
+
+      <!-- ........................................................... sending -->
+      <div class="tabpane" data-pane="sending" hidden>
+        <div class="grid two">
+          <div class="card">
+            <h2>Email limits</h2>
+            <div class="row">
+              <div class="field"><label for="st-limit">Emails a day</label><input id="st-limit" type="number" min="1"></div>
+              <div class="field"><label for="st-delay">Seconds between emails</label><input id="st-delay" type="number" min="0"></div>
+            </div>
+            <div class="row">
+              <div class="field"><label for="st-fudays">Follow up after (days)</label><input id="st-fudays" type="number" min="1"></div>
+              <div class="field"><label for="st-fumax">Follow-ups per lead</label><input id="st-fumax" type="number" min="0"></div>
+            </div>
+            <div class="checks">
+              <label class="check"><input type="checkbox" id="st-warmup"> <span>Ramp up gradually (10 &rarr; 20 &rarr; 30 a day) on a new sending account</span></label>
+            </div>
+            <div class="field"><label for="st-footer">Line added to every email</label>
+              <textarea id="st-footer" rows="3"></textarea></div>
+          </div>
+          <div class="card">
+            <h2>Sending hours</h2>
+            <p class="hint">Bulk sends and follow-ups only go out inside these hours, so nothing lands at 3 am. One-off sends from a lead are never blocked.</p>
+            <div class="checks">
+              <label class="check"><input type="checkbox" id="st-window"> <span>Only send during these hours</span></label>
+            </div>
+            <div class="row">
+              <div class="field"><label for="st-start">From</label><select id="st-start"></select></div>
+              <div class="field"><label for="st-end">Until</label><select id="st-end"></select></div>
+            </div>
+            <div class="field"><label>On</label><div id="st-days" class="daypick"></div></div>
+            <div class="field"><label for="st-tz">Time zone <span class="muted">(your leads' time zone; also decides when &ldquo;today&rdquo; starts for the daily limit)</span></label>
+              <div class="row-tight"><input id="st-tz" list="tz-list" placeholder="UTC">
+                <button class="btn small" id="st-tz-mine" type="button">Use mine</button></div></div>
+          </div>
+        </div>
+        <div class="grid two">
+          <div class="card">
+            <h2>Replies</h2>
+            <p class="hint">With your inbox connected, replies and bounced addresses are picked up automatically &mdash; read or unread &mdash;
+               so nobody who answered gets a follow-up.</p>
+            <div class="field"><label for="st-replymin">Check the inbox every</label>
+              <select id="st-replymin">
+                <option value="15">15 minutes</option><option value="30">30 minutes</option><option value="60">hour</option>
+                <option value="180">3 hours</option><option value="0">Never &mdash; only when I press Check for replies</option></select></div>
+            <h2 style="margin-top:16px">Fit judging</h2>
+            <div class="checks">
+              <label class="check"><input type="checkbox" id="st-autoremove"> <span>Automatically delete rejected leads
+                <span class="muted">(only ones with no notes, draft or activity yet &mdash; never a lead you've worked on)</span></span></label>
+            </div>
+            <p class="hint" id="st-autoremove-warn" hidden>This permanently deletes leads the moment Judge fit rejects them. Off by default &mdash; rejected leads are normally kept so you can review why.</p>
+          </div>
+          <div class="card">
+            <h2>Do-not-contact list</h2>
+            <div class="row">
+              <div class="field grow"><label for="sp-value">Email, phone, or Instagram/Facebook URL</label>
+                <input id="sp-value"></div>
+              <button class="btn" id="sp-add" style="margin-bottom:12px">Add</button>
+            </div>
+            <div id="sp-list"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ....................................................... connections -->
+      <div class="tabpane" data-pane="connections" hidden>
+        <div class="card">
+          <div class="card-head"><div><h2>Connections</h2>
+            <p class="hint" style="margin:0">Your own keys and email account. They're stored encrypted, only used for <b>your</b> leads, and
+              never shown again after saving. Leave a box empty to keep what's saved.</p></div>
+            <button class="btn primary" id="conn-save">Save connections</button></div>
+          <div id="conn-unreadable" class="notice" hidden>Your saved keys couldn't be read &mdash; the server's secret key
+            changed since you saved them. Enter them again below (your old copy is kept aside), or ask the server owner to restore the old key.</div>
+          <div id="st-conn"></div>
+        </div>
+      </div>
+
+      <!-- ........................................................... account -->
+      <div class="tabpane" data-pane="account" hidden>
+        <div class="grid two">
+          <div class="card">
+            <h2>Your account</h2>
+            <div class="row">
+              <div class="field"><label for="ac-name">Name</label><input id="ac-name"></div>
+              <button class="btn" id="ac-save" style="margin-bottom:12px">Save name</button>
+            </div>
+            <h2 style="margin-top:8px">Your data</h2>
+            <p class="hint">Download all your leads, campaigns, settings and activity as ordinary files. Passwords and API keys are never included.</p>
+            <a class="btn small" href="/api/export/my-data.zip" download>Download my data</a>
+          </div>
+          <div class="card">
+            <h2>Change password</h2>
+            <div class="field"><label for="pw-cur">Current password</label>
+              <div class="pw-wrap"><input id="pw-cur" type="password" autocomplete="current-password">
+                <button type="button" class="pw-eye" data-toggle="pw-cur" aria-label="Show password">&#128065;</button></div></div>
+            <div class="field"><label for="pw-new">New password (8+ characters)</label>
+              <div class="pw-wrap"><input id="pw-new" type="password" autocomplete="new-password">
+                <button type="button" class="pw-eye" data-toggle="pw-new" aria-label="Show password">&#128065;</button></div></div>
+            <div class="field"><label for="pw-confirm">Confirm new password</label>
+              <div class="pw-wrap"><input id="pw-confirm" type="password" autocomplete="new-password">
+                <button type="button" class="pw-eye" data-toggle="pw-confirm" aria-label="Show password">&#128065;</button></div></div>
+            <button class="btn" id="pw-save">Change password</button>
+          </div>
+        </div>
+        <div class="card" id="st-storage-card" hidden>
+          <h2>Storage &amp; backups <span class="chip info">admin</span></h2>
+          <div id="st-storage"></div>
+          <div class="row actions">
+            <button class="btn small" id="stor-backup">Back up now</button>
+            <a class="btn small" href="/api/admin/backup.zip" download>Download a full backup</a>
+          </div>
         </div>
         <div class="card" id="st-users-card" hidden>
-          <h2>People using this server</h2>
+          <h2>People using this server <span class="chip info">admin</span></h2>
           <p class="hint">Each person has their own separate database. Deleting someone permanently removes all of their data.</p>
           <div id="st-users"></div>
         </div>
@@ -410,6 +522,13 @@
 </div>
 
 <datalist id="campaign-list"></datalist>
+<datalist id="tz-list">
+  <option value="America/New_York"><option value="America/Chicago"><option value="America/Denver"><option value="America/Los_Angeles">
+  <option value="America/Toronto"><option value="America/Sao_Paulo"><option value="Europe/London"><option value="Europe/Berlin">
+  <option value="Europe/Paris"><option value="Africa/Lagos"><option value="Africa/Johannesburg"><option value="Asia/Dubai">
+  <option value="Asia/Kolkata"><option value="Asia/Singapore"><option value="Asia/Manila"><option value="Australia/Sydney">
+  <option value="Pacific/Auckland"><option value="UTC">
+</datalist>
 
 <!-- ============================================================ LEAD DRAWER -->
 <div id="scrim" hidden></div>
@@ -426,6 +545,7 @@
   </footer>
 </aside>
 
+<div id="offline" class="offline" hidden>Can't reach the server &mdash; it may be restarting. Retrying&hellip;</div>
 <div id="toasts" aria-live="polite"></div>
 <script src="/static/app.js"></script>
 </body>

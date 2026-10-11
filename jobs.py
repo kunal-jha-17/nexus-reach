@@ -20,7 +20,7 @@ import schema
 import userctx
 
 SCRAPE_LOCK = threading.Lock()
-SINGLETON_KINDS = {"enrich", "judge", "draft", "send_bulk"}
+SINGLETON_KINDS = {"enrich", "judge", "draft", "send_bulk", "pipeline", "followups"}
 
 _lock = threading.Lock()
 _stops = {}      # (user_id, job_id) -> threading.Event
@@ -131,19 +131,30 @@ def stop_job(job_id):
 _scheduler_started = False
 
 
-def run_scheduler_once(launch_scrape):
-    """Start any recurring scrape that's due, for every user, each as that user."""
+def run_scheduler_once(launch_scrape, check_replies=None):
+    """Start any recurring scrape that's due -- and look for replies -- for every user, each as
+    that user. One person's failure (a full queue, a mailbox that's down) never stops the rest."""
     for user in accounts.all_users():
-        with userctx.use(user, accounts.db_path_for(user["id"])):
-            for s in db.due_schedules():
-                db.mark_schedule_ran(s["id"], s["interval_hours"])
-                launch_scrape(s["platform"], s["query"], s["location"] or "",
-                              s["max_results"], s["campaign"] or "")
+        try:
+            with userctx.use(user, accounts.db_path_for(user["id"])):
+                for s in db.due_schedules():
+                    try:
+                        launch_scrape(s["platform"], s["query"], s["location"] or "",
+                                      s["max_results"], s["campaign"] or "", bool(s.get("only_no_website")))
+                    except JobBusy:
+                        continue          # their queue is full: leave it due, try again next minute
+                    except Exception:  # noqa: BLE001 -- e.g. a schedule that no longer makes sense
+                        traceback.print_exc()
+                    db.mark_schedule_ran(s["id"], s["interval_hours"])
+                if check_replies is not None:
+                    check_replies()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
 
 
-def start_scheduler(launch_scrape):
-    """Every minute, run whatever recurring scrapes are due.
-    launch_scrape(platform, query, location, max_results, campaign)."""
+def start_scheduler(launch_scrape, check_replies=None):
+    """Every minute, run whatever recurring scrapes are due and (when given) the reply check.
+    launch_scrape(platform, query, location, max_results, campaign, only_no_website)."""
     global _scheduler_started
     if _scheduler_started:
         return
@@ -152,7 +163,7 @@ def start_scheduler(launch_scrape):
     def loop():
         while True:
             try:
-                run_scheduler_once(launch_scrape)
+                run_scheduler_once(launch_scrape, check_replies)
             except Exception:  # noqa: BLE001 -- never let the loop die
                 traceback.print_exc()
             time.sleep(60)

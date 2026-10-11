@@ -85,8 +85,11 @@ def norm_phone(raw):
         if len(digits) == 10 and re.fullmatch(r"[2-9]\d{2}[2-9]\d{6}", digits):
             return "+1" + digits
         return ""
-    if 8 <= len(digits) <= 12:
-        return "+" + cc + digits.lstrip("0")
+    national = digits.lstrip("0")
+    if national.startswith(cc) and len(national) - len(cc) >= 9 and len(national) > 10:
+        national = national[len(cc):]          # written with the country code but no "+": 91 98765 43210
+    if 7 <= len(national) <= 12:
+        return "+" + cc + national
     return ""
 
 
@@ -100,14 +103,23 @@ _EMAIL_RE = re.compile(r"^[a-z0-9._%+\-]+@[a-z0-9\-]+(\.[a-z0-9\-]+)*\.[a-z]{2,}
 _BAD_EMAIL_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js", ".ico")
 
 
+_EMAIL_FIND = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9\-]+(?:\.[a-z0-9\-]+)*\.[a-z]{2,}")
+
+
 def norm_email(raw):
+    """One clean, lowercased address, or ''. A cell holding several ("a@x.com; b@x.com",
+    "Jo <jo@x.com>") gives the first usable one instead of nothing."""
     if not raw:
         return ""
     e = str(raw).strip().lower()
     e = re.sub(r"^mailto:", "", e).split("?")[0].strip(" <>;,.\"'")
-    if e.endswith(_BAD_EMAIL_SUFFIX) or not _EMAIL_RE.match(e):
-        return ""
-    return e
+    if _EMAIL_RE.match(e):
+        return "" if e.endswith(_BAD_EMAIL_SUFFIX) else e
+    for m in _EMAIL_FIND.findall(e):
+        m = m.strip(".")
+        if _EMAIL_RE.match(m) and not m.endswith(_BAD_EMAIL_SUFFIX):
+            return m
+    return ""
 
 
 # --------------------------------------------------------------------- URLs
@@ -193,6 +205,18 @@ DIRECTORY_HOSTS = (
     "angi.com", "angieslist.com", "homeadvisor.com", "thumbtack.com", "yellowpages.com",
     "bbb.org", "mapquest.com", "manta.com", "porch.com", "instagram.com", "facebook.com",
     "fb.com", "linkedin.com", "yelp.com",
+    # messaging / link pages
+    "wa.me", "whatsapp.com", "t.me", "m.me", "bit.ly", "tinyurl.com", "taplink.cc", "bio.link",
+    "carrd.co", "lnk.bio", "campsite.bio", "snapchat.com", "threads.net",
+    # listing, booking and marketplace pages (a profile there is not the business's own site)
+    "tripadvisor.com", "foursquare.com", "houzz.com", "nextdoor.com", "superpages.com",
+    "chamberofcommerce.com", "alignable.com", "buildzoom.com", "homeguide.com", "expertise.com",
+    "justdial.com", "sulekha.com", "indiamart.com", "tradeindia.com", "practo.com", "lybrate.com",
+    "zocdoc.com", "healthgrades.com", "vitals.com", "webmd.com", "ratemds.com", "1mg.com",
+    "booksy.com", "vagaro.com", "fresha.com", "styleseat.com", "mindbodyonline.com", "schedulicity.com",
+    "opentable.com", "doordash.com", "ubereats.com", "grubhub.com", "zomato.com", "swiggy.com",
+    "booking.com", "airbnb.com", "expedia.com", "makemytrip.com", "etsy.com", "amazon.com", "ebay.com",
+    "apple.com", "play.google.com", "yell.com", "gumtree.com", "craigslist.org", "olx.in",
 )
 
 
@@ -304,11 +328,31 @@ _TEXT_KEYS = [
 ]
 
 
+# What spreadsheets put in a cell that has nothing in it.
+_BLANK_WORDS = {"n/a", "na", "n.a.", "n.a", "#n/a", "none", "null", "nil", "nan", "-", "--", "---", "—",
+                "not available", "not applicable", "unknown", "tbd", "?", "x", "."}
+# ...and, in a link / email / phone column only, a yes-or-no answer is not a link.
+_BLANK_FLAGS = {"no", "yes", "y", "n", "true", "false", "0", "1"}
+_CONTACT_KEYS = {"phone", "phone_raw", "email", "website", "instagram_url", "facebook_url",
+                 "linkedin_url", "yelp_url", "google_maps_url"}
+
+
+def clean_cell(key, value):
+    """'' for a placeholder such as "N/A" or "-", else the trimmed text."""
+    v = "" if value is None else str(value).strip()
+    low = v.lower()
+    if low in _BLANK_WORDS and key != "notes":
+        return ""
+    if key in _CONTACT_KEYS and low in _BLANK_FLAGS:
+        return ""
+    return v
+
+
 def normalize_lead(raw):
     """Take a dict with any subset of canonical fields and return a cleaned
     dict with ALL data columns present (blank when unknown) plus the derived
     ones (has_website, website_domain, name_key, city/state, trade)."""
-    d = {k: ("" if raw.get(k) is None else str(raw.get(k)).strip()) for k in _TEXT_KEYS}
+    d = {k: clean_cell(k, raw.get(k)) for k in _TEXT_KEYS}
     d["review_count"] = _to_int(raw.get("review_count"))
 
     d["business_name"] = re.sub(r"\s+", " ", d["business_name"])
@@ -491,7 +535,20 @@ _PH_RE = re.compile(
 )
 
 
+# Shown under every template editor.
+PLACEHOLDER_HELP = ("{business_name}  {first_name}  {contact_name}  {city}  {state}  {location}  {trade}  "
+                    "{phone}  {email}  {website}  {address}")
+
+
 def _placeholder_value(token, lead):
+    token, bar, fallback = token.partition("|")       # {first_name|there}: use "there" when blank
+    value, known = _placeholder_lookup(token, lead)
+    if known and not value and bar:
+        return fallback.strip(), True
+    return value, known
+
+
+def _placeholder_lookup(token, lead):
     key = re.sub(r"[^a-z0-9]+", "_", token.lower()).strip("_")
     field = _PH_FIELDS.get(key)
     if field is None:
@@ -517,14 +574,16 @@ def fill_placeholders(text, lead):
     the lead's real details. Returns (text, unresolved): `unresolved` lists the placeholders that
     are still in the text -- a known one whose value is blank for this lead, or any {curly} /
     {{double curly}} / <<angle>> token that isn't recognised. Square brackets are only touched
-    when they hold a known placeholder, so ordinary [bracketed] text is left alone."""
+    when they hold a known placeholder, so ordinary [bracketed] text is left alone.
+    A fallback can be given after a bar: {first_name|there} becomes "there" when the lead has
+    no contact name, instead of blocking the send."""
     unresolved = []
 
     def sub(m):
         token = next(g for g in m.groups() if g is not None)
         square = m.group(4) is not None
         value, known = _placeholder_value(token, lead or {})
-        if known and value:
+        if known and (value or "|" in token):      # {first_name|} = "leave it out when blank"
             return value
         if known or not square:
             if m.group(0) not in unresolved:

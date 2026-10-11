@@ -84,9 +84,13 @@ def judge_lead(lead, criteria):
     """Returns {"fits": bool, "confidence": str, "reason": str}. Raises on failure."""
     reply = llm.complete(build_prompt(lead, criteria), task="filter", max_tokens=500, temperature=0)
     data = llm.extract_json(reply)
-    fits = data.get("fits")
-    if isinstance(fits, str):
+    fits = data.get("fits") if isinstance(data, dict) else None
+    if isinstance(fits, str) and fits.strip().lower() in ("true", "yes", "1", "false", "no", "0"):
         fits = fits.strip().lower() in ("true", "yes", "1")
+    if not isinstance(fits, bool):
+        # No verdict in the reply. Recording that as "rejected" would quietly throw the lead away;
+        # raising leaves it unjudged, to be tried again on the next run.
+        raise ValueError("the AI's reply had no yes/no verdict")
     conf = str(data.get("confidence", "low")).lower()
     return {
         "fits": bool(fits),

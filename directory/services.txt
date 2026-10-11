@@ -1,0 +1,403 @@
+# Search terms suggested in the Find leads "Search" box: one per line, most common first within
+# each group. Add your own lines freely -- nothing else needs changing.
+# --- home services & trades
+HVAC contractor
+AC repair
+Air conditioning repair
+Air conditioning contractor
+Heating and air conditioning
+Heating contractor
+Furnace repair
+Air duct cleaning
+Plumber
+Plumbing contractor
+Emergency plumber
+Drain cleaning service
+Water heater repair
+Septic tank service
+Electrician
+Electrical contractor
+Roofing contractor
+Roof repair
+Gutter cleaning service
+Gutter installation
+General contractor
+Home builder
+Remodeling contractor
+Kitchen remodeler
+Bathroom remodeler
+Handyman
+Painter
+Painting contractor
+Drywall contractor
+Flooring contractor
+Flooring store
+Carpet installer
+Carpet cleaning service
+Tile contractor
+Hardwood floor refinishing
+Concrete contractor
+Masonry contractor
+Paving contractor
+Asphalt contractor
+Fence contractor
+Deck builder
+Siding contractor
+Window installation service
+Window cleaning service
+Door installer
+Garage door repair
+Garage door supplier
+Insulation contractor
+Foundation repair
+Waterproofing service
+Excavating contractor
+Demolition contractor
+Welder
+Cabinet maker
+Carpenter
+Countertop installer
+Locksmith
+Pest control service
+Exterminator
+Termite control
+Wildlife removal service
+Landscaper
+Landscaping company
+Lawn care service
+Lawn mowing service
+Tree service
+Tree removal service
+Irrigation contractor
+Sprinkler repair
+Pool cleaning service
+Pool contractor
+Pool repair
+Pressure washing service
+House cleaning service
+Maid service
+Janitorial service
+Commercial cleaning service
+Junk removal service
+Moving company
+Movers
+Storage facility
+Appliance repair
+Refrigerator repair
+Washer and dryer repair
+Chimney sweep
+Solar panel installer
+Solar energy company
+Home inspector
+Interior designer
+Home security company
+Septic system service
+Well drilling contractor
+Water damage restoration
+Fire damage restoration
+Mold remediation
+Snow removal service
+Upholstery cleaning service
+Furniture repair
+Blinds and shutters installer
+Glass repair service
+Elevator service
+# --- auto
+Auto repair shop
+Mechanic
+Mobile mechanic
+Auto body shop
+Collision repair
+Car detailing service
+Mobile car detailing
+Car wash
+Tire shop
+Oil change service
+Transmission shop
+Brake shop
+Auto glass shop
+Windshield repair
+Towing service
+Used car dealer
+Car dealer
+Motorcycle repair shop
+Truck repair shop
+RV repair shop
+Auto parts store
+Car rental agency
+Driving school
+# --- health & medical
+Dentist
+Dental clinic
+Orthodontist
+Pediatric dentist
+Cosmetic dentist
+Doctor
+Family practice physician
+Medical clinic
+Urgent care center
+Pediatrician
+Dermatologist
+Skin clinic
+Chiropractor
+Physical therapist
+Physiotherapy clinic
+Optometrist
+Eye clinic
+Optician
+Psychologist
+Therapist
+Counselor
+Psychiatrist
+Mental health clinic
+Acupuncturist
+Massage therapist
+Nutritionist
+Dietitian
+Podiatrist
+Orthopedic clinic
+Cardiologist
+Gynecologist
+Fertility clinic
+ENT specialist
+Hearing aid store
+Audiologist
+Home health care service
+Assisted living facility
+Nursing home
+Pharmacy
+Medical laboratory
+Diagnostic center
+Hospital
+Ayurvedic clinic
+Homeopathy clinic
+Veterinarian
+Animal hospital
+Hair transplant clinic
+Plastic surgeon
+Weight loss clinic
+Speech therapist
+Occupational therapist
+# --- beauty & wellness
+Hair salon
+Barber shop
+Beauty salon
+Nail salon
+Spa
+Med spa
+Day spa
+Massage spa
+Tattoo shop
+Piercing shop
+Lash studio
+Eyebrow threading
+Waxing salon
+Tanning salon
+Makeup artist
+Bridal makeup artist
+Gym
+Fitness center
+Personal trainer
+Yoga studio
+Pilates studio
+CrossFit gym
+Martial arts school
+Boxing gym
+Dance studio
+Swimming school
+# --- food & hospitality
+Restaurant
+Cafe
+Coffee shop
+Bakery
+Pizza restaurant
+Mexican restaurant
+Italian restaurant
+Indian restaurant
+Chinese restaurant
+Thai restaurant
+Japanese restaurant
+Sushi restaurant
+Burger restaurant
+Barbecue restaurant
+Seafood restaurant
+Vegan restaurant
+Fast food restaurant
+Food truck
+Caterer
+Catering service
+Bar
+Pub
+Brewery
+Winery
+Ice cream shop
+Dessert shop
+Juice bar
+Deli
+Butcher shop
+Grocery store
+Liquor store
+Hotel
+Motel
+Bed and breakfast
+Guest house
+Resort
+Banquet hall
+Event venue
+Wedding venue
+# --- professional services
+Lawyer
+Law firm
+Personal injury attorney
+Family law attorney
+Divorce lawyer
+Immigration attorney
+Criminal defense attorney
+Estate planning attorney
+Real estate attorney
+Bankruptcy attorney
+Accountant
+CPA
+Bookkeeping service
+Tax preparation service
+Tax consultant
+Financial advisor
+Insurance agency
+Insurance broker
+Mortgage broker
+Mortgage lender
+Real estate agent
+Real estate agency
+Property management company
+Notary public
+Architect
+Civil engineer
+Land surveyor
+Marketing agency
+Advertising agency
+Web designer
+Graphic designer
+Printing service
+Sign shop
+Photographer
+Wedding photographer
+Videographer
+Recruitment agency
+Staffing agency
+Business consultant
+IT services
+Computer repair service
+Phone repair shop
+Translation service
+Security guard service
+Private investigator
+Travel agency
+Courier service
+Coworking space
+# --- events & personal
+Wedding planner
+Event planner
+Florist
+DJ service
+Party rental service
+Limousine service
+Taxi service
+Funeral home
+Dry cleaner
+Laundromat
+Laundry service
+Tailor
+Shoe repair shop
+Jewelry repair
+Watch repair
+# --- pets
+Pet groomer
+Dog groomer
+Mobile dog groomer
+Dog trainer
+Dog daycare
+Pet boarding
+Kennel
+Pet store
+# --- education & childcare
+Daycare
+Child care center
+Preschool
+Kindergarten
+Private school
+Tutoring service
+Coaching center
+Music school
+Music teacher
+Art school
+Language school
+Driving instructor
+Test preparation center
+Training institute
+# --- retail
+Furniture store
+Mattress store
+Jewelry store
+Clothing store
+Boutique
+Shoe store
+Gift shop
+Bookstore
+Toy store
+Bicycle shop
+Sporting goods store
+Hardware store
+Paint store
+Garden center
+Plant nursery
+Electronics store
+Mobile phone store
+Appliance store
+Thrift store
+Pawn shop
+Optical store
+Cosmetics store
+Vape shop
+Smoke shop
+Gun shop
+Music store
+Antique store
+Art gallery
+Craft store
+Bridal shop
+Convenience store
+Supermarket
+# --- construction & industrial
+Construction company
+Commercial contractor
+Steel fabricator
+Machine shop
+Metal fabricator
+Sheet metal contractor
+Scaffolding service
+Crane service
+Equipment rental agency
+Trucking company
+Freight forwarding service
+Logistics company
+Warehouse
+Packaging company
+Manufacturer
+Wholesaler
+Recycling center
+Dumpster rental service
+# --- other local
+Church
+Nonprofit organization
+Community center
+Golf course
+Bowling alley
+Escape room
+Trampoline park
+Campground
+Tour operator
+Farm
+Feed store
+Tractor dealer
+Boat repair shop
+Marina

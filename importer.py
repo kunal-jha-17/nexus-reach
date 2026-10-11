@@ -82,6 +82,24 @@ IGNORED = {"has_website", "id", "quality_score", "score", "status", "stage", "fi
            "fit_reason", "confidence_notes", "score_reasons"}
 
 
+_HAS_CONTACT = ("phone", "phone_raw", "email", "website", "instagram_url", "facebook_url",
+                "yelp_url", "google_maps_url")
+
+
+def _worth_keeping(norm):
+    """A row is a lead if, once cleaned ("N/A" and "-" are nothing), it has a name or any way to reach it."""
+    return bool(norm["business_name"] or any(norm.get(k) for k in _HAS_CONTACT))
+
+
+def _cell(row, h):
+    """One CSV cell as text. Undoes the leading apostrophe our own export puts in front of
+    values a spreadsheet would otherwise run as a formula ('=..., '@...)."""
+    v = (row.get(h) or "").strip()
+    if len(v) > 1 and v[0] == "'" and v[1] in "=@+-":
+        v = v[1:]
+    return "" if v.lower() == "nan" else v
+
+
 def _norm_header(h):
     return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
 
@@ -122,10 +140,64 @@ def map_headers(headers):
     return mapping, unmapped
 
 
+def _decode(data):
+    """Spreadsheet exports aren't always UTF-8: Excel on Windows writes Windows-1252 ("café"
+    arrives as a broken character otherwise), and "Unicode text" is UTF-16."""
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("cp1252", errors="replace")
+
+
+def _delimiter(text):
+    """Comma, semicolon (Excel in much of Europe), tab or bar -- whichever the header row uses most."""
+    first = next((ln for ln in text.splitlines() if ln.strip()), "")
+    counts = {d: first.count(d) for d in (",", ";", "\t", "|")}
+    best = max(counts, key=counts.get)
+    return best if counts[best] else ","
+
+
 def rows_from_csv_bytes(data):
-    text = data.decode("utf-8-sig", errors="replace")
-    reader = csv.DictReader(io.StringIO(text))
-    return reader.fieldnames or [], list(reader)
+    text = _decode(data)
+    lines = text.splitlines(keepends=True)
+    while lines and not lines[0].strip(" ,;\t|\r\n"):       # blank lines above the header row
+        lines.pop(0)
+    text = "".join(lines)
+    reader = csv.DictReader(io.StringIO(text), delimiter=_delimiter(text))
+    headers = [h for h in (reader.fieldnames or []) if h is not None and str(h).strip()]
+    return headers, list(reader)
+
+
+def rows_from_xlsx_bytes(data):
+    """The first sheet of an Excel workbook, as (headers, rows) -- same shape as a CSV."""
+    try:
+        from openpyxl import load_workbook
+    except ImportError:
+        raise ValueError("This server can't read Excel files yet (the 'openpyxl' package is missing). "
+                         "In Excel choose File > Save As > CSV and import that instead.")
+    try:
+        wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    except Exception:  # noqa: BLE001 -- not a real workbook
+        raise ValueError("That file couldn't be opened as an Excel workbook. Save it as CSV and try again.")
+    try:
+        ws = wb.worksheets[0]
+        headers, rows = None, []
+        for values in ws.iter_rows(values_only=True):
+            cells = ["" if v is None else (str(int(v)) if isinstance(v, float) and v.is_integer() else str(v)).strip()
+                     for v in values]
+            if not any(cells):
+                continue
+            if headers is None:
+                headers = [c or f"column {i + 1}" for i, c in enumerate(cells)]
+                continue
+            rows.append(dict(zip(headers, cells)))
+            if len(rows) > MAX_IMPORT_ROWS:
+                break
+        return headers or [], rows
+    finally:
+        wb.close()
 
 
 def import_rows(headers, rows, campaign="", source="import", query=""):
@@ -148,8 +220,8 @@ def import_rows(headers, rows, campaign="", source="import", query=""):
                 row_campaign, row_source = campaign, source
                 extra_notes = []
                 for h, target in mapping.items():
-                    v = (row.get(h) or "").strip()
-                    if not v or v.lower() == "nan":
+                    v = _cell(row, h)
+                    if not v:
                         continue
                     if target == "campaign":
                         row_campaign = row_campaign or v
@@ -162,18 +234,16 @@ def import_rows(headers, rows, campaign="", source="import", query=""):
                     else:
                         lead[target] = v
                 for h in unmapped:
-                    v = (row.get(h) or "").strip()
-                    if v and v.lower() != "nan" and len(v) <= 200 and _norm_header(h) not in IGNORED:
+                    v = _cell(row, h)
+                    if v and len(v) <= 200 and _norm_header(h) not in IGNORED and schema.clean_cell(h, v):
                         extra_notes.append(f"{h}: {v}")
                 lead["notes"] = "; ".join(extra_notes)
 
                 # Nothing to go on -> skip
-                has_contact = any(lead.get(k) for k in ("phone", "email", "website", "instagram_url",
-                                                         "facebook_url", "yelp_url", "google_maps_url"))
-                if not lead.get("business_name") and not has_contact:
+                norm = schema.normalize_lead(lead)
+                if not _worth_keeping(norm):
                     summary["skipped_empty"] += 1
                     continue
-                norm = schema.normalize_lead(lead)
                 if db.is_suppressed(norm):
                     summary["skipped_suppressed"] += 1
                     continue
@@ -211,12 +281,11 @@ def import_leads(leads, campaign="", source="", query=""):
     for start in range(0, len(leads), 200):
         with db.batch():
             for lead in leads[start:start + 200]:
-                has_contact = any(lead.get(k) for k in ("phone", "email", "website", "instagram_url",
-                                                         "facebook_url", "yelp_url", "google_maps_url"))
-                if not (lead.get("business_name") or has_contact):
+                norm = schema.normalize_lead(lead)
+                if not _worth_keeping(norm):
                     summary["skipped_empty"] += 1
                     continue
-                if db.is_suppressed(schema.normalize_lead(lead)):
+                if db.is_suppressed(norm):
                     summary["skipped_suppressed"] += 1
                     continue
                 try:
@@ -231,8 +300,15 @@ def import_leads(leads, campaign="", source="", query=""):
     return summary
 
 
-def import_csv_bytes(data, campaign="", source="import"):
-    headers, rows = rows_from_csv_bytes(data)
+def import_csv_bytes(data, campaign="", source="import", filename=""):
+    """Import a CSV -- or, going by the file name / its first bytes, an Excel .xlsx workbook."""
+    if filename.lower().endswith((".xlsx", ".xlsm")) or data[:4] == b"PK\x03\x04":
+        headers, rows = rows_from_xlsx_bytes(data)
+    elif filename.lower().endswith(".xls") or data[:4] == b"\xd0\xcf\x11\xe0":
+        raise ValueError("Old-style .xls files can't be read. In Excel choose File > Save As > "
+                         "Excel Workbook (.xlsx) or CSV, then import that.")
+    else:
+        headers, rows = rows_from_csv_bytes(data)
     if not headers:
         raise ValueError("The file has no header row")
     return import_rows(headers, rows, campaign=campaign, source=source)

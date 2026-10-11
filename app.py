@@ -15,6 +15,8 @@ malicious website can't add to a cross-site request (CSRF protection).
 import csv
 import io
 import os
+import time
+import traceback
 from datetime import timedelta
 
 from flask import Flask, g, jsonify, redirect, render_template, request, Response, session
@@ -32,6 +34,7 @@ import limits
 import llm
 import outreach
 import persistence
+import pipeline
 import schema
 import scraper
 import userctx
@@ -40,7 +43,8 @@ PUBLIC_PATHS = {"/login", "/api/ping", "/api/auth/status", "/api/auth/login", "/
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 # Calls that spend real resources (browser, AI credits, mail) count extra against the rate limit.
 _HEAVY = ("/api/enrich", "/api/judge", "/api/draft", "/api/scrape", "/api/send-bulk", "/api/import",
-          "/api/check-replies", "/api/connections/test", "/api/admin/backup")
+          "/api/check-replies", "/api/connections/test", "/api/admin/backup", "/api/pipeline",
+          "/api/followups")
 _CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
         "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
@@ -162,17 +166,36 @@ def create_app(start_threads=True):
     def _nf(e):
         return jsonify({"error": "Not found"}), 404
 
+    @app.errorhandler(Exception)
+    def _unexpected(e):
+        """Anything not handled above. The page only ever reads JSON, so a bare HTML error
+        page would show up as an unexplained "Request failed (500)"."""
+        from werkzeug.exceptions import HTTPException
+        if isinstance(e, HTTPException):
+            return jsonify({"error": e.description or e.name}), e.code or 500
+        traceback.print_exc()
+        return jsonify({"error": f"Something went wrong on the server ({type(e).__name__}). "
+                                 "Nothing was changed -- try again, and if it keeps happening check the server log."}), 500
+
     # ---------------------------------------------------------- helpers
     def body():
         return request.get_json(silent=True) or {}
 
     def lead_filters(src):
         f = {k: src.get(k) for k in ("q", "campaign", "stage", "channel", "source", "trade",
-                                     "send_status", "fit", "enriched", "drafted", "min_score", "dnc")
+                                     "send_status", "fit", "enriched", "drafted", "min_score", "dnc",
+                                     "has", "sent")
              if src.get(k) not in (None, "")}
-        if src.get("not_rejected") in ("1", "true", 1, True):
-            f["not_rejected"] = True
+        for flag in ("not_rejected", "hand", "open_stage", "reachable"):
+            if src.get(flag) in ("1", "true", 1, True):
+                f[flag] = True
         return f
+
+    def whole_number(value, default, lo, hi):
+        try:
+            return max(lo, min(int(value), hi))
+        except (TypeError, ValueError):
+            return default
 
     def resolve_ids(b):
         """Rows chosen by ticking them (ids) or 'everything matching the filters'."""
@@ -186,11 +209,34 @@ def create_app(start_threads=True):
             raise outreach.SendError("Lead not found", 404)
         return lead
 
-    def launch_scrape(platform, query, location, max_results, campaign, only_no_website=False):
+    def scrape_job(ctx, params):
+        """A scrape -- and, when asked, the enrich > judge > draft pipeline on what it found."""
+        summary = scraper.run_scrape(ctx, params)
+        if params.get("then_pipeline") and not ctx.stopped:
+            try:
+                jobs.start_job("pipeline", {"campaign": params.get("campaign") or ""}, pipeline.run_pipeline)
+                summary += " -- now enriching and judging the new leads"
+            except jobs.JobBusy:
+                summary += " (the enrich-and-judge run is already going, so it wasn't started twice)"
+        return summary
+
+    def launch_scrape(platform, query, location, max_results, campaign, only_no_website=False,
+                      then_pipeline=False):
         params = {"platform": platform, "query": query, "location": location,
                   "max_results": max_results, "campaign": campaign,
-                  "only_no_website": bool(only_no_website)}
-        return jobs.start_job("scrape", params, scraper.run_scrape, queue_lock=jobs.SCRAPE_LOCK)
+                  "only_no_website": bool(only_no_website), "then_pipeline": bool(then_pipeline)}
+        return jobs.start_job("scrape", params, scrape_job, queue_lock=jobs.SCRAPE_LOCK)
+
+    # Asking Playwright where its browser is starts a helper process (tens of MB, half a second).
+    # The answer doesn't change while the server runs, so ask once -- not on every page load,
+    # and never in the middle of a scrape on a small server.
+    browser_seen = {"ok": None, "at": 0.0}
+
+    def browser_ready():
+        if browser_seen["ok"] or (browser_seen["ok"] is False and time.time() - browser_seen["at"] < 300):
+            return bool(browser_seen["ok"])
+        browser_seen.update(ok=bool(scraper.browser_available()), at=time.time())
+        return browser_seen["ok"]
 
     def is_admin():
         return bool(g.user and g.user["is_admin"])
@@ -296,8 +342,12 @@ def create_app(start_threads=True):
         b = body()
         accounts.set_secrets(g.user["id"], b.get("set") or {}, b.get("clear") or [])
         enter(accounts.get_user(g.user["id"]))     # so the reply reflects the new values
+        reread = 0
+        if "DEFAULT_COUNTRY_CODE" in (b.get("set") or {}) or "DEFAULT_COUNTRY_CODE" in (b.get("clear") or []):
+            reread = db.renormalize_phones()       # numbers that made no sense before may make sense now
+            db.recompute_channels()
         return jsonify({"fields": accounts.connections_view(), "is_admin": is_admin(),
-                        "unreadable": bool(g.user.get("secrets_unreadable"))})
+                        "unreadable": bool(g.user.get("secrets_unreadable")), "phones_fixed": reread})
 
     @app.route("/api/connections/test", methods=["POST"])
     def connections_test():
@@ -315,8 +365,10 @@ def create_app(start_threads=True):
             "imap": outreach.imap_configured(),
             "serpapi": bool(config.env("SERPAPI_KEY")),
             "instagram_login": bool(config.env("IG_USERNAME") and config.env("IG_PASSWORD")),
-            "playwright": scraper.browser_available(),
+            "playwright": browser_ready(),
             "user": public_user(g.user),
+            "placeholders": schema.PLACEHOLDER_HELP,
+            "country_code": config.env("DEFAULT_COUNTRY_CODE", "1").lstrip("+") or "1",
         })
 
     # --------------------------------------------------------- admin only
@@ -370,8 +422,8 @@ def create_app(start_threads=True):
     def leads_list():
         a = request.args
         rows, total = db.list_leads(lead_filters(a), sort=a.get("sort", "score"),
-                                    limit=min(int(a.get("limit", 50)), 500),
-                                    offset=int(a.get("offset", 0)))
+                                    limit=whole_number(a.get("limit"), 50, 1, 500),
+                                    offset=whole_number(a.get("offset"), 0, 0, 10 ** 9))
         return jsonify({"leads": rows, "total": total})
 
     @app.route("/api/leads", methods=["POST"])
@@ -435,7 +487,7 @@ def create_app(start_threads=True):
         for r in rows:
             r = dict(r)
             r["fit"] = {1: "yes", 0: "no"}.get(r["fit"], "")
-            w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in schema.EXPORT_COLUMNS])
+            w.writerow([exports.safe_cell(r.get(c)) for c in schema.EXPORT_COLUMNS])
         return Response(buf.getvalue(), mimetype="text/csv",
                         headers={"Content-Disposition": "attachment; filename=leads.csv"})
 
@@ -447,7 +499,7 @@ def create_app(start_threads=True):
             raise ValueError("Choose a CSV file")
         summary = importer.import_csv_bytes(
             f.read(), campaign=(request.form.get("campaign") or "").strip(),
-            source=(request.form.get("source") or "import").strip())
+            source=(request.form.get("source") or "import").strip(), filename=f.filename or "")
         summary.pop("ids", None)
         return jsonify(summary)
 
@@ -457,19 +509,22 @@ def create_app(start_threads=True):
         platform = b.get("platform")
         if platform not in ("google_maps", "yelp", "instagram"):
             raise ValueError("Choose a platform")
-        if not (b.get("query") or "").strip():
-            raise ValueError("Enter a search query")
-        if platform == "yelp" and not (b.get("location") or "").strip():
+        # Several terms and/or places may be given, separated by ';' -- every pair is searched.
+        pairs = scraper.plan_searches(b)                 # raises ValueError if empty or too many
+        queries = "; ".join(dict.fromkeys(q for q, _ in pairs))
+        locations = "; ".join(dict.fromkeys(loc for _, loc in pairs if loc))
+        if platform == "yelp" and not locations:
             raise ValueError("Yelp needs a location, e.g. Dallas, TX")
-        job_id = launch_scrape(platform, b["query"].strip(), (b.get("location") or "").strip(),
-                               max(1, min(int(b.get("max_results") or 30), 200)),
-                               (b.get("campaign") or "").strip(), bool(b.get("only_no_website")))
-        return jsonify({"job_id": job_id})
+        job_id = launch_scrape(platform, queries, locations, whole_number(b.get("max_results"), 30, 1, 200),
+                               (b.get("campaign") or "").strip(), bool(b.get("only_no_website")),
+                               bool(b.get("then_pipeline")))
+        return jsonify({"job_id": job_id, "searches": len(pairs)})
 
     @app.route("/api/suggest")
     def suggest():
-        # Autocomplete from the signed-in account's own history only (see db.suggest).
-        return jsonify({"suggestions": db.suggest(request.args.get("field", ""), request.args.get("q", ""))})
+        # Autocomplete: the account's own history first, then the built-in directory (see db.suggest).
+        return jsonify({"suggestions": db.suggest(request.args.get("field", ""), request.args.get("q", ""),
+                                                  context=request.args.get("context", "")[:600])})
 
     @app.route("/api/schedules", methods=["GET"])
     def schedules_list():
@@ -480,11 +535,16 @@ def create_app(start_threads=True):
     @app.route("/api/schedules", methods=["POST"])
     def schedules_add():
         b = body()
-        if b.get("platform") not in ("google_maps", "yelp", "instagram") or not (b.get("query") or "").strip():
-            raise ValueError("Platform and query are required")
-        sid = db.create_schedule(b["platform"], b["query"].strip(), (b.get("location") or "").strip(),
-                                 int(b.get("max_results") or 30), (b.get("campaign") or "").strip(),
-                                 max(1, int(b.get("interval_hours") or 24)))
+        if b.get("platform") not in ("google_maps", "yelp", "instagram"):
+            raise ValueError("Choose a platform")
+        pairs = scraper.plan_searches(b)                 # the same checks a one-off scrape gets
+        queries = "; ".join(dict.fromkeys(q for q, _ in pairs))
+        locations = "; ".join(dict.fromkeys(loc for _, loc in pairs if loc))
+        if b["platform"] == "yelp" and not locations:
+            raise ValueError("Yelp needs a location, e.g. Dallas, TX")
+        sid = db.create_schedule(b["platform"], queries, locations, whole_number(b.get("max_results"), 30, 1, 200),
+                                 (b.get("campaign") or "").strip(), whole_number(b.get("interval_hours"), 24, 1, 24 * 90),
+                                 only_no_website=bool(b.get("only_no_website")))
         return jsonify({"id": sid})
 
     @app.route("/api/schedules/<int:sid>", methods=["PATCH"])
@@ -501,9 +561,13 @@ def create_app(start_threads=True):
     @app.route("/api/jobs")
     def jobs_list():
         kinds = request.args.get("kinds")
+        # logs=3,7 -> those runs' logs in full, every other run's last few lines (the page asks
+        # for the ones whose "Log" is open). Without it, everything comes back in full.
+        logs = request.args.get("logs")
+        full = None if logs is None else {int(x) for x in logs.split(",") if x.strip().isdigit()}
         return jsonify(db.list_jobs(kinds.split(",") if kinds else None,
-                                    limit=int(request.args.get("limit", 15)),
-                                    campaign=request.args.get("campaign")))
+                                    limit=whole_number(request.args.get("limit"), 15, 1, 100),
+                                    campaign=request.args.get("campaign"), full_logs=full))
 
     @app.route("/api/jobs/<int:job_id>")
     def job_get(job_id):
@@ -519,7 +583,8 @@ def create_app(start_threads=True):
     # ------------------------------------------------ enrich / judge / draft
     def job_params(b):
         p = {"ids": b.get("ids") or None, "campaign": b.get("campaign") or "",
-             "force": bool(b.get("force")), "limit": int(b["limit"]) if b.get("limit") else None}
+             "force": bool(b.get("force")),
+             "limit": whole_number(b["limit"], None, 1, 10 ** 6) if b.get("limit") else None}
         if b.get("filters") and not p["ids"]:
             p["ids"] = db.select_ids(b["filters"]) or None
         return p
@@ -534,15 +599,33 @@ def create_app(start_threads=True):
             raise ValueError("Fit judging needs an AI key -- add one under Settings > Connections.")
         return jsonify({"job_id": jobs.start_job("judge", job_params(body()), filtering.run_judge)})
 
+    def wants_exact(b, campaign=""):
+        """Mail-merge mode for this request: said outright, or the account / campaign default."""
+        if "exact" in b:
+            return bool(b["exact"])
+        return bool(db.effective_settings(campaign).get("exact_templates"))
+
     @app.route("/api/draft", methods=["POST"])
     def draft_start():
-        if not llm.is_configured("draft"):
-            raise ValueError("Drafting needs an AI key -- add one under Settings > Connections.")
         b = body()
         p = job_params(b)
+        p["exact"] = wants_exact(b, p["campaign"])
+        if not p["exact"] and not llm.is_configured("draft"):
+            raise ValueError("Drafting with AI needs an AI key (Settings > Connections). Without one, tick "
+                             "\"Use my templates exactly as written\" to fill in your templates instead.")
         p["template"] = b.get("template", "")
         p["channel"] = b.get("channel", "")
         return jsonify({"job_id": jobs.start_job("draft", p, outreach.run_draft)})
+
+    @app.route("/api/pipeline", methods=["POST"])
+    def pipeline_start():
+        """Enrich, judge and draft in one run (each step only does what's still outstanding)."""
+        b = body()
+        p = {"ids": b.get("ids") or None, "campaign": (b.get("campaign") or "").strip(),
+             "skip_draft": bool(b.get("skip_draft"))}
+        if b.get("filters") and not p["ids"]:
+            p["ids"] = db.select_ids(b["filters"]) or None
+        return jsonify({"job_id": jobs.start_job("pipeline", p, pipeline.run_pipeline)})
 
     @app.route("/api/usage")
     def usage():
@@ -571,6 +654,8 @@ def create_app(start_threads=True):
             raise outreach.SendError("Campaign not found", 404)
         canon = d["campaign"]["name"]
         d["queue"]["followups_due"] = sum(1 for l in outreach.followups_due() if l["campaign"] == canon)
+        d["queue"]["hand_followups_due"] = sum(1 for l in outreach.hand_followups_due() if l["campaign"] == canon)
+        d["replies"] = db.replies_waiting(canon, limit=8)
         d["jobs"] = db.list_jobs(limit=6, campaign=canon)
         d["email"] = outreach.email_status()
         d["saved_default_criteria"] = db.get_setting("default_criteria") or ""
@@ -599,10 +684,13 @@ def create_app(start_threads=True):
     # ---------------------------------------------------------- outreach
     @app.route("/api/leads/<int:lead_id>/draft", methods=["POST"])
     def lead_draft(lead_id):
-        if not llm.is_configured("draft"):
-            raise ValueError("Drafting needs an AI key -- add one under Settings > Connections.")
+        b = body()
+        exact = wants_exact(b, need_lead(lead_id)["campaign"])
+        if not exact and not llm.is_configured("draft"):
+            raise ValueError("Drafting with AI needs an AI key (Settings > Connections). Without one, switch on "
+                             "\"Use my templates exactly as written\" under Settings > Messaging.")
         try:
-            return jsonify(outreach.draft_message(lead_id, body().get("template", "")))
+            return jsonify(outreach.draft_message(lead_id, b.get("template", ""), exact=exact))
         except llm.LLMError as e:
             return jsonify({"error": f"The AI call failed: {e}"}), 502
 
@@ -618,17 +706,34 @@ def create_app(start_threads=True):
 
     @app.route("/api/leads/<int:lead_id>/mark-sent", methods=["POST"])
     def lead_mark_sent(lead_id):
-        return jsonify(outreach.mark_sent(lead_id, body().get("channel", "")))
+        b = body()
+        return jsonify(outreach.mark_sent(lead_id, b.get("channel", ""), followup=bool(b.get("followup"))))
 
     @app.route("/api/leads/<int:lead_id>/followup", methods=["POST"])
     def lead_followup(lead_id):
         return jsonify(outreach.send_followup(lead_id))
 
+    @app.route("/api/leads/<int:lead_id>/followup-text", methods=["POST"])
+    def lead_followup_text(lead_id):
+        # the nudge for a lead you message by hand: nothing is sent, the text is just handed back
+        return jsonify({"message": outreach.followup_text(need_lead(lead_id))})
+
     @app.route("/api/followups-due")
     def followups_due():
-        rows = outreach.followups_due()
+        rows = outreach.hand_followups_due() if request.args.get("kind") == "hand" else outreach.followups_due()
         c = request.args.get("campaign")
         return jsonify([r for r in rows if r["campaign"] == c] if c else rows)
+
+    @app.route("/api/followups", methods=["POST"])
+    def followups_send_all():
+        if not outreach.smtp_configured():
+            raise ValueError("Email isn't set up: add your email details under Settings > Connections.")
+        p = {"campaign": (body().get("campaign") or "").strip()}
+        return jsonify({"job_id": jobs.start_job("followups", p, outreach.run_followups)})
+
+    @app.route("/api/replies")
+    def replies_waiting():
+        return jsonify(db.replies_waiting(request.args.get("campaign", "")))
 
     @app.route("/api/send-bulk", methods=["POST"])
     def send_bulk():
@@ -670,14 +775,35 @@ def create_app(start_threads=True):
         if "channel_priority" in b:
             pr = [c for c in b["channel_priority"] if c in schema.CHANNELS and c != "unknown"]
             clean["channel_priority"] = pr or schema.DEFAULT_CHANNEL_PRIORITY
-        for k, lo in (("email_daily_limit", 1), ("email_send_delay_seconds", 0),
-                      ("followup_delay_days", 1), ("max_followups", 0)):
+        for k, lo, hi in (("email_daily_limit", 1, 2000), ("email_send_delay_seconds", 0, 3600),
+                          ("followup_delay_days", 1, 365), ("max_followups", 0, 10),
+                          ("reply_check_minutes", 0, 24 * 60), ("send_start_hour", 0, 23), ("send_end_hour", 1, 24)):
             if k in b:
-                clean[k] = max(lo, int(b[k]))
-        if "warmup_enabled" in b:
-            clean["warmup_enabled"] = bool(b["warmup_enabled"])
-        if "auto_remove_rejected" in b:
-            clean["auto_remove_rejected"] = bool(b["auto_remove_rejected"])
+                n = whole_number(b[k], None, lo, hi)
+                if n is None:
+                    raise ValueError(f"{k.replace('_', ' ').capitalize()} must be a whole number.")
+                clean[k] = n
+        for k in ("warmup_enabled", "auto_remove_rejected", "exact_templates", "send_window_enabled"):
+            if k in b:
+                clean[k] = bool(b[k])
+        if "followup_template" in b:
+            clean["followup_template"] = str(b["followup_template"] or "").strip()
+        if "send_days" in b:
+            clean["send_days"] = sorted({int(d) for d in (b["send_days"] or []) if str(d).isdigit() and 0 <= int(d) <= 6})
+        if "timezone" in b:
+            tz = str(b["timezone"] or "").strip()
+            if tz:
+                try:
+                    from zoneinfo import ZoneInfo
+                    ZoneInfo(tz)
+                except Exception:  # noqa: BLE001
+                    raise ValueError(f"'{tz}' isn't a time zone name this server knows. Use one like "
+                                     "America/Chicago, Europe/London or Asia/Kolkata.")
+            clean["timezone"] = tz
+        start = clean.get("send_start_hour", db.get_setting("send_start_hour"))
+        end = clean.get("send_end_hour", db.get_setting("send_end_hour"))
+        if ("send_start_hour" in clean or "send_end_hour" in clean) and start >= end:
+            raise ValueError("Sending hours must end later than they start.")
         saved = db.set_settings(clean)
         if "channel_priority" in clean:
             db.recompute_channels()
@@ -707,7 +833,7 @@ def create_app(start_threads=True):
 
     # ------------------------------------------------------- background
     if start_threads and os.environ.get("HUB_START_THREADS", "1") != "0":
-        jobs.start_scheduler(launch_scrape)
+        jobs.start_scheduler(launch_scrape, outreach.auto_check_replies)
 
     return app
 

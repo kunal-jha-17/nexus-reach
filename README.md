@@ -28,17 +28,40 @@ The app starts with **no keys at all**. Each feature switches on when its key is
 
 | Tab | What it does |
 |---|---|
-| **Dashboard** | Everything at a glance: counts, the next thing worth doing, all campaigns, budgets, recent jobs. |
+| **Dashboard** | Everything at a glance: counts, the next thing worth doing, **replies waiting for an answer**, all campaigns, today's sending numbers, recent runs. |
 | **Campaigns** | One card per campaign. Click one for **its own dashboard**: funnel (leads → in play → contacted → replied → qualified → won), reply/win rates, what needs doing (with one-click buttons scoped to that campaign), a 14-day activity chart, who's in it, recent activity and runs, plus the campaign's own settings. |
-| **Find leads** | Import any CSV (Outscraper, Instant Data Scraper, your sheets; columns auto-matched). Or scrape Google Maps / Yelp / Instagram, one-off or on a schedule. |
-| **Enrich & judge** | *Enrich* fills missing emails, socials, websites, owner names. *Judge* has an LLM mark each lead Fits / Rejected using criteria you edit per campaign. |
-| **All leads** | Search, filter, bulk actions, export. Click a row for the full record, message editor and activity timeline. |
-| **Outreach** | Draft messages, send emails (paced, capped, warmed up), check replies, send follow-ups, and work the hand-send queue (Yelp / Facebook / Instagram / SMS). |
-| **Settings** | About you, templates, channel order, email limits, do-not-contact list, connection status. |
+| **Find leads** | Import a CSV **or Excel (.xlsx)** file (Outscraper, Instant Data Scraper, your sheets; columns auto-matched). Or scrape Google Maps / Yelp / Instagram, one-off or on a schedule -- optionally handing straight over to enrich > judge > draft when the scrape ends. |
+| **Enrich & judge** | **Run all steps** does enrich > judge > draft in one run. Or one at a time: *Enrich* fills missing emails, socials, websites, owner names; *Judge* has an AI mark each lead Fits / Rejected using criteria you edit per campaign. |
+| **All leads** | Search, filter (campaign, stage, fit, channel, contact details, outreach status), bulk actions, export. Click a row for the full record, one-click stage buttons, call / WhatsApp / email / website links, message editor and activity timeline. |
+| **Outreach** | Write messages (AI-personalised, or your templates exactly as written), send emails (paced, capped, warmed up, inside your sending hours), replies to answer, follow-ups by email (one click for all that are due) and by hand, and the hand-send queue (Yelp / Facebook / Instagram / WhatsApp / SMS). |
+| **Settings** | Four tabs. *Messaging*: about you, templates, follow-up message, channel order. *Sending*: limits, sending hours and time zone, reply checking, do-not-contact list. *Connections*: your keys, mailbox and default phone country code. *Account*: name, password, your data, and (admin) storage and users. |
 
 Long jobs (scrape, enrich, judge, draft, send) run in the background with a progress bar and a Stop
 button. Everything is saved lead-by-lead, so stopping or crashing loses nothing; run it again and it
 carries on with what's left.
+
+## Working a campaign, start to finish
+
+1. **Find leads** -- import a list or scrape. Tick "when it finishes, enrich, judge and draft" to have the next step start itself.
+2. **Run all steps** (campaign page, Enrich & judge, or select leads in All leads). Enrich, then judge, then write a message for the leads that fit. Each step skips what's already done, so it's safe to press again.
+3. **Outreach** -- *Start sending* for email; *Copy & open* then *Mark sent* for everything else.
+4. Replies and bounced addresses are picked up from your inbox on a timer (every 30 minutes by default; Settings > Sending). A reply moves the lead to *replied* and it appears under **Replies to answer**; a bounce marks the lead *Failed* and stops its follow-ups.
+5. **Follow-ups** come due after your follow-up delay: *Send all due* for email, *Copy follow-up & open* for hand channels.
+6. Move answered leads on with the stage buttons in the lead's panel (qualified / won / lost). The campaign's funnel and rates follow.
+
+### Messages: AI-written or exactly as you wrote them
+
+- **AI on (default):** each template is rewritten for the lead from the facts on record. Needs an AI key.
+- **"Use my templates exactly as written":** a plain mail-merge -- your words, blanks filled in, nothing else changed. Needs no AI key. Set it account-wide under Settings > Messaging, or per run on the Outreach page.
+- **Blanks:** `{business_name}` `{first_name}` `{contact_name}` `{city}` `{state}` `{location}` `{trade}` `{phone}` `{email}` `{website}` `{address}` -- also written `{{Business Name}}`, `[Business Name]` or `<<company>>`, and any "... name" wording (`{{Clinic Name}}`).
+- **Fallbacks:** `{first_name|there}` becomes "there" when the lead has no contact name; `{first_name|}` just leaves it out. A blank with no value and no fallback **blocks the send** with a message naming it, rather than going out as "Hi {first_name}".
+- **Follow-up message** (Settings > Messaging) is used as written, blanks included. Leave it empty and the AI writes a short nudge per lead instead.
+
+### Sending safely
+
+- **Sending hours** (Settings > Sending, off by default): bulk sends and bulk follow-ups only go out on the chosen days and hours, in the time zone you set -- normally your leads' time zone. The same time zone decides when "today" starts for the daily limit. One-off sends from a lead's panel are never blocked.
+- **Failures are sorted into yours and theirs.** A refused address marks that one lead *Failed*. A wrong password, blocked port or exhausted quota stops the run and marks nobody -- fix it and press Start again.
+- **Reply checking reads the whole inbox, read or unread** (it never marks anything as read), and carries on from where the last check stopped.
 
 ## Accounts, and where each person's data lives
 
@@ -83,11 +106,16 @@ change with `DEFAULT_COUNTRY_CODE`); social profiles as full URLs; one stage lis
 - Enrichment fills blank *cells*, never skips a column, never overwrites, and doesn't search for what you already have.
 - The scraper keeps each listing's URL (`yelp_url`, `google_maps_url`) and decodes Yelp/Instagram redirect links to real websites.
 - **Scrapes save as they go.** Each listing is stored the moment it's read, so a restart, an error or pressing Stop never loses what was already found. A listing that's already in your leads isn't opened again, so running the same search after an interruption carries on where it stopped.
-- **Large runs (100+ listings):** the results list is read in one call per scroll, images aren't downloaded, listing pages load two at a time in reused tabs, and tabs are recycled every 20 listings to keep memory flat. With "only keep businesses with no website" on, a Google Maps result whose card already shows a Website button is skipped without opening its page. Google itself lists at most roughly 120 results per search; for more, vary the search term or the town.
-- **Scraper speed settings** (optional environment variables, see `.env.example`): `SCRAPER_SCROLL_DELAY_MIN/MAX`, `SCRAPER_DETAIL_DELAY_MIN/MAX`, `SCRAPER_DETAIL_TABS` (1-4, default 2; use 1 if the server runs out of memory), `SCRAPER_RECYCLE_EVERY`, `SCRAPER_BLOCK_MEDIA`. Lower delays and more tabs are faster but raise the odds of a CAPTCHA.
+- **Large runs (100+ listings):** the results list is read in one call per scroll, images aren't downloaded, listing pages reuse tabs that are recycled every 20 listings, and the run logs and watches its own memory use. With "only keep businesses with no website" on, a Google Maps result whose card already shows a Website button is skipped without opening its page. Google itself lists at most roughly 120 results per search; for more, vary the search term or the town.
+- **Scraper speed settings** (optional environment variables, see `.env.example`): `SCRAPER_SCROLL_DELAY_MIN/MAX`, `SCRAPER_DETAIL_DELAY_MIN/MAX`, `SCRAPER_DETAIL_TABS` (1-4, default 1; 2+ is faster but needs a server with 1 GB or more), `SCRAPER_MEMORY_LIMIT_MB` (the server's memory; the scraper backs off at 85% of it -- it stops growing the results list, reopens tabs, or ends the run with everything saved -- instead of the server being killed and restarted; defaults to the container's limit, or 512 on Render; 0 turns it off), `SCRAPER_RECYCLE_EVERY`, `SCRAPER_BLOCK_MEDIA`. Lower delays and more tabs are faster but raise the odds of a CAPTCHA.
 - **Name columns are detected automatically on import:** any "<something> name" header (Clinic Name, Shop Name, Name of Practice, ClinicName) or a bare Clinic / Practice / Shop / Restaurant column becomes the business name; First Name / Owner Name / Doctor Name become the contact. Leads an older import left as "(no name)" are repaired automatically from their notes the next time the app opens that account's database. The import result (and a pop-up) says how many rows ended up without a name.
 - **Placeholders are filled before anything is sent:** `{name}`, `{business_name}`, `{{Clinic Name}}`, `[Business Name]`, `<<company>>`, plus `{first_name}`, `{city}`, `{state}`, `{location}`, `{trade}`. If a lead has nothing to put in a placeholder, the email (or Copy & open) is refused with a message naming it, rather than sent half-filled.
-- **Search suggestions:** after 3 characters, the Find leads *Search* and *Location* boxes and the All leads search box suggest from your own past searches, locations and lead names (`GET /api/suggest`). Nothing is sent to an outside service.
+- **Several searches in one run:** put several search terms and/or several places in the Find leads boxes, separated by a semicolon (`AC repair; furnace repair` and `Garland, TX; Mesquite, TX`). Every term is searched in every place, one after another, up to "listings to check" each, with a fresh browser per search -- so a small server that can't hold one 100-listing search can still work through many 30-40 listing ones. At most 40 searches per run. One search failing doesn't stop the rest; a CAPTCHA does. Recurring scrapes work the same way.
+- **Imports are forgiving:** Excel `.xlsx`, CSV in UTF-8 / Windows-1252 / UTF-16, comma / semicolon / tab separated, blank lines above the header row. Cells holding "N/A", "none", "-" and the like are treated as empty. A cell with several emails gives the first usable one.
+- **"No website" is judged properly:** besides Facebook / Instagram / link-in-bio pages, a profile on a listing, booking or marketplace site (Practo, Justdial, Tripadvisor, Booksy, Zocdoc, WhatsApp links ...) does not count as the business having its own website. The list is `DIRECTORY_HOSTS` in `schema.py`.
+- **Phone numbers outside the US:** set your default country calling code under Settings > Connections > Phone numbers (per account; `DEFAULT_COUNTRY_CODE` sets the server default). Changing it re-reads every number that couldn't be understood before.
+- **CSV exports are safe to open in Excel:** a cell that a spreadsheet would run as a formula gets a leading apostrophe (and the importer takes it off again).
+- **Search suggestions:** after 3 characters, the *Search* box suggests business types and the *Location* box suggests places -- your own past searches first, then a built-in directory (`directory/services.txt`, about 390 business types you can edit; `directory/places.tsv`, about 57,000 places: every US town of 1,000+ people, the US states, and cities of 5,000+ elsewhere). Places like the ones you already use are listed first. The All leads box suggests from your own leads. Nothing is sent to an outside service (`GET /api/suggest`). Place data: GeoNames (geonames.org), CC BY 4.0.
 - The fit judge sees trade, city, category, review count, website status and notes. A lead it *can't* judge stays blank and is retried, never silently rejected.
 - Phones normalise before de-duplication, so `(214) 555-0100` and `+1 214-555-0100` are one lead. Two Yelp leads with no phone no longer collapse into one.
 - A Facebook/Instagram/link-in-bio page as someone's only "website" counts as **no website**.
@@ -232,7 +260,7 @@ so Supabase (or anyone who got the bucket keys) sees only noise.
 app.py          web server + JSON API          accounts.py   sign-in, per-user databases, encrypted keys
 userctx.py      "which user is this?"          manage.py     command-line account tools
 schema.py       the one lead format            db.py         SQLite layer (leads, campaigns, jobs...)
-importer.py     CSV import, column matching
+importer.py     CSV / Excel import, column matching   pipeline.py   enrich > judge > draft in one run
 scraper.py      Maps / Yelp / Instagram        enrichment.py contact finding
 filtering.py    fit judging                    outreach.py   drafting, email, follow-ups, replies
 llm.py          one client for Groq/OpenAI/Gemini   jobs.py  background jobs + scheduler

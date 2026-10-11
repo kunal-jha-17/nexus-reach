@@ -104,6 +104,7 @@ CONNECTION_FIELDS = [
     ("SMTP_FROM_NAME", False), ("IMAP_USER", False), ("IMAP_PASS", True), ("IMAP_HOST", False),
     ("SERPAPI_KEY", True), ("SERPAPI_MONTHLY_LIMIT", False),
     ("IG_USERNAME", False), ("IG_PASSWORD", True),
+    ("DEFAULT_COUNTRY_CODE", False),
 ]
 _SECRET_NAMES = {n for n, s in CONNECTION_FIELDS if s}
 _EDITABLE = {n for n, _ in CONNECTION_FIELDS}
@@ -406,6 +407,8 @@ def _validate_secret(name, value):
         raise ValueError("Mail server port must be one of: " + ", ".join(sorted(_MAIL_PORTS, key=int)) + ".")
     if name == "SERPAPI_MONTHLY_LIMIT" and not value.isdigit():
         raise ValueError("Searches per month must be a number.")
+    if name == "DEFAULT_COUNTRY_CODE" and not re.fullmatch(r"\+?[1-9]\d{0,3}", value):
+        raise ValueError("The country calling code is 1 to 4 digits, for example 1 (US/Canada), 44 (UK) or 91 (India).")
 
 
 def set_secrets(user_id, updates=None, clear=None):
