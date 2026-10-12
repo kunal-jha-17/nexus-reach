@@ -100,7 +100,7 @@ _DUMMY_HASH = generate_password_hash("not-a-real-password", method=PW_METHOD)   
 CONNECTION_FIELDS = [
     ("LLM_PROVIDER", False), ("GROQ_API_KEY", True), ("GROQ_MODEL", False),
     ("OPENAI_API_KEY", True), ("OPENAI_MODEL", False), ("GEMINI_API_KEY", True), ("GEMINI_MODEL", False),
-    ("SMTP_USER", False), ("SMTP_PASS", True), ("SMTP_HOST", False), ("SMTP_PORT", False),
+    ("SMTP_USER", False), ("SMTP_PASS", True), ("GMAIL_REFRESH_TOKEN", True), ("SMTP_HOST", False), ("SMTP_PORT", False),
     ("SMTP_FROM_NAME", False), ("IMAP_USER", False), ("IMAP_PASS", True), ("IMAP_HOST", False),
     ("SERPAPI_KEY", True), ("SERPAPI_MONTHLY_LIMIT", False),
     ("IG_USERNAME", False), ("IG_PASSWORD", True),

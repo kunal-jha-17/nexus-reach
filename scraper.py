@@ -52,6 +52,7 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
 MAPS_SEARCH_URL = "https://www.google.com/maps/search/"
+IG_BASE = "https://www.instagram.com"
 YELP_BASE_URL = "https://www.yelp.com"
 
 # Keeps Chromium small and stable inside a container: Docker's /dev/shm is only 64 MB, and a
@@ -137,7 +138,7 @@ def _short(e, n=140):
     return str(e).strip().split("\n")[0][:n]
 
 
-def _new_page(p):
+def _new_page(p, storage_state=None):
     # SCRAPER_BROWSER_CHANNEL=chrome makes Playwright use your installed Google Chrome,
     # so there's no separate browser download (`playwright install chromium`) at all.
     args = list(_BROWSER_ARGS)
@@ -150,8 +151,9 @@ def _new_page(p):
     elif not (p.chromium.executable_path and os.path.exists(p.chromium.executable_path)):
         raise BrowserNotInstalled()
     browser = p.chromium.launch(**kwargs)
+    extra = {"storage_state": storage_state} if storage_state else {}
     context = browser.new_context(user_agent=USER_AGENT, locale="en-US",
-                                  viewport={"width": 1000, "height": 720})
+                                  viewport={"width": 1000, "height": 720}, **extra)
     context.set_default_timeout(15000)      # no single click/read may hang a run for 30 s
     return browser, context
 
@@ -353,7 +355,7 @@ def extract_instagram_profile(page, uname):
         "phone": phone.group(0) if phone else "",
         "email": email.group(0) if email else "",
         "website": _attr(page, 'header a[href*="l.instagram.com"]', "href"),
-        "instagram_url": f"https://www.instagram.com/{uname}/",
+        "instagram_url": f"https://www.instagram.com/{uname}/",   # always the real address, whatever IG_BASE is
     }
 
 
@@ -650,47 +652,144 @@ def scrape_yelp(query, location, max_results=30, progress=None, ctx=None, on_row
     return results
 
 
+# Instagram has changed its login form more than once (name="username" became name="email" on
+# some versions) -- so look for any of the usual shapes rather than one exact field.
+_IG_USER_FIELD = ('input[name="username"], input[name="email"], input[autocomplete="username"], '
+                  'input[aria-label*="username" i], input[aria-label*="email" i], input[aria-label*="phone" i]')
+_IG_PASS_FIELD = 'input[name="password"], input[name="pass"], input[type="password"]'
+_IG_DISMISS = ("Allow all cookies", "Allow essential and optional cookies", "Decline optional cookies",
+               "Only allow essential cookies", "Accept all", "Not now", "Not Now")
+_IG_BAD_LOGIN = ("password was incorrect", "password you entered is incorrect", "couldn't find your account",
+                 "check your username", "problem logging you into", "please wait a few minutes")
+_IG_HOLD = ("challenge", "checkpoint", "suspended", "two_factor", "/auth_platform/")
+
+# A signed-in session, kept in memory per account for as long as the server runs, so several
+# hashtags -- and the next run -- reuse it instead of logging in again. Repeated logins from a
+# server's address are what gets a burner account locked.
+_IG_SESSIONS = {}
+
+
+def _ig_key(username):
+    try:
+        import userctx
+        u = userctx.get_user()
+        return (u["id"] if u else 0, (username or "").lower())
+    except Exception:  # noqa: BLE001
+        return (0, (username or "").lower())
+
+
+def _ig_dismiss(page):
+    """Click away cookie banners and "save your login info?" prompts, if any are showing."""
+    for label in _IG_DISMISS:
+        try:
+            btn = page.get_by_role("button", name=label, exact=True)
+            if btn.count():
+                btn.first.click(timeout=2000)
+                page.wait_for_timeout(400)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _ig_page_summary(page):
+    """What Instagram actually showed, for the run log, when it isn't what we expected."""
+    try:
+        title = page.title()
+    except Exception:  # noqa: BLE001
+        title = ""
+    text = re.sub(r"\s+", " ", _text(page, "body"))[:160]
+    return f"page '{title}' at {page.url.replace(IG_BASE, '') or '/'}: \"{text}\""
+
+
+def _ig_logged_in(page):
+    """Signed in = no login form on the page and not parked on a login / challenge address."""
+    if any(x in page.url for x in ("/accounts/login", *_IG_HOLD)):
+        return False
+    try:
+        return page.query_selector(_IG_PASS_FIELD) is None
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ig_login(page, username, password, ctx, progress):
+    page.goto(f"{IG_BASE}/accounts/login/", wait_until="domcontentloaded", timeout=60000)
+    _delay(ctx, 1.5, 2.5)
+    _ig_dismiss(page)
+    try:
+        page.wait_for_selector(_IG_USER_FIELD, timeout=25000)
+    except Exception:  # noqa: BLE001
+        if _ig_logged_in(page):
+            return
+        raise ScrapeBlocked("Instagram didn't show its login form, so nothing was tried. It showed "
+                            f"{_ig_page_summary(page)}. Instagram often refuses logins from servers -- "
+                            "try again later, or find these businesses on Google Maps instead.")
+    page.fill(_IG_USER_FIELD, username)
+    _delay(ctx, 0.4, 0.9)
+    page.fill(_IG_PASS_FIELD, password)
+    _delay(ctx, 0.4, 0.9)
+    page.press(_IG_PASS_FIELD, "Enter")
+    for _ in range(30):                                   # up to ~15 s for Instagram to answer
+        page.wait_for_timeout(500)
+        if any(x in page.url for x in _IG_HOLD):
+            raise ScrapeBlocked("Instagram wants to verify this account (a security check). Log in to it "
+                                "once by hand in a normal browser, complete the check, then run this again.")
+        body = _text(page, "body").lower()
+        bad = next((m for m in _IG_BAD_LOGIN if m in body), None)
+        if bad:
+            raise ScrapeBlocked(f"Instagram refused the login (\"{bad}\"). Check the burner account's username "
+                                "and password under Settings > Connections.")
+        if "/accounts/login" not in page.url:
+            break
+    else:
+        raise ScrapeBlocked(f"The Instagram login didn't go through -- {_ig_page_summary(page)}.")
+    _ig_dismiss(page)                                     # "Save your login info?" / notifications
+    progress("Logged into Instagram.")
+
+
 def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=None, ctx=None, on_row=None):
     """Highest ban-risk scraper: use a BURNER account, keep max_results small (20-40).
-    Deliberately NOT sped up -- Instagram's limits are the tightest of the three."""
+    Deliberately NOT sped up -- Instagram's limits are the tightest of the three.
+    Logs in once and keeps the session for the next hashtag / the next run (see _IG_SESSIONS)."""
     from playwright.sync_api import sync_playwright
     progress = progress or (lambda m: None)
     tag = tag.strip().lstrip("#").replace(" ", "")
     results = []
+    key = _ig_key(ig_username)
     with sync_playwright() as p:
-        browser, context = _new_page(p)
+        browser, context = _new_page(p, storage_state=_IG_SESSIONS.get(key))
         try:
             page = context.new_page()
-            page.goto("https://www.instagram.com/accounts/login/", timeout=60000)
+            page.goto(f"{IG_BASE}/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=60000)
             _delay(ctx, 2, 3)
-            try:
-                page.fill('input[name="username"]', ig_username)
-                _delay(ctx, 0.5, 1)
-                page.fill('input[name="password"]', ig_password)
-                _delay(ctx, 0.5, 1)
-                page.click('button[type="submit"]')
-                _delay(ctx, 4, 6)
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(f"Instagram login failed -- check credentials/selectors: {e}")
-            if any(x in page.url for x in ("challenge", "checkpoint", "suspended", "accounts/login")):
-                raise ScrapeBlocked("Instagram wants verification (challenge/checkpoint) or the login "
-                                    "failed. Log in once by hand with this account, then retry.")
-            progress("Logged into Instagram, browsing the tag page...")
+            _ig_dismiss(page)
+            if not _ig_logged_in(page):
+                _IG_SESSIONS.pop(key, None)
+                _ig_login(page, ig_username, ig_password, ctx, progress)
+                _IG_SESSIONS[key] = context.storage_state()
+                page.goto(f"{IG_BASE}/explore/tags/{tag}/", wait_until="domcontentloaded", timeout=60000)
+                _delay(ctx, 2, 3)
+                _ig_dismiss(page)
+            else:
+                progress("Using the Instagram session from earlier (no new login).")
+            if any(x in page.url for x in _IG_HOLD):
+                _IG_SESSIONS.pop(key, None)
+                raise ScrapeBlocked("Instagram wants to verify this account. Log in to it once by hand, "
+                                    "complete the check, then run this again.")
+            progress(f"Browsing #{tag}...")
 
-            page.goto(f"https://www.instagram.com/explore/tags/{tag}/", timeout=60000)
-            _delay(ctx, 2, 3)
             posts, stagnant = [], 0
             while len(posts) < max_results and stagnant < 5 and not _stopped(ctx):
                 before = len(posts)
-                for href in page.evaluate(_HREFS_JS, 'a[href*="/p/"]'):
+                for href in page.evaluate(_HREFS_JS, 'a[href*="/p/"], a[href*="/reel/"]'):
                     if href:
-                        full = f"https://www.instagram.com{href}" if href.startswith("/") else href
+                        full = f"{IG_BASE}{href}" if href.startswith("/") else href
                         if full not in posts:
                             posts.append(full)
                 stagnant = stagnant + 1 if len(posts) == before else 0
                 page.mouse.wheel(0, 1200)
                 _delay(ctx, 1.5, 3)
                 progress(f"Found {len(posts)} posts so far...")
+            if not posts:
+                progress(f"No posts showed up for #{tag} -- {_ig_page_summary(page)}")
 
             usernames = []
             detail = context.new_page()
@@ -699,11 +798,11 @@ def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=Non
                     if _stopped(ctx):
                         break
                     try:
-                        detail.goto(link, timeout=30000)
+                        detail.goto(link, wait_until="domcontentloaded", timeout=30000)
                         _delay(ctx, 1.5, 2.5)
                         href = _attr(detail, "header a", "href")
                         uname = href.strip("/").split("/")[-1] if href else ""
-                        if uname and uname not in usernames:
+                        if uname and uname not in usernames and uname not in ("explore", "p", "reel"):
                             usernames.append(uname)
                     except Exception:  # noqa: BLE001
                         pass
@@ -717,7 +816,7 @@ def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=Non
                     if _stopped(ctx):
                         break
                     try:
-                        prof.goto(f"https://www.instagram.com/{uname}/", timeout=30000)
+                        prof.goto(f"{IG_BASE}/{uname}/", wait_until="domcontentloaded", timeout=30000)
                         _delay(ctx, 2, 3)
                         row = extract_instagram_profile(prof, uname)
                         row["notes"] = f"scraped from Instagram #{tag}"
@@ -732,6 +831,10 @@ def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=Non
                     _delay(ctx, 2, 4)
             finally:
                 _close_all([prof])
+            try:
+                _IG_SESSIONS[key] = context.storage_state()    # keep any refreshed cookies
+            except Exception:  # noqa: BLE001
+                pass
         finally:
             browser.close()
     return results
@@ -841,7 +944,8 @@ def run_scrape(ctx, params):
         else:
             user, pw = config.env("IG_USERNAME"), config.env("IG_PASSWORD")
             if not user or not pw:
-                raise RuntimeError("Set IG_USERNAME and IG_PASSWORD (a burner account) in .env first")
+                raise ValueError("Instagram scraping needs a burner account: add its username and password "
+                                 "under Settings > Connections > Instagram scraping.")
             rows = scrape_instagram(query, user, pw, max_results, ctx.log, ctx, on_row=save)
         for r in rows or []:             # anything a scraper returned without reporting as it went
             if id(r) not in handled and not st["limit"]:

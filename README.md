@@ -63,6 +63,41 @@ carries on with what's left.
 - **Failures are sorted into yours and theirs.** A refused address marks that one lead *Failed*. A wrong password, blocked port or exhausted quota stops the run and marks nobody -- fix it and press Start again.
 - **Reply checking reads the whole inbox, read or unread** (it never marks anything as read), and carries on from where the last check stopped.
 
+## Sending through the Gmail API (for hosts that block email ports)
+
+Render's free plan blocks the email ports (25, 465, 587), so SMTP can't send from there. The Gmail API
+sends the very same message over HTTPS, which isn't blocked. Only the `gmail.send` permission is
+requested: the app can send as you, and can't read, change or delete your mail. Reply checking still
+uses IMAP with your App Password, exactly as before. Accounts without a Gmail sign-in keep using SMTP.
+
+**One-time setup (about 10 minutes):**
+
+1. **Google Cloud Console > APIs & Services > Library:** find **Gmail API** and press **Enable**.
+2. **OAuth consent screen:** add the scope `.../auth/gmail.send`. Set the publishing status to
+   **In production** -- while it says *Testing*, Google expires the token after 7 days. (If you
+   keep it in Testing, add your Gmail address as a test user and expect to redo step 4 weekly.)
+3. **Credentials > your OAuth client:** a *Web application* client needs `http://localhost:8080/` under
+   **Authorized redirect URIs**. (A *Desktop app* client needs nothing here.)
+4. **On your own computer**, from the project folder:
+   ```
+   pip3 install google-auth-oauthlib
+   python3 tools/gmail_auth.py ~/Downloads/client_secret_XXXX.json --email you@gmail.com
+   ```
+   Your browser opens Google's consent page. If Google warns the app isn't verified, choose
+   *Advanced > Go to ... (unsafe)* -- it's your own app. The script prints three lines.
+5. **Render > your service > Environment:** add `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` and
+   `GMAIL_REFRESH_TOKEN` with the printed values, and save (Render redeploys).
+6. **In the app, Settings > Connections > Email sending:** *Your email address* must be that same
+   Gmail address. Press **Save & test** -- the chip should read *Ready · Gmail API*.
+
+Other people on the same server can paste their own refresh token under Settings > Connections
+(stored encrypted), made with the same `tools/gmail_auth.py` and your OAuth client.
+
+**If sending stops** with "Gmail no longer accepts the saved sign-in", the token was revoked or
+expired: run step 4 again and replace `GMAIL_REFRESH_TOKEN`. Until then nothing is marked as failed.
+
+Never commit the client file or the token: `.gitignore` already excludes `client_secret*.json`.
+
 ## Accounts, and where each person's data lives
 
 Anyone can have an account; **each person gets their own separate database file**, so one person's
@@ -263,6 +298,7 @@ schema.py       the one lead format            db.py         SQLite layer (leads
 importer.py     CSV / Excel import, column matching   pipeline.py   enrich > judge > draft in one run
 scraper.py      Maps / Yelp / Instagram        enrichment.py contact finding
 filtering.py    fit judging                    outreach.py   drafting, email, follow-ups, replies
+gmailapi.py     sending via the Gmail API      tools/gmail_auth.py  one-time Gmail sign-in (run locally)
 llm.py          one client for Groq/OpenAI/Gemini   jobs.py  background jobs + scheduler
 netguard.py     blocks server-side request tricks   cryptobox.py  encryption + key rotation
 persistence.py  encrypted copies to Supabase/S3     exports.py    'download my data' / full backup

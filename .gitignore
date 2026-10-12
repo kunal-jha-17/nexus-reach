@@ -5,3 +5,7 @@ hub.db-*
 __pycache__/
 *.pyc
 .venv/
+
+# OAuth client files from Google Cloud Console -- never commit these
+client_secret*.json
+*.apps.googleusercontent.com.json

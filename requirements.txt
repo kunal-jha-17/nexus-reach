@@ -3,6 +3,7 @@ requests>=2.31
 beautifulsoup4>=4.12
 python-dotenv>=1.0
 openpyxl>=3.1         # lets Find leads > Import read Excel .xlsx files as well as CSV
+google-auth>=2.29      # sends email through the Gmail API (HTTPS) where a host blocks the email ports
 tzdata>=2024.1        # time-zone names for sending hours (the Docker image has none of its own)
 cryptography>=42.0      # encrypts each user's saved API keys / email passwords
 playwright>=1.44      # only needed for scraping; the rest of the app runs without it

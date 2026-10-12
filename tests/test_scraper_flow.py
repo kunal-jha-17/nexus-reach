@@ -390,3 +390,76 @@ class TestSuggest(ApiBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_BROWSER, "Chromium not available")
+class TestInstagramLogin(Base):
+    """The Instagram login against a stand-in site: today's form, cookie banner, one login per run."""
+
+    def setUp(self):
+        super().setUp()
+        import fake_instagram
+        self.ig = fake_instagram
+        self.srv = fake_instagram.start()
+        scraper._IG_SESSIONS.clear()
+        self._p = [mock.patch.object(scraper, "IG_BASE", f"http://127.0.0.1:{self.srv.server_address[1]}"),
+                   mock.patch.object(scraper, "_delay", return_value=False),
+                   mock.patch.dict(os.environ, {"IG_USERNAME": "burner", "IG_PASSWORD": "pw"})]
+        for p in self._p:
+            p.start()
+
+    def tearDown(self):
+        for p in self._p:
+            p.stop()
+        self.srv.shutdown()
+        scraper._IG_SESSIONS.clear()
+        super().tearDown()
+
+    def run_tags(self, tags):
+        ctx = Ctx()
+        try:
+            msg = scraper.run_scrape(ctx, {"platform": "instagram", "query": tags, "max_results": 10, "campaign": "c"})
+        except Exception as e:  # noqa: BLE001
+            msg = e
+        return msg, ctx
+
+    def logins(self):
+        return sum(1 for h in self.ig.hits if h.startswith("POST"))
+
+    def test_logs_in_once_for_several_hashtags_and_saves_the_profiles(self):
+        msg, ctx = self.run_tags("invisalignabudhabi; dentistdubai")
+        self.assertEqual(self.logins(), 1, ctx.lines)
+        self.assertIn("2 of 2 searches run", str(msg))
+        leads = db.list_leads({}, limit=50)[0]
+        self.assertEqual(len(leads), 4)                                    # 3 posts + 1 reel, same 4 clinics both times
+        lead = next(l for l in leads if l["business_name"] == "clinic_post0")
+        self.assertEqual(lead["email"], "clinic_post0@clinic.ae")
+        self.assertTrue(lead["phone"].startswith("+971501234"))
+        self.assertEqual(lead["instagram_url"], "https://www.instagram.com/clinic_post0/")
+        self.assertTrue(any("Using the Instagram session from earlier" in l for l in ctx.lines))
+        self.run_tags("smilemakeover")                                     # the next run reuses the session too
+        self.assertEqual(self.logins(), 1)
+
+    def test_no_login_form_stops_the_run_at_once_with_what_instagram_showed(self):
+        self.ig.mode["login"] = "no_form"
+        msg, ctx = self.run_tags("a; b; c; d; e; f")
+        self.assertIsInstance(msg, RuntimeError)
+        self.assertIn("didn't show its login form", str(msg))
+        self.assertIn("Something went wrong", str(msg))
+        self.assertEqual(sum(1 for h in self.ig.hits if h.startswith("GET /explore/tags")), 1)    # stopped after the first, not six tries
+
+    def test_wrong_password_and_security_check_are_explained(self):
+        self.ig.mode["login"] = "wrong_password"
+        msg, _ = self.run_tags("a; b")
+        self.assertIn("refused the login", str(msg))
+        self.assertEqual(self.logins(), 1)
+        scraper._IG_SESSIONS.clear()
+        self.ig.mode["login"] = "challenge"
+        msg, _ = self.run_tags("a")
+        self.assertIn("verify this account", str(msg))
+
+    def test_missing_burner_account_is_a_clear_message(self):
+        with mock.patch.dict(os.environ, {"IG_USERNAME": "", "IG_PASSWORD": ""}):
+            msg, _ = self.run_tags("a; b")
+        self.assertIsInstance(msg, ValueError)
+        self.assertIn("Settings > Connections", str(msg))

@@ -31,7 +31,7 @@ USER_SETTABLE = {
     "IMAP_USER", "IMAP_PASS", "IMAP_HOST",
     "SERPAPI_KEY", "SERPAPI_MONTHLY_LIMIT",
     "IG_USERNAME", "IG_PASSWORD",
-    "DEFAULT_COUNTRY_CODE",
+    "DEFAULT_COUNTRY_CODE", "GMAIL_REFRESH_TOKEN",
 }
 # The server owner may share their AI keys with everyone (SHARE_LLM_WITH_USERS=1).
 # Email, Instagram and search credentials are never shared.

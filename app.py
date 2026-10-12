@@ -362,6 +362,8 @@ def create_app(start_threads=True):
         return jsonify({
             "llm": llm.status(),
             "smtp": outreach.smtp_configured(),
+            "email_via": outreach.email_transport(),
+            "gmail_api_client": bool(config.env("GOOGLE_CLIENT_ID") and config.env("GOOGLE_CLIENT_SECRET")),
             "imap": outreach.imap_configured(),
             "serpapi": bool(config.env("SERPAPI_KEY")),
             "instagram_login": bool(config.env("IG_USERNAME") and config.env("IG_PASSWORD")),

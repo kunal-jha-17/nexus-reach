@@ -8,3 +8,5 @@ __pycache__/
 .git/
 tests/
 tools/
+client_secret*.json
+*.apps.googleusercontent.com.json

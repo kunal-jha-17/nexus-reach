@@ -1006,8 +1006,10 @@ const CONN_GROUPS = [
     help: 'Pick one provider and paste its key. Free tiers work (Groq or Google Gemini). The model boxes are optional.',
     fields: ['LLM_PROVIDER', null, 'GROQ_API_KEY', 'GROQ_MODEL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'GEMINI_API_KEY', 'GEMINI_MODEL'] },
   { title: 'Email sending', ready: (c) => c.smtp, test: 'smtp',
-    help: 'For Gmail: turn on 2-step verification, then create an App Password at myaccount.google.com/apppasswords and paste it here (not your normal password).',
-    fields: ['SMTP_USER', 'SMTP_PASS', 'SMTP_FROM_NAME', null, 'SMTP_HOST', 'SMTP_PORT'] },
+    readyLabel: (c) => (c.email_via === 'gmail_api' ? 'Ready · Gmail API' : c.email_via === 'smtp' ? 'Ready · SMTP' : 'Not set'),
+    help: 'Your Gmail address, plus either a Gmail API refresh token (works on hosts that block email ports, like Render\'s free plan — see the README) '
+      + 'or an App Password from myaccount.google.com/apppasswords (not your normal password). The App Password is also what reply checking uses.',
+    fields: ['SMTP_USER', 'SMTP_FROM_NAME', 'GMAIL_REFRESH_TOKEN', 'SMTP_PASS', 'SMTP_HOST', 'SMTP_PORT'] },
   { title: 'Reply checking', ready: (c) => c.imap, test: 'imap', help: 'Leave these blank to reuse your email details above.',
     fields: ['IMAP_USER', 'IMAP_PASS', 'IMAP_HOST'] },
   { title: 'Phone numbers', ready: () => true, readyLabel: (c) => `+${c.country_code}`,
@@ -1025,7 +1027,7 @@ const CONN_LABEL = {
   SMTP_FROM_NAME: 'Sender name', SMTP_HOST: 'Mail server (SMTP)', SMTP_PORT: 'Mail server port',
   IMAP_USER: 'Inbox login', IMAP_PASS: 'Inbox password', IMAP_HOST: 'Inbox server (IMAP)',
   SERPAPI_KEY: 'SerpAPI key', SERPAPI_MONTHLY_LIMIT: 'Searches per month', IG_USERNAME: 'Burner username', IG_PASSWORD: 'Burner password',
-  DEFAULT_COUNTRY_CODE: 'Default country code',
+  DEFAULT_COUNTRY_CODE: 'Default country code', GMAIL_REFRESH_TOKEN: 'Gmail API refresh token',
 };
 const CONN_PLACEHOLDER = { SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '587', IMAP_HOST: 'imap.gmail.com', SERPAPI_MONTHLY_LIMIT: '100',
   GROQ_MODEL: 'default', OPENAI_MODEL: 'default', GEMINI_MODEL: 'default', DEFAULT_COUNTRY_CODE: '1', SMTP_FROM_NAME: 'e.g. Kunal from NeuroSpark' };
@@ -1052,8 +1054,12 @@ function renderConnections(fields) {
       return `<div class="field"><label>${esc(CONN_LABEL[n] || n)}</label>${input}${note}</div>`;
     }).join('');
     const label = g.readyLabel ? g.readyLabel(state.config) : (ok ? 'Ready' : 'Not set');
-    return `<div class="conn-group"><h3>${esc(g.title)} <span class="chip ${g.readyLabel ? 'info' : ok ? 'ok' : 'warn'}">${esc(label)}</span></h3>
-      <div class="hint">${esc(g.help)}</div><div class="conn-grid">${inputs}</div>
+    const tone = label === 'Not set' ? 'warn' : ok && g.test ? 'ok' : g.readyLabel ? 'info' : ok ? 'ok' : 'warn';
+    return `<div class="conn-group"><h3>${esc(g.title)} <span class="chip ${tone}">${esc(label)}</span></h3>
+      <div class="hint">${esc(g.help)}</div>
+      ${g.test === 'smtp' && by.GMAIL_REFRESH_TOKEN && by.GMAIL_REFRESH_TOKEN.set && !state.config.gmail_api_client
+        ? '<div class="notice">A Gmail API refresh token is saved, but this server has no GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET yet, so it can\'t be used. Add both on the host (Render > Environment).</div>' : ''}
+      <div class="conn-grid">${inputs}</div>
       ${g.test ? `<div class="row actions conn-test"><button class="btn small" data-conn-test="${g.test}">Save &amp; test this connection</button>
         <span class="hint" data-conn-result="${g.test}">Saves any changes above, then tests the connection.</span></div>` : ''}</div>`;
   }).join('');

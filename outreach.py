@@ -30,6 +30,7 @@ from email.utils import formatdate, make_msgid, formataddr, parseaddr
 
 import config
 import db
+import gmailapi
 import llm
 import netguard
 import schema
@@ -193,7 +194,15 @@ def draft_message(lead_id, selection="", index=0, settings=None, exact=None):
 # ------------------------------------------------------------------- email
 
 def smtp_configured():
-    return bool(config.env("SMTP_USER") and config.env("SMTP_PASS"))
+    """Email can go out: an address to send from, plus either the Gmail API sign-in or an SMTP password."""
+    return bool(config.env("SMTP_USER") and (gmailapi.configured() or config.env("SMTP_PASS")))
+
+
+def email_transport():
+    """How email leaves this account: "gmail_api", "smtp", or "" when it isn't set up."""
+    if not config.env("SMTP_USER"):
+        return ""
+    return "gmail_api" if gmailapi.configured() else "smtp" if config.env("SMTP_PASS") else ""
 
 
 def imap_configured():
@@ -305,8 +314,8 @@ def _explain_connect_error(e, host, port):
     if isinstance(e, smtplib.SMTPException):
         return str(e)
     return (f"Couldn't connect to {host}:{port} ({e}). If this app runs on a free hosting plan, the host may block "
-            "outgoing email ports (Render's free plan blocks 25, 465 and 587). Use a host that allows email, or an "
-            "email relay service that accepts port 2525.")
+            "outgoing email ports (Render's free plan blocks 25, 465 and 587). Send through the Gmail API instead "
+            "(it uses HTTPS, which isn't blocked) -- see 'Sending through the Gmail API' in the README.")
 
 
 class DeliveryError(RuntimeError):
@@ -320,7 +329,14 @@ class DeliveryError(RuntimeError):
 
 
 def _deliver(msg):
-    """Actually send via SMTP (Gmail by default; use an App Password)."""
+    """Actually send the message. Through the Gmail API (HTTPS) when this account has a Gmail
+    sign-in; otherwise over SMTP. Returns Gmail's {"id", "threadId"} for an API send, else None.
+    A follow-up can carry msg.gmail_thread_id to stay in the original Gmail conversation."""
+    if gmailapi.configured():
+        try:
+            return gmailapi.send(msg, getattr(msg, "gmail_thread_id", None))
+        except gmailapi.GmailError as e:
+            raise DeliveryError(str(e), recipient=e.recipient)
     host = config.env("SMTP_HOST", "smtp.gmail.com")
     port = config.env_int("SMTP_PORT", 587)
     user, pw = config.env("SMTP_USER"), config.env("SMTP_PASS")
@@ -350,9 +366,14 @@ def _deliver(msg):
 
 
 def test_smtp():
-    """Log in to the user's mail server to check the details. Sends nothing."""
+    """Check the email details (the Gmail API sign-in, or the SMTP login). Sends nothing."""
     if not smtp_configured():
-        raise SendError("Add your email address and App Password first.", 400)
+        raise SendError("Add your email address, plus a Gmail API refresh token or an App Password, first.", 400)
+    if gmailapi.configured():
+        try:
+            return gmailapi.test()
+        except gmailapi.GmailError as e:
+            raise SendError(str(e), 400 if e.auth else 502)
     host = config.env("SMTP_HOST", "smtp.gmail.com")
     port = config.env_int("SMTP_PORT", 587)
     user, pw = config.env("SMTP_USER"), config.env("SMTP_PASS")
@@ -449,7 +470,7 @@ def send_lead_email(lead_id, force=False):
     subject, body = split_subject(final_message(lead), lead)
     msg = build_email(lead, subject, body, settings)
     try:
-        _deliver(msg)
+        sent = _deliver(msg)
     except Exception as e:  # noqa: BLE001
         if getattr(e, "recipient", False):
             # this address is the problem: record it against the lead and move on
@@ -467,7 +488,8 @@ def send_lead_email(lead_id, force=False):
     if lead["stage"] == "new":
         fields["stage"] = "contacted"
     db.update_lead(lead_id, fields)
-    db.add_event(lead_id, "email_sent", json.dumps({"subject": subject, "message_id": msg["Message-ID"]}))
+    db.add_event(lead_id, "email_sent", json.dumps({"subject": subject, "message_id": msg["Message-ID"],
+                                                    "thread_id": sent.get("threadId", "") if isinstance(sent, dict) else ""}))
     return {"ok": True, "subject": subject}
 
 
@@ -530,14 +552,19 @@ def hand_followups_due(settings=None):
     return [dict(r) for r in rows]
 
 
-def _original_subject(lead_id):
+def _first_email(lead_id):
+    """What was recorded when this lead was first emailed (subject, message id, Gmail thread)."""
     for ev in reversed(db.list_events(lead_id, limit=100)):  # oldest first
         if ev["kind"] == "email_sent":
             try:
-                return json.loads(ev["detail"]).get("subject", "")
+                return json.loads(ev["detail"]) or {}
             except ValueError:
-                return ""
-    return ""
+                return {}
+    return {}
+
+
+def _original_subject(lead_id):
+    return _first_email(lead_id).get("subject", "")
 
 
 def followup_text(lead, settings=None):
@@ -579,6 +606,7 @@ def send_followup(lead_id):
     orig = _original_subject(lead_id) or f"Quick question for {lead['business_name'] or 'you'}"
     subject = orig if orig.lower().startswith("re:") else f"Re: {orig}"
     msg = build_email(lead, subject, text, settings, in_reply_to=lead["email_message_id"])
+    msg.gmail_thread_id = _first_email(lead_id).get("thread_id") or None     # same conversation in Gmail
     try:
         _deliver(msg)
     except Exception as e:  # noqa: BLE001
