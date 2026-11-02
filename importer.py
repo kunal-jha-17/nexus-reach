@@ -52,6 +52,30 @@ EXACT = {
     "location_link": "google_maps_url", "maps_url": "google_maps_url",
     "google_url": "google_maps_url", "place_url": "google_maps_url",
     # misc
+    # Google Maps exports (Apify, Outscraper, others)
+    "rating": "rating", "totalscore": "rating", "stars": "rating", "google_rating": "rating",
+    "average_rating": "rating", "avg_rating": "rating",
+    "place_id": "place_id", "placeid": "place_id", "google_place_id": "place_id", "google_id": "place_id",
+    "cid": "place_id", "ftid": "place_id",
+    "working_hours": "opening_hours", "opening_hours": "opening_hours", "openinghours": "opening_hours",
+    "hours": "opening_hours", "business_hours": "opening_hours",
+    "country": "country", "country_code": "country", "countrycode": "country",
+    "reviewscount": "review_count", "categoryname": "category_raw", "phoneunformatted": "phone",
+    "emails_0": "email", "instagrams_0": "instagram_url", "facebooks_0": "facebook_url",
+    "linkedins_0": "linkedin_url",
+    # Indian directories and spreadsheets (JustDial, IndiaMART, Sulekha, hand-made lists)
+    "mobile_no": "phone", "mobile_number": "phone", "mobile_num": "phone", "mob_no": "phone", "mob": "phone",
+    "contact_no": "phone", "contact_num": "phone", "phone_no": "phone", "ph_no": "phone", "cell": "phone",
+    "cell_no": "phone", "whatsapp_no": "phone", "whatsapp_number": "phone", "landline": "phone",
+    "landline_no": "phone", "telephone_no": "phone",
+    "email_id": "email", "e_mail_id": "email", "mail_id": "email", "emailid": "email", "mail": "email",
+    "firm_name": "business_name", "shop_name": "business_name", "clinic_name": "business_name",
+    "proprietor": "contact_name", "proprietor_name": "contact_name", "owner_name_": "contact_name",
+    "contact_person_name": "contact_name", "doctor_name": "contact_name", "dr_name": "contact_name",
+    "pincode": "postal_code", "pin_code": "postal_code", "pin": "postal_code", "postal_code": "postal_code",
+    "zip": "postal_code", "zip_code": "postal_code", "zipcode": "postal_code", "postcode": "postal_code",
+    "locality": "area", "area": "area", "neighbourhood": "area", "neighborhood": "area", "sub_locality": "area",
+    "district": "area", "region": "state", "province": "state",
     "notes": "notes", "note": "notes", "description": "notes",
     "source": "source_label", "campaign": "campaign",
 }
@@ -104,9 +128,38 @@ def _norm_header(h):
     return re.sub(r"[^a-z0-9]+", "_", (h or "").strip().lower()).strip("_")
 
 
+_HOURS_COL = re.compile(r"^opening_?hours_(\d+)_(day|hours)$")
+_CLOSED_HEADERS = {"permanentlyclosed": ("true", "1", "yes"),
+                   "business_status": ("closed_permanently", "permanently closed", "closed permanently")}
+
+
+def _hours_from_columns(row, headers):
+    """Apify writes opening hours as openingHours/0/day, openingHours/0/hours, ... -> 'Mon: 9-5; Tue: ...'."""
+    days = {}
+    for h in headers:
+        m = _HOURS_COL.match(_norm_header(h))
+        if m:
+            v = _cell(row, h)
+            if v:
+                days.setdefault(int(m.group(1)), {})[m.group(2)] = v
+    return "; ".join(f"{d.get('day', '')}: {d.get('hours', '')}".strip(": ") for _, d in sorted(days.items()))
+
+
+def _closed_for_good(row, headers):
+    for h in headers:
+        bad = _CLOSED_HEADERS.get(_norm_header(h))
+        if bad and _cell(row, h).lower() in bad:
+            return True
+    return False
+
+
 def map_headers(headers):
     """Return ({header: canonical_field}, [unmapped headers])."""
     mapping, used_targets, unmapped = {}, set(), []
+    keys = {_norm_header(h) for h in headers}
+    # Apify's Google Maps export has both "website" (the business's site) and "url" (its Maps page).
+    url_is_maps = "url" in keys and ("website" in keys or "site" in keys) and ("placeid" in keys or "totalscore" in keys
+                                                                              or "place_id" in keys)
     # A file with an explicit business column (Clinic Name, Company, Shop ...) AND a bare
     # "Name" / "Title" column: the bare one is the person / their job title, not the business.
     explicit_business = any(
@@ -120,7 +173,11 @@ def map_headers(headers):
         if key in IGNORED:
             unmapped.append(h)
             continue
+        if _HOURS_COL.match(key) or key in _CLOSED_HEADERS:
+            continue  # read separately: opening hours spread over columns / closed-for-good flags
         target = EXACT.get(key)
+        if key == "url" and url_is_maps:
+            target = "google_maps_url"
         if explicit_business and key in ("name", "title"):
             target = "contact_name" if key == "name" else None
         if target is None and not any(w in key.split("_") for w in _TEXTY):
@@ -212,10 +269,15 @@ def import_rows(headers, rows, campaign="", source="import", query=""):
     summary = {"inserted": 0, "merged": 0, "skipped_empty": 0, "skipped_suppressed": 0,
                "column_mapping": mapping,
                "unmapped_columns": [h for h in unmapped if _norm_header(h) not in IGNORED],
-               "missing_name": 0, "ids": []}
+               "missing_name": 0, "skipped_closed": 0, "ids": []}
+    hours_cols = any(_HOURS_COL.match(_norm_header(h)) for h in headers)
+    closed_cols = any(_norm_header(h) in _CLOSED_HEADERS for h in headers)
     for start in range(0, len(rows), 200):
         with db.batch():
             for row in rows[start:start + 200]:
+                if closed_cols and _closed_for_good(row, headers):
+                    summary["skipped_closed"] += 1
+                    continue
                 lead = {}
                 row_campaign, row_source = campaign, source
                 extra_notes = []
@@ -238,6 +300,18 @@ def import_rows(headers, rows, campaign="", source="import", query=""):
                     if v and len(v) <= 200 and _norm_header(h) not in IGNORED and schema.clean_cell(h, v):
                         extra_notes.append(f"{h}: {v}")
                 lead["notes"] = "; ".join(extra_notes)
+                # locality and PIN / postcode columns become part of the address
+                # ("..., Indiranagar" and "... 560038" -- the postcode after a space, as it's written)
+                addr = lead.get("address", "")
+                area, postal = lead.pop("area", ""), lead.pop("postal_code", "")
+                if area and area.lower() not in addr.lower():
+                    addr = f"{addr}, {area}" if addr else area
+                if postal and postal.replace(" ", "") not in addr.replace(" ", ""):
+                    addr = f"{addr} {postal}" if addr else postal
+                if addr:
+                    lead["address"] = addr
+                if hours_cols and not lead.get("opening_hours"):
+                    lead["opening_hours"] = _hours_from_columns(row, headers)
 
                 # Nothing to go on -> skip
                 norm = schema.normalize_lead(lead)

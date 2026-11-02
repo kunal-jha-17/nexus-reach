@@ -68,7 +68,7 @@
           <div class="field"><label for="cp-copy">Start from</label><select id="cp-copy"></select></div>
         </div>
         <div class="field"><label for="cp-desc">What is it for? <span class="muted">(optional)</span></label>
-          <input id="cp-desc" placeholder="HVAC contractors in Dallas / Fort Worth with no website"></div>
+          <input id="cp-desc" placeholder="Dental clinics in Dubai that miss calls after hours"></div>
         <div class="row actions"><button class="btn primary" id="cp-create">Create</button>
           <button class="btn" id="cp-cancel">Cancel</button></div>
       </div>
@@ -112,6 +112,14 @@
           <div class="hint" id="cs-criteria-note"></div></div>
         <div class="field"><label for="cs-info">About this campaign <span class="muted">(added to what the AI knows about you)</span></label>
           <textarea id="cs-info" rows="4" placeholder="Leave blank to use About you from Settings"></textarea></div>
+        <div class="row">
+          <div class="field"><label for="cs-cc">Phone country code <span class="muted">(numbers written without +)</span></label>
+            <input id="cs-cc" inputmode="numeric" placeholder="account default"></div>
+          <div class="field"><label for="cs-scoreweb">Scoring</label>
+            <select id="cs-scoreweb"><option value="">Account default</option>
+              <option value="yes">Rank businesses with no website higher</option>
+              <option value="no">Don't score websites (not selling websites)</option></select></div>
+        </div>
         <div class="field"><label class="check"><input type="checkbox" id="cs-prio-on"> Use a different channel order for this campaign</label>
           <div id="cs-prio"></div></div>
         <div class="field"><label class="check"><input type="checkbox" id="cs-tpl-on"> Use different message templates for this campaign</label>
@@ -134,7 +142,7 @@
             <input type="file" id="imp-file" accept=".csv,.xlsx,.xlsm,.tsv,.txt,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"></div>
           <div class="row">
             <div class="field"><label for="imp-campaign">Campaign</label>
-              <input id="imp-campaign" list="campaign-list" placeholder="e.g. dfw-trades"></div>
+              <input id="imp-campaign" list="campaign-list" placeholder="e.g. dubai-dentists"></div>
             <div class="field"><label for="imp-source">Source label</label>
               <input id="imp-source" value="import" placeholder="outscraper"></div>
           </div>
@@ -158,17 +166,17 @@
             <div class="field"><label for="sc-max">Listings to check</label><input id="sc-max" type="number" min="1" max="200" value="30"></div>
           </div>
           <div class="field"><label for="sc-query" id="sc-query-label">Search</label>
-            <input id="sc-query" placeholder="AC repair; furnace repair"></div>
+            <input id="sc-query" placeholder="dental clinic; orthodontist"></div>
           <div class="field"><label for="sc-location">Location</label>
-            <input id="sc-location" placeholder="Garland, TX; Mesquite, TX"></div>
+            <input id="sc-location" placeholder="Dubai, UAE; Abu Dhabi, UAE"></div>
           <p class="hint">Several at once: separate them with a semicolon ( ; ). Every search term is run in every place. Start typing for suggestions.</p>
           <p class="hint" id="sc-plan" hidden></p>
           <div class="field"><label for="sc-campaign">Campaign</label>
-            <input id="sc-campaign" list="campaign-list" placeholder="e.g. dfw-trades"></div>
+            <input id="sc-campaign" list="campaign-list" placeholder="e.g. dubai-dentists"></div>
           <div class="checks">
-            <label class="check"><input type="checkbox" id="sc-nosite" checked> <span>Only keep businesses with <b>no website</b>
+            <label class="check"><input type="checkbox" id="sc-nosite"> <span>Only keep businesses with <b>no website</b>
               <span class="muted">&mdash; &ldquo;listings to check&rdquo; is then how many are looked at, not how many are kept</span></span></label>
-            <label class="check"><input type="checkbox" id="sc-then"> <span>When it finishes, <b>enrich, judge and draft</b> what it found
+            <label class="check"><input type="checkbox" id="sc-then"> <span>When it finishes, <b>judge, enrich and draft</b> what it found
               <span class="muted">&mdash; nothing is sent</span></span></label>
           </div>
           <div class="row actions">
@@ -247,7 +255,7 @@
       <header class="view-head"><h1>Enrich &amp; judge</h1></header>
       <div class="card accent">
         <div class="card-head"><div><h2>Do all of it in one run</h2>
-          <p class="hint" style="margin:0">Enrich &rarr; judge fit &rarr; draft messages, each step only for the leads that still need it. Nothing is sent.</p></div>
+          <p class="hint" style="margin:0">Judge fit &rarr; enrich the leads that weren&rsquo;t rejected &rarr; draft messages, each step only for the leads that still need it. Nothing is sent.</p></div>
           <div class="row-tight">
             <select id="pl-campaign" aria-label="Campaign"><option value="">All campaigns</option></select>
             <button class="btn primary" id="pl-go">Run all steps</button></div></div>
@@ -372,11 +380,15 @@
             <h2>About you</h2>
             <p class="hint">Who's sending, what you offer, price, tone. Given to the AI with every draft.</p>
             <textarea id="st-info" rows="8" aria-label="Business info"></textarea>
+            <div class="checks">
+              <label class="check"><input type="checkbox" id="st-scoreweb"> <span>I sell websites &mdash; <b>rank businesses with no website higher</b>
+                <span class="muted">(untick if you sell something else, e.g. an AI receptionist or ads; campaigns can override this)</span></span></label>
+            </div>
           </div>
           <div class="card">
             <h2>How to reach a lead</h2>
             <p class="hint">Order of preference. A lead gets the first channel you have contact details for.
-               (WhatsApp is only used for numbers outside the US.)</p>
+               (WhatsApp is only used for mobile numbers outside the US &mdash; landlines go to Phone.)</p>
             <div id="st-priority"></div>
           </div>
         </div>
@@ -395,7 +407,7 @@
           <h2>Follow-up message</h2>
           <p class="hint">Sent to leads who haven't answered. Blanks like <code>{business_name}</code> work here too.
              Leave it empty and the AI writes a short nudge for each lead instead.</p>
-          <textarea id="st-followup" rows="3" placeholder="Hi {first_name|there}, just floating this back up — is a website something you'd want for {business_name}?"></textarea>
+          <textarea id="st-followup" rows="3" placeholder="Hi {first_name|there}, just floating this back up — is this something you'd want for {business_name}?"></textarea>
         </div>
       </div>
 
@@ -405,7 +417,7 @@
           <div class="card">
             <h2>Email limits</h2>
             <div class="row">
-              <div class="field"><label for="st-limit">Emails a day</label><input id="st-limit" type="number" min="1"></div>
+              <div class="field"><label for="st-limit">Emails a day</label><input id="st-limit" type="number" min="1" max="100000"></div>
               <div class="field"><label for="st-delay">Seconds between emails</label><input id="st-delay" type="number" min="0"></div>
             </div>
             <div class="row">
@@ -413,8 +425,16 @@
               <div class="field"><label for="st-fumax">Follow-ups per lead</label><input id="st-fumax" type="number" min="0"></div>
             </div>
             <div class="checks">
-              <label class="check"><input type="checkbox" id="st-warmup"> <span>Ramp up gradually (10 &rarr; 20 &rarr; 30 a day) on a new sending account</span></label>
+              <label class="check"><input type="checkbox" id="st-warmup"> <span>Ramp up gradually on a new sending account
+                <span class="muted">(up to 40 a day: 10 &rarr; 20 &rarr; 30; above that: starts at 20 and grows about 30% a day)</span></span></label>
+              <label class="check"><input type="checkbox" id="st-autopace"> <span><b>Pace automatically</b> &mdash; spread the day's emails evenly over your sending hours
+                <span class="muted">(ignores "seconds between emails"; 5,000 over 9 hours is one every ~6 seconds)</span></span></label>
             </div>
+            <div class="row">
+              <div class="field"><label for="st-bounce">Pause sending when bounces pass (%)</label><input id="st-bounce" type="number" min="0" max="50"></div>
+              <div class="field"></div>
+            </div>
+            <div class="notice" id="st-volume-note" hidden></div>
             <div class="field"><label for="st-footer">Line added to every email</label>
               <textarea id="st-footer" rows="3"></textarea></div>
           </div>

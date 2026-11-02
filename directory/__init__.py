@@ -48,6 +48,23 @@ def _line_start(mm, pos):
 
 
 def places(q, limit=8, prefer=()):
+    """Places whose name starts with `q` -- or an old/new name of one (Bangalore -> Bengaluru,
+    Gurugram -> Gurgaon) -- biggest first."""
+    found = _search_places(q, limit, prefer)
+    if len(found) < limit:
+        import schema
+        key = fold(q)
+        if key:
+            names = {**schema.CITY_ALIASES, **{v: k for k, v in schema.CITY_ALIASES.items()}}
+            for alias, target in names.items():
+                if alias.startswith(key) and alias != target:
+                    for d in _search_places(target, limit, prefer):
+                        if d not in found:
+                            found.append(d)
+    return found[:limit]
+
+
+def _search_places(q, limit=8, prefer=()):
     """Places whose name starts with `q`, biggest first. `prefer` is a set of endings such as
     {'TX', 'India'}: places ending in one of them (where this account already works) rank first."""
     key = fold(q).encode()

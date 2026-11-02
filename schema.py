@@ -11,7 +11,9 @@ settled here, once:
   * one stage vocabulary and one send-status vocabulary
   * timestamps are ISO-8601 UTC text
 """
+import contextvars
 import re
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs, urlunparse
 
@@ -34,11 +36,14 @@ DATA_COLUMNS = [
     "phone", "phone_raw", "email", "website", "has_website",
     "instagram_url", "facebook_url", "linkedin_url", "yelp_url", "google_maps_url",
     "notes", "website_domain", "name_key",
+    "place_id", "rating", "opening_hours", "country", "phone_kind",
 ]
+# Columns worked out from the others (never merged in from a second copy of a lead).
+DERIVED_COLUMNS = ("has_website", "website_domain", "name_key", "phone_kind")
 
 # Columns a person may edit by hand in the UI.
 EDITABLE_FIELDS = [
-    "business_name", "contact_name", "trade", "category_raw", "address", "city", "state",
+    "business_name", "contact_name", "trade", "category_raw", "address", "city", "state", "country",
     "phone", "email", "website", "instagram_url", "facebook_url", "linkedin_url",
     "yelp_url", "google_maps_url", "notes", "campaign", "stage", "message",
     "send_status", "channel", "do_not_contact",
@@ -47,7 +52,8 @@ EDITABLE_FIELDS = [
 # Column order for CSV export.
 EXPORT_COLUMNS = [
     "id", "campaign", "source", "business_name", "contact_name", "trade", "category_raw",
-    "address", "city", "state", "review_count", "phone", "email", "website", "has_website",
+    "address", "city", "state", "country", "review_count", "rating", "opening_hours", "place_id",
+    "phone", "email", "website", "has_website",
     "instagram_url", "facebook_url", "linkedin_url", "yelp_url", "google_maps_url",
     "score", "score_reasons", "fit", "fit_confidence", "fit_reason", "enrichment_notes",
     "channel", "stage", "send_status", "message", "template_used", "sent_at",
@@ -61,23 +67,59 @@ def now_iso():
 
 # ------------------------------------------------------------------- phones
 
+_CALLING_CODE = contextvars.ContextVar("calling_code", default="")
+
+
+@contextmanager
+def calling_code(cc):
+    """Read numbers written without a country code as `cc` (a campaign's own country) inside
+    this block, instead of the account's DEFAULT_COUNTRY_CODE."""
+    # an empty code keeps whatever an outer block chose (a scrape of "Bengaluru" reads +91 even when
+    # the campaign itself has no code of its own)
+    token = _CALLING_CODE.set(re.sub(r"\D", "", str(cc or "")) or _CALLING_CODE.get())
+    try:
+        yield
+    finally:
+        _CALLING_CODE.reset(token)
+
+
+_PHONE_SPLIT = re.compile(r"\s*(?:[,;/|\n]|\bor\b|&)\s*", re.I)
+
+
 def norm_phone(raw):
     """Return an E.164 phone number, or '' if it can't be trusted.
     US-first: 10 digits (or 11 starting with 1) become +1XXXXXXXXXX. Set
-    DEFAULT_COUNTRY_CODE in .env to change the assumed country."""
+    DEFAULT_COUNTRY_CODE in .env (or a campaign's own code) to change the assumed country.
+    A cell holding several numbers ("98765 43210 / 080 2345 6789") gives the first usable one."""
     if not raw:
         return ""
     s = str(raw).strip()
-    s = re.split(r"(?i)\s*(?:ext\.?|extension|x)\s*\d+\s*$", s)[0]
+    first = _norm_one(s)
+    if first or not _PHONE_SPLIT.search(s):
+        return first
+    for part in _PHONE_SPLIT.split(s):
+        n = _norm_one(part)
+        if n:
+            return n
+    return ""
+
+
+def _norm_one(s):
+    s = re.split(r"(?i)\s*(?:ext\.?|extension|x)\s*\d+\s*$", s.strip())[0]
+    s = re.sub(r"\(\s*0\s*\)", "", s)            # "+91 (0) 80 ..." / "+44 (0)20 ...": the 0 isn't dialled from abroad
     digits = re.sub(r"\D", "", s)
     if not digits:
         return ""
-    cc = config.env("DEFAULT_COUNTRY_CODE", "1").lstrip("+")
+    cc = _CALLING_CODE.get() or config.env("DEFAULT_COUNTRY_CODE", "1").lstrip("+")
     if s.startswith("+") or s.startswith("00"):
         if s.startswith("00"):
             digits = digits[2:]
         if digits.startswith("0"):      # E.164 country codes never start with 0
             return ""
+        for code in _TRUNK_ZERO_CODES:  # "+91 080 2345 6789": a national 0 kept after the country code
+            if digits.startswith(code + "0") and len(digits) - len(code) - 1 >= 7:
+                digits = code + digits[len(code) + 1:]
+                break
         return "+" + digits if 8 <= len(digits) <= 15 else ""
     if cc == "1":
         if len(digits) == 11 and digits.startswith("1"):
@@ -88,13 +130,100 @@ def norm_phone(raw):
     national = digits.lstrip("0")
     if national.startswith(cc) and len(national) - len(cc) >= 9 and len(national) > 10:
         national = national[len(cc):]          # written with the country code but no "+": 91 98765 43210
+    if cc == "91" and not (len(national) == 10 or (national.startswith(("1800", "1860")) and 10 <= len(national) <= 11)):
+        return ""                              # Indian numbers are 10 digits (toll-free 1800/1860 a little longer)
     if 7 <= len(national) <= 12:
         return "+" + cc + national
     return ""
 
 
+# Countries whose numbers are written with a leading 0 nationally (people sometimes keep it after the code).
+_TRUNK_ZERO_CODES = ("971", "966", "91", "92", "44", "61", "64", "20", "27", "234", "254", "63", "60", "62",
+                     "353", "33", "49", "39", "880", "94", "977")
+
+
 def is_us_phone(e164):
     return bool(e164) and e164.startswith("+1")
+
+
+# country code -> regex on the national number for MOBILE lines. Anything else in that
+# country is a landline (or a shared/toll-free line), which can't receive WhatsApp.
+_MOBILE_PATTERNS = {
+    "971": r"5\d{8}",            # UAE 050/052/054/055/056/058
+    "966": r"5\d{8}",            # Saudi Arabia
+    "974": r"[3567]\d{7}",       # Qatar
+    "965": r"[569]\d{7}",        # Kuwait
+    "968": r"[79]\d{7}",         # Oman
+    "973": r"3\d{7}",            # Bahrain
+    "91": r"[6-9]\d{9}",         # India
+    "92": r"3\d{9}",             # Pakistan
+    "44": r"7\d{9}",             # UK
+    "61": r"4\d{8}",             # Australia
+    "64": r"2\d{7,9}",           # New Zealand
+    "65": r"[89]\d{7}",          # Singapore
+    "20": r"1\d{9}",             # Egypt
+    "27": r"[678]\d{8}",         # South Africa
+    "234": r"[789]\d{9}",        # Nigeria
+    "254": r"[17]\d{8}",         # Kenya
+    "63": r"9\d{9}",             # Philippines
+    "60": r"1\d{8,9}",           # Malaysia
+    "62": r"8\d{8,11}",          # Indonesia
+    "353": r"8\d{8}",            # Ireland
+    "33": r"[67]\d{8}",          # France
+    "49": r"1[5-7]\d{8,9}",      # Germany
+    "34": r"[67]\d{8}",          # Spain
+    "39": r"3\d{8,9}",           # Italy
+    "52": r"\d{10}",             # Mexico (mobiles and landlines look alike) -> treated as mobile
+    "55": r"\d{2}9\d{8}",        # Brazil
+}
+
+
+# Landline / shared / toll-free numbers, for the countries where they're clearly told apart.
+_LANDLINE_PATTERNS = {
+    "971": r"[234679]\d{7}|[68]00\d{3,9}",   # UAE 02/03/04/06/07/09 + 800 / 600 numbers
+    "966": r"1\d{7}|[89]\d{8,9}",
+    "974": r"4\d{7}|800\d{4}",
+    "965": r"[12]\d{7}|1800\d+",
+    "968": r"2\d{7}|800\d+",
+    "973": r"1\d{7}|80\d{6}",
+    "91": r"[1-5]\d{9}|18[06]0\d{6,7}",
+    "92": r"[2-9]\d{8,9}",
+    "44": r"[123]\d{8,9}|80\d{7,8}",
+    "61": r"[2378]\d{8}|1[38]00\d{6}",
+    "65": r"6\d{7}|1800\d{7}",
+    "20": r"[2-9]\d{7,8}",
+    "27": r"[1-5]\d{8}",
+}
+
+
+# Indian landlines whose area code starts like a mobile (Bengaluru 080, Ahmedabad 079, ...): told apart
+# by how they're written -- area code with its 0, then the subscriber number, which starts 2-6.
+_IN_STD_WRITTEN = re.compile(r"^\s*(?:\+91[\s.\-]*\(?0?|\(?0)(79|80|612|641|674|712|731|751|761|771|781|788|821|824|"
+                             r"831|836|863|866|870|877|891|895)\)?[\s.\-]+[2-6]\d")
+
+
+def phone_kind_from_raw(raw, e164):
+    """phone_kind, with what the raw text reveals that the number alone can't."""
+    kind = phone_kind(e164)
+    if kind == "mobile" and e164.startswith("+91") and _IN_STD_WRITTEN.match(str(raw or "")):
+        return "landline"
+    return kind
+
+
+def phone_kind(e164):
+    """'mobile', 'landline' or '' (can't tell -- US/Canada numbers, unknown countries, odd lengths)."""
+    if not e164 or not e164.startswith("+"):
+        return ""
+    digits = e164[1:]
+    for cc in sorted(_MOBILE_PATTERNS, key=len, reverse=True):
+        if digits.startswith(cc):
+            national = digits[len(cc):]
+            if re.fullmatch(_MOBILE_PATTERNS[cc], national):
+                return "mobile"
+            if cc in _LANDLINE_PATTERNS and re.fullmatch(_LANDLINE_PATTERNS[cc], national):
+                return "landline"
+            return ""
+    return ""
 
 
 # ------------------------------------------------------------------- emails
@@ -217,6 +346,14 @@ DIRECTORY_HOSTS = (
     "opentable.com", "doordash.com", "ubereats.com", "grubhub.com", "zomato.com", "swiggy.com",
     "booking.com", "airbnb.com", "expedia.com", "makemytrip.com", "etsy.com", "amazon.com", "ebay.com",
     "apple.com", "play.google.com", "yell.com", "gumtree.com", "craigslist.org", "olx.in",
+    # more Indian listing / booking sites (a profile there isn't the business's own website)
+    "justdial.in", "jsdl.in", "sulekha.in", "magicpin.in", "dineout.co.in", "eazydiner.com", "urbancompany.com",
+    "urbanclap.com", "nobroker.in", "99acres.com", "magicbricks.com", "housing.com", "bookmyshow.com",
+    "clinicspots.com", "credihealth.com", "docprime.com", "practo.in", "quikr.com", "grotal.com",
+    "asklaila.com", "yellowpages.in", "indiacom.com", "exportersindia.com", "dial4trade.com",
+    "nearbuy.com", "zomato.in", "swiggy.in", "meesho.com", "flipkart.com", "amazon.in", "myntra.com",
+    "instamojo.com", "dukaan.app", "mydukaan.io", "shiprocket.in", "wa.link", "api.whatsapp.com",
+    "g.page", "maps.app.goo.gl",
 )
 
 
@@ -282,6 +419,158 @@ def parse_city_state(address):
     return "", ""
 
 
+COUNTRY_NAMES = {
+    "united arab emirates": "AE", "uae": "AE", "u.a.e.": "AE", "india": "IN", "saudi arabia": "SA",
+    "ksa": "SA", "qatar": "QA", "kuwait": "KW", "oman": "OM", "bahrain": "BH", "united kingdom": "GB",
+    "uk": "GB", "england": "GB", "australia": "AU", "canada": "CA", "singapore": "SG", "pakistan": "PK",
+    "egypt": "EG", "south africa": "ZA", "new zealand": "NZ", "ireland": "IE", "nigeria": "NG",
+    "kenya": "KE", "philippines": "PH", "malaysia": "MY", "indonesia": "ID", "united states": "US",
+    "usa": "US", "us": "US", "united states of america": "US", "germany": "DE", "france": "FR",
+    "spain": "ES", "italy": "IT", "mexico": "MX", "brazil": "BR", "bangladesh": "BD", "sri lanka": "LK",
+    "nepal": "NP",
+}
+
+
+def norm_country(raw):
+    """Two-letter country code from 'AE', 'ae', 'United Arab Emirates', 'UAE' ... or ''."""
+    v = (raw or "").strip()
+    if not v:
+        return ""
+    if len(v) == 2 and v.isalpha():
+        return v.upper()
+    return COUNTRY_NAMES.get(v.lower().strip(" ."), "")
+
+
+def parse_city_country(address):
+    """'Building 5, Al Reem Island, Abu Dhabi, United Arab Emirates' -> ('Abu Dhabi', 'AE').
+    Only when the address ends with a country we know; otherwise ('', '')."""
+    parts = [p.strip() for p in str(address or "").split(",") if p.strip()]
+    if len(parts) < 2:
+        return "", ""
+    country = COUNTRY_NAMES.get(re.sub(r"[\d\-]+", "", parts[-1]).strip(" .").lower(), "")
+    if not country or country == "US":
+        return "", country
+    city = re.sub(r"\b\d[\d\- ]*\b", "", parts[-2]).strip(" -")
+    return (city if re.search(r"[A-Za-z]", city) else ""), country
+
+
+INDIAN_STATES = {
+    "andhra pradesh": "Andhra Pradesh", "arunachal pradesh": "Arunachal Pradesh", "assam": "Assam", "bihar": "Bihar",
+    "chhattisgarh": "Chhattisgarh", "goa": "Goa", "gujarat": "Gujarat", "haryana": "Haryana",
+    "himachal pradesh": "Himachal Pradesh", "jharkhand": "Jharkhand", "karnataka": "Karnataka", "kerala": "Kerala",
+    "madhya pradesh": "Madhya Pradesh", "maharashtra": "Maharashtra", "manipur": "Manipur", "meghalaya": "Meghalaya",
+    "mizoram": "Mizoram", "nagaland": "Nagaland", "odisha": "Odisha", "orissa": "Odisha", "punjab": "Punjab",
+    "rajasthan": "Rajasthan", "sikkim": "Sikkim", "tamil nadu": "Tamil Nadu", "tamilnadu": "Tamil Nadu",
+    "telangana": "Telangana", "tripura": "Tripura", "uttar pradesh": "Uttar Pradesh", "uttarakhand": "Uttarakhand",
+    "uttaranchal": "Uttarakhand", "west bengal": "West Bengal", "delhi": "Delhi", "new delhi": "Delhi",
+    "nct of delhi": "Delhi", "national capital territory of delhi": "Delhi", "jammu and kashmir": "Jammu and Kashmir",
+    "jammu & kashmir": "Jammu and Kashmir", "ladakh": "Ladakh", "puducherry": "Puducherry", "pondicherry": "Puducherry",
+    "chandigarh": "Chandigarh", "andaman and nicobar islands": "Andaman and Nicobar Islands",
+    "dadra and nagar haveli and daman and diu": "Dadra and Nagar Haveli and Daman and Diu", "lakshadweep": "Lakshadweep",
+}
+# Old and new names of the same Indian city, so "Bangalore" and "Bengaluru" listings are recognised as one place.
+CITY_ALIASES = {
+    "bangalore": "bengaluru", "bombay": "mumbai", "madras": "chennai", "calcutta": "kolkata", "gurgaon": "gurugram",
+    "pondicherry": "puducherry", "trivandrum": "thiruvananthapuram", "cochin": "kochi", "ernakulam": "kochi",
+    "mysore": "mysuru", "allahabad": "prayagraj", "baroda": "vadodara", "poona": "pune", "new delhi": "delhi",
+    "mangalore": "mangaluru", "belgaum": "belagavi", "hubli": "hubballi", "vizag": "visakhapatnam",
+    "benares": "varanasi", "banaras": "varanasi", "calicut": "kozhikode", "trichy": "tiruchirappalli",
+    "navi mumbai": "navi mumbai", "secunderabad": "hyderabad",
+}
+IN_STATE_CODES = {
+    "AP": "Andhra Pradesh", "AR": "Arunachal Pradesh", "AS": "Assam", "BR": "Bihar", "CG": "Chhattisgarh",
+    "CT": "Chhattisgarh", "GA": "Goa", "GJ": "Gujarat", "HR": "Haryana", "HP": "Himachal Pradesh", "JH": "Jharkhand",
+    "KA": "Karnataka", "KL": "Kerala", "MP": "Madhya Pradesh", "MH": "Maharashtra", "MN": "Manipur", "ML": "Meghalaya",
+    "MZ": "Mizoram", "NL": "Nagaland", "OD": "Odisha", "OR": "Odisha", "PB": "Punjab", "RJ": "Rajasthan",
+    "SK": "Sikkim", "TN": "Tamil Nadu", "TS": "Telangana", "TG": "Telangana", "TR": "Tripura", "UP": "Uttar Pradesh",
+    "UK": "Uttarakhand", "UT": "Uttarakhand", "WB": "West Bengal", "DL": "Delhi", "JK": "Jammu and Kashmir",
+    "LA": "Ladakh", "PY": "Puducherry", "CH": "Chandigarh",
+}
+CALLING_CODES = {"US": "1", "CA": "1", "IN": "91", "AE": "971", "SA": "966", "QA": "974", "KW": "965", "OM": "968",
+                 "BH": "973", "GB": "44", "AU": "61", "NZ": "64", "SG": "65", "PK": "92", "BD": "880", "LK": "94",
+                 "NP": "977", "EG": "20", "ZA": "27", "NG": "234", "KE": "254", "PH": "63", "MY": "60", "ID": "62",
+                 "IE": "353", "DE": "49", "FR": "33", "ES": "34", "IT": "39", "MX": "52", "BR": "55"}
+_COUNTRY_BY_CODE = {"91": "IN", "971": "AE", "966": "SA", "974": "QA", "965": "KW", "968": "OM", "973": "BH",
+                    "44": "GB", "61": "AU", "64": "NZ", "65": "SG", "92": "PK", "880": "BD", "94": "LK", "977": "NP",
+                    "20": "EG", "27": "ZA", "234": "NG", "254": "KE", "63": "PH", "60": "MY", "62": "ID", "353": "IE"}
+_PIN_RE = re.compile(r"(?<!\d)([1-9]\d{2})\s?(\d{3})(?!\d)")
+
+
+def indian_state(text):
+    return INDIAN_STATES.get(re.sub(r"[^a-z& ]", "", (text or "").lower()).strip(), "")
+
+
+def parse_indian_address(address):
+    """'No. 12, MG Road, Indiranagar, Bengaluru, Karnataka 560038, India' ->
+    {'city': 'Bengaluru', 'state': 'Karnataka', 'pin': '560038'}; {} when it isn't clearly Indian."""
+    text = str(address or "").strip()
+    if not text:
+        return {}
+    pin_m = None
+    for pin_m in _PIN_RE.finditer(text):
+        pass                                           # the last 6-digit group is the PIN
+    pin = (pin_m.group(1) + pin_m.group(2)) if pin_m else ""
+    parts = [p.strip(" -.") for p in re.split(r",|\n", text) if p.strip(" -.")]
+    parts = [p for p in parts if p.lower() not in ("india", "bharat", "in")]
+    state, state_at = "", -1
+    for i in range(len(parts) - 1, -1, -1):
+        st = indian_state(_PIN_RE.sub("", parts[i]).strip(" -"))
+        if st:
+            state, state_at = st, i
+            break
+    says_india = bool(re.search(r"\bindia\b", text, re.I))
+    if not state and not (pin and says_india):
+        return {}
+    city = ""
+    if state_at > 0:
+        city = parts[state_at - 1]
+    elif state_at == 0 and indian_state(parts[0]) == "Delhi":
+        city = "New Delhi" if "new delhi" in text.lower() else "Delhi"
+    elif not state and parts:
+        city = parts[-1]
+    city = re.sub(r"\s*-?\s*" + (pin_m.group(0) if pin_m else r"\b\d{6}\b"), "", city).strip(" -.")
+    city = re.sub(r"\d", "", city).strip(" -.")
+    if state == "Delhi" and not city:
+        city = "Delhi"
+    return {"city": city if re.search(r"[A-Za-z]", city) else "", "state": state, "pin": pin}
+
+
+_PLACE_ID_RE = re.compile(r"(?:place_id[:=]|query_place_id=|placeid=)(ChI[A-Za-z0-9_\-]{10,})")
+_CID_RE = re.compile(r"[?&]cid=(\d{5,})")
+_FTID_RE = re.compile(r"(0x[0-9a-f]+:0x[0-9a-f]+)", re.I)
+
+
+def place_key(place_id="", maps_url=""):
+    """One comparable id for a Google Maps place: 'pid:ChIJ...', 'cid:123...' or 'ftid:0x..:0x..'.
+    Different kinds can't be compared with each other, so callers compare only like with like."""
+    pid = (place_id or "").strip()
+    if pid.startswith("ChI"):
+        return "pid:" + pid
+    if pid.startswith("0x") and ":" in pid:
+        return "ftid:" + pid.lower()
+    if pid.isdigit() and len(pid) >= 5:
+        return "cid:" + pid
+    url = maps_url or ""
+    m = _PLACE_ID_RE.search(url)
+    if m:
+        return "pid:" + m.group(1)
+    m = _CID_RE.search(url)
+    if m:
+        return "cid:" + m.group(1)
+    m = _FTID_RE.search(url)
+    if m:
+        return "ftid:" + m.group(1).lower()
+    return ""
+
+
+def _to_rating(v):
+    m = re.search(r"\d+(?:[.,]\d+)?", str(v if v is not None else ""))
+    if not m:
+        return None
+    r = float(m.group(0).replace(",", "."))
+    return round(r, 1) if 0 < r <= 5 else None
+
+
 _TRADE_KEYWORDS = [
     ("hvac", ("hvac", "heating", "air condition", "a/c", "furnace", "cooling", "heat pump")),
     ("plumbing", ("plumb", "drain", "sewer", "water heater", "rooter")),
@@ -304,9 +593,15 @@ def derive_trade(category, name=""):
 _NAME_SUFFIX = re.compile(r"\b(llc|inc|incorporated|co|company|corp|corporation|ltd|the)\b")
 
 
+_NAME_SUFFIX_IN = re.compile(r"\b(pvt|private|limited|llp|opc)\b")
+
+
 def make_name_key(name, city=""):
-    n = re.sub(r"[^a-z0-9]", "", _NAME_SUFFIX.sub(" ", (name or "").lower()))
-    c = re.sub(r"[^a-z0-9]", "", (city or "").lower())
+    # \W keeps letters of every script, so Hindi, Tamil or Arabic names dedupe too (ASCII names give the same keys as before)
+    low = _NAME_SUFFIX_IN.sub(" ", _NAME_SUFFIX.sub(" ", (name or "").lower()))
+    n = re.sub(r"[\W_]", "", low)
+    c = (city or "").lower().strip()
+    c = re.sub(r"[\W_]", "", CITY_ALIASES.get(c, c))
     return f"{n}|{c}" if n else ""
 
 
@@ -325,6 +620,7 @@ _TEXT_KEYS = [
     "business_name", "contact_name", "trade", "category_raw", "address", "city", "state",
     "phone", "phone_raw", "email", "website", "instagram_url", "facebook_url",
     "linkedin_url", "yelp_url", "google_maps_url", "notes",
+    "place_id", "opening_hours", "country",
 ]
 
 
@@ -400,6 +696,36 @@ def normalize_lead(raw):
         d["city"] = d["city"] or city
         d["state"] = d["state"] or state
     d["state"] = d["state"].upper() if len(d["state"]) == 2 else d["state"]
+    d["country"] = norm_country(d["country"])
+    assumed_cc = _CALLING_CODE.get() or config.env("DEFAULT_COUNTRY_CODE", "1").lstrip("+")
+    if len(d["state"]) == 2 and d["state"].upper() in IN_STATE_CODES and (d["country"] == "IN" or (
+            not d["country"] and (assumed_cc == "91" or d["phone"].startswith("+91")))):
+        d["state"] = IN_STATE_CODES[d["state"].upper()]      # "UP", "KA" on an Indian list are states, not US ones
+    if indian_state(d["state"]):
+        d["state"] = indian_state(d["state"])
+        d["country"] = d["country"] or "IN"
+    if d["address"] and d["country"] in ("", "IN") and not (d["city"] and d["state"] and d["country"]):
+        ind = parse_indian_address(d["address"])
+        if ind:
+            d["city"] = d["city"] or ind["city"]
+            d["state"] = d["state"] or ind["state"]
+            d["country"] = d["country"] or "IN"
+    if d["address"] and (not d["city"] or not d["country"]):
+        city, country = parse_city_country(d["address"])
+        d["city"] = d["city"] or city
+        d["country"] = d["country"] or country
+    if not d["country"] and d["state"] in US_STATES:
+        d["country"] = "US"
+    if not d["country"] and d["phone"]:
+        d["country"] = next((c for code, c in sorted(_COUNTRY_BY_CODE.items(), key=lambda x: -len(x[0]))
+                             if d["phone"].startswith("+" + code)), "")
+
+    # Google Maps place, rating, hours, line type ---------------------------------
+    key = place_key(d["place_id"], d["google_maps_url"])
+    d["place_id"] = key.split(":", 1)[1] if key else ""
+    d["rating"] = _to_rating(raw.get("rating"))
+    d["opening_hours"] = re.sub(r"\s+", " ", d["opening_hours"])[:300]
+    d["phone_kind"] = phone_kind_from_raw(d["phone_raw"], d["phone"])
 
     # trade -------------------------------------------------------------------
     t = re.sub(r"[\s\-]+", "_", d["trade"].lower())
@@ -414,13 +740,17 @@ def normalize_lead(raw):
 
 # ---------------------------------------------------------- scoring / channel
 
-def score_lead(lead):
+def score_lead(lead, favor_no_website=True):
     """Rule-based 0-10 score (free, instant). Favours businesses that clearly
     need help -- no real website, thin review history -- but are still
     reachable. It's a first-pass sort order, not a verdict: the LLM 'fit'
     judgement (which reads your criteria) is the real filter."""
     score, reasons = 0, []
-    if not lead.get("has_website"):
+    if not favor_no_website:
+        # selling something other than websites: a site of their own is neither good nor bad
+        score += 2
+        reasons.append("website not scored (+2 for everyone)")
+    elif not lead.get("has_website"):
         score += 3
         reasons.append("no real website (+3)")
     else:
@@ -449,7 +779,7 @@ def score_lead(lead):
 def derive_channel(lead, priority=None):
     """Pick the best way to reach a lead, following the priority list.
     WhatsApp is only suggested for non-US numbers (US business lines are
-    rarely on it); a US phone falls through to 'phone' (call / text)."""
+    rarely on it) that aren't landlines; those fall through to 'phone' (call / text)."""
     priority = priority or DEFAULT_CHANNEL_PRIORITY
     for ch in priority:
         if ch == "email" and lead.get("email"):
@@ -460,7 +790,8 @@ def derive_channel(lead, priority=None):
             return "facebook"
         if ch == "instagram" and lead.get("instagram_url"):
             return "instagram"
-        if ch == "whatsapp" and lead.get("phone") and not is_us_phone(lead["phone"]):
+        if (ch == "whatsapp" and lead.get("phone") and not is_us_phone(lead["phone"])
+                and (lead.get("phone_kind") or phone_kind(lead["phone"])) != "landline"):
             return "whatsapp"
         if ch == "phone" and (lead.get("phone") or lead.get("phone_raw")):
             return "phone"

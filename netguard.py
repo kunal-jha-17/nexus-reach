@@ -29,7 +29,7 @@ import requests
 import config
 
 WEB_PORTS = {80, 443, 8080, 8443}
-MAIL_PORTS = {25, 465, 587, 2525, 143, 993}
+MAIL_PORTS = {25, 465, 587, 2525, 2587, 2465, 143, 993}
 
 
 class Blocked(ValueError):

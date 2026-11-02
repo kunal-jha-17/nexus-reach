@@ -83,11 +83,47 @@ def _get(url, timeout=12):
         return ""
 
 
+_AT = r"\s*(?:\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\}|<\s*at\s*>|\[@\]|\(@\)|\s+at\s+(?=[a-z0-9\-]+\s*(?:\[|\(|\{|<)\s*dot))\s*"
+_DOT = r"\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|<\s*dot\s*>|\[\.\]|\(\.\))\s*"
+_OBFUSCATED = re.compile(r"([a-z0-9._%+\-]+)" + _AT + r"([a-z0-9\-]+(?:(?:" + _DOT + r"|\.)[a-z0-9\-]+)*)", re.I)
+
+
+def deobfuscate_emails(text):
+    """'hello [at] clinic [dot] ae' / 'info (at) clinic.ae' -> 'hello@clinic.ae', so the address can be
+    found -- and so the check that an address really is on the page passes for it."""
+    if not text or ("at" not in text.lower() and "@" not in text):
+        return text
+
+    def fix(m):
+        domain = re.sub(_DOT, ".", m.group(2), flags=re.I)
+        return f"{m.group(1)}@{domain}" if "." in domain else m.group(0)
+    return _OBFUSCATED.sub(fix, text)
+
+
+def cloudflare_emails(html):
+    """Addresses hidden by Cloudflare's "email protection" (shown only by JavaScript in a browser)."""
+    out = []
+    for hexstr in re.findall(r'(?:data-cfemail="|/cdn-cgi/l/email-protection#)([0-9a-fA-F]{4,})', html or ""):
+        try:
+            key = int(hexstr[:2], 16)
+            email = "".join(chr(int(hexstr[i:i + 2], 16) ^ key) for i in range(2, len(hexstr), 2))
+        except ValueError:
+            continue
+        e = schema.norm_email(email)
+        if e and e not in out:
+            out.append(e)
+    return out
+
+
 def visible_text(html, limit=6000):
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "noscript"]):
         tag.decompose()
-    return soup.get_text(separator=" ", strip=True)[:limit]
+    text = deobfuscate_emails(soup.get_text(separator=" ", strip=True))
+    hidden = cloudflare_emails(html)
+    if hidden:
+        text = " ".join(hidden) + " " + text
+    return text[:limit]
 
 
 def fetch_profile_text(url):
@@ -119,6 +155,9 @@ def scan_website(url):
 
     texts = []
     for html in pages:
+        for e in cloudflare_emails(html):
+            if e not in found["emails"]:
+                found["emails"].append(e)
         s = BeautifulSoup(html, "html.parser")
         for a in s.find_all("a", href=True):
             href = a["href"].strip()
@@ -353,6 +392,8 @@ def run_enrich(ctx, params):
         filters["campaign"] = params["campaign"]
     if not params.get("force"):
         filters["enriched"] = "no"
+    if params.get("skip_rejected"):
+        filters["not_rejected"] = True
     ids = db.select_ids(filters, limit=params.get("limit"))
     ctx.progress(0, len(ids))
     ctx.log(f"Enriching {len(ids)} leads (search budget left this month: {serp_remaining()})")

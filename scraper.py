@@ -326,6 +326,7 @@ def extract_maps_detail(page):
         "address": address,
         "category_raw": _text(page, 'button[jsaction*="category"]'),
         "review_count": _digits(_attr(page, 'span[aria-label*="reviews"]', "aria-label")),
+        "rating": _attr(page, 'span[role="img"][aria-label*="star"]', "aria-label"),
     }
 
 
@@ -515,7 +516,9 @@ def scrape_google_maps(query, location="", max_results=30, progress=None, ctx=No
         browser, context = _new_page(p)
         try:
             page = context.new_page()
-            page.goto(f"{MAPS_SEARCH_URL}{quote_plus(full_query)}", wait_until="domcontentloaded", timeout=60000)
+            # hl=en: the page in English wherever the server is, so the labels read below ("Phone:",
+            # "reviews", "stars") are always the same words
+            page.goto(f"{MAPS_SEARCH_URL}{quote_plus(full_query)}?hl=en", wait_until="domcontentloaded", timeout=60000)
             _blocked(page, ("unusual traffic", "recaptcha"), "Google")
             cards, seen = [], set()
             try:
@@ -843,6 +846,7 @@ def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=Non
 # --------------------------------------------------------------- job entry
 
 MAX_SEARCHES_PER_RUN = 40
+YELP_COUNTRIES = ("", "US", "CA", "GB", "AU", "NZ", "IE", "DE", "FR", "ES", "IT", "MX", "SG")
 
 
 def split_multi(value):
@@ -868,11 +872,51 @@ def plan_searches(params):
         locations = []
     if not queries:
         raise ValueError("Enter a search query")
+    if params.get("platform") == "yelp":
+        for loc in locations:
+            if country_of_location(loc) not in YELP_COUNTRIES:
+                raise ValueError(f"Yelp doesn't list businesses in {loc}. Use Google Maps for this search.")
     pairs = [(q, loc) for loc in (locations or [""]) for q in queries]
     if len(pairs) > MAX_SEARCHES_PER_RUN:
         raise ValueError(f"That's {len(pairs)} searches ({len(queries)} terms x {len(locations)} places). "
                          f"The most one run can do is {MAX_SEARCHES_PER_RUN} -- split it into two runs.")
     return pairs
+
+
+def country_of_location(location):
+    """Two-letter country for a search location: 'Bengaluru, Karnataka' -> 'IN', 'Garland, TX' -> 'US',
+    'Dubai' -> 'AE' (looked up in the built-in place list), '' when it can't tell."""
+    import directory
+    parts = [p.strip() for p in str(location or "").split(",") if p.strip()]
+    if not parts:
+        return ""
+    last = parts[-1]
+    if len(parts) > 1 and last.upper() in schema.US_STATES:
+        return "US"
+    c = schema.COUNTRY_NAMES.get(last.lower().strip(" ."), "")
+    if c:
+        return c
+    if any(schema.indian_state(p) for p in parts):
+        return "IN"
+    reverse = {v: k for k, v in schema.CITY_ALIASES.items()}
+    for part in (parts[-1], parts[0]):
+        city = part.lower()
+        if city in schema.CITY_ALIASES or city in reverse:
+            return "IN"                                 # the renamed-city list is all Indian cities
+        names = {city, schema.CITY_ALIASES.get(city, city), reverse.get(city, city)}
+        hits = directory.places(city, 1)
+        if hits and hits[0].rsplit(", ", 1)[0].lower() in names:
+            ending = hits[0].rsplit(", ", 1)[-1]
+            if len(ending) == 2 and ending.isupper():
+                return "US"
+            c = schema.COUNTRY_NAMES.get(ending.lower(), "")
+            if c:
+                return c
+    return ""
+
+
+def calling_code_for_location(location):
+    return schema.CALLING_CODES.get(country_of_location(location), "")
 
 
 def run_scrape(ctx, params):
@@ -909,7 +953,10 @@ def run_scrape(ctx, params):
             # and AI budget on it. Drop it here instead.
             return True
         st["kept"] += 1
-        s = importer.import_leads([row], campaign=campaign, source=platform, query=cur["query"])
+        # numbers on an Indian listing are Indian, whatever the account's default country is
+        # (a campaign's own country code, when it has one, still wins)
+        with schema.calling_code(cur.get("cc", "")):
+            s = importer.import_leads([row], campaign=campaign, source=platform, query=cur["query"])
         for k in ("inserted", "merged", "skipped_suppressed"):
             st[k] += s[k]
         if s.get("stopped_at_limit"):
@@ -936,6 +983,7 @@ def run_scrape(ctx, params):
 
     def one_search(query, location):
         rows = []
+        cur["cc"] = calling_code_for_location(location)
         if platform == "google_maps":
             rows = scrape_google_maps(query, location, max_results, ctx.log, ctx,
                                       on_row=save, skip_known=skip_known, skip_site=skip_site)

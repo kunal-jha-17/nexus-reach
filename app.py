@@ -103,9 +103,16 @@ def create_app(start_threads=True):
 
     @app.before_request
     def _guard():
-        if request.method not in _SAFE_METHODS and request.headers.get("X-Requested-With") != "fetch":
+        if (request.method not in _SAFE_METHODS and request.headers.get("X-Requested-With") != "fetch"
+                and not request.path.startswith("/u/")):
             return jsonify({"error": "Missing X-Requested-With header"}), 403
         if request.path.startswith("/static/"):
+            return None
+        if request.path.startswith("/u/"):        # unsubscribe links: opened from an email, no session
+            if ip_limiter:
+                ok, wait = ip_limiter.allow(f"ip|{request.remote_addr}")
+                if not ok:
+                    return _too_many(wait)
             return None
         if request.path in PUBLIC_PATHS:
             if ip_limiter:
@@ -252,6 +259,28 @@ def create_app(start_threads=True):
             return redirect("/")
         return render_template("login.html")
 
+    @app.route("/u/<token>", methods=["GET", "POST"])
+    def unsubscribe(token):
+        """The unsubscribe link in every email. GET shows a button (link checkers open links, and must not
+        unsubscribe anyone); POST -- the button, or a mail app's one-click unsubscribe -- does it."""
+        def page(title, text, button=False, status=200):
+            form = ('<form method="post"><button type="submit">Unsubscribe</button></form>' if button else "")
+            html = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+                    "<title>Unsubscribe</title><style>body{font:16px/1.5 system-ui,sans-serif;max-width:480px;margin:12vh auto;"
+                    "padding:0 20px;color:#1f2430}button{font:inherit;padding:10px 18px;border-radius:8px;border:0;"
+                    "background:#4338ca;color:#fff;cursor:pointer}</style>"
+                    f"<h1 style='font-size:22px'>{title}</h1><p>{text}</p>{form}")
+            return html, status, {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store"}
+        ids = outreach.read_unsubscribe_token(token)
+        user = accounts.get_user(ids[0]) if ids else None
+        if not user:
+            return page("Link not recognised", "This unsubscribe link isn't valid any more.", status=404)
+        enter(user)
+        if request.method == "POST":
+            outreach.unsubscribe_lead(ids[1])
+            return page("You're unsubscribed", "You won't receive any more emails from us. Sorry for the bother.")
+        return page("Unsubscribe?", "Press the button and you won't receive any more emails from us.", button=True)
+
     @app.route("/api/ping")
     def ping():
         """Point an uptime monitor here (keeps a sleeping free host awake, which keeps storage synced)."""
@@ -363,6 +392,8 @@ def create_app(start_threads=True):
             "llm": llm.status(),
             "smtp": outreach.smtp_configured(),
             "email_via": outreach.email_transport(),
+            "provider_cap": outreach.provider_daily_cap(),
+            "unsubscribe_link": bool(outreach.public_url()),
             "gmail_api_client": bool(config.env("GOOGLE_CLIENT_ID") and config.env("GOOGLE_CLIENT_SECRET")),
             "imap": outreach.imap_configured(),
             "serpapi": bool(config.env("SERPAPI_KEY")),
@@ -440,7 +471,8 @@ def create_app(start_threads=True):
     def lead_get(lead_id):
         lead = need_lead(lead_id)
         return jsonify({"lead": lead, "events": db.list_events(lead_id),
-                        "templates": db.effective_settings(lead["campaign"])["templates"]})
+                        "templates": db.effective_settings(lead["campaign"])["templates"],
+                        "branches": db.branches_of(lead)})
 
     @app.route("/api/leads/<int:lead_id>", methods=["PATCH"])
     def lead_patch(lead_id):
@@ -777,7 +809,7 @@ def create_app(start_threads=True):
         if "channel_priority" in b:
             pr = [c for c in b["channel_priority"] if c in schema.CHANNELS and c != "unknown"]
             clean["channel_priority"] = pr or schema.DEFAULT_CHANNEL_PRIORITY
-        for k, lo, hi in (("email_daily_limit", 1, 2000), ("email_send_delay_seconds", 0, 3600),
+        for k, lo, hi in (("email_daily_limit", 1, 100000), ("email_send_delay_seconds", 0, 3600), ("max_bounce_rate", 0, 50),
                           ("followup_delay_days", 1, 365), ("max_followups", 0, 10),
                           ("reply_check_minutes", 0, 24 * 60), ("send_start_hour", 0, 23), ("send_end_hour", 1, 24)):
             if k in b:
@@ -785,7 +817,8 @@ def create_app(start_threads=True):
                 if n is None:
                     raise ValueError(f"{k.replace('_', ' ').capitalize()} must be a whole number.")
                 clean[k] = n
-        for k in ("warmup_enabled", "auto_remove_rejected", "exact_templates", "send_window_enabled"):
+        for k in ("warmup_enabled", "auto_remove_rejected", "exact_templates", "send_window_enabled",
+                  "score_no_website", "auto_pace"):
             if k in b:
                 clean[k] = bool(b[k])
         if "followup_template" in b:
@@ -806,9 +839,12 @@ def create_app(start_threads=True):
         end = clean.get("send_end_hour", db.get_setting("send_end_hour"))
         if ("send_start_hour" in clean or "send_end_hour" in clean) and start >= end:
             raise ValueError("Sending hours must end later than they start.")
+        rescore = "score_no_website" in clean and clean["score_no_website"] != db.get_setting("score_no_website")
         saved = db.set_settings(clean)
         if "channel_priority" in clean:
             db.recompute_channels()
+        if rescore:
+            db.rescore_all()
         return jsonify(saved)
 
     @app.route("/api/suppression", methods=["GET"])

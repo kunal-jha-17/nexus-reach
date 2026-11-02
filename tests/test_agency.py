@@ -521,7 +521,7 @@ class TestFollowUps(Base):
 
 
 class TestPipeline(Base):
-    def test_enrich_then_judge_then_draft_only_the_ones_that_fit(self):
+    def test_judge_then_enrich_then_draft_only_the_ones_that_fit(self):
         good = self.add(business_name="Good Co", email="a@good.com", campaign="c")
         bad = self.add(business_name="Bad Co", email="b@bad.com", campaign="c")
         other = self.add(business_name="Elsewhere", email="c@else.com", campaign="other")
@@ -534,11 +534,11 @@ class TestPipeline(Base):
         with mock.patch.object(llm, "complete", side_effect=ai), \
                 mock.patch.object(enrichment, "enrich_lead", return_value={"updates": {}, "notes": "", "searches": 0}):
             msg = pipeline.run_pipeline(ctx, {"campaign": "c"})
-        self.assertIn("Enrich: 2 enriched", msg)
-        self.assertIn("Judge: 1 fit, 1 rejected", msg)
+        self.assertIn("Judge: 1 fit, 1 rejected | Enrich: 1 enriched", msg)   # judged first ...
         self.assertIn("Draft: 1 drafted", msg)
         self.assertTrue(db.get_lead(good)["message"])
         self.assertEqual(db.get_lead(bad)["message"], "")
+        self.assertIsNone(db.get_lead(bad)["enriched_at"])                 # ... so the reject cost nothing to enrich
         self.assertIsNone(db.get_lead(other)["enriched_at"])               # the other campaign wasn't touched
         self.assertTrue(any(l.startswith("[judge]") for l in ctx.lines))
         with mock.patch.object(llm, "complete", side_effect=AssertionError("nothing left to do")), \
@@ -550,7 +550,7 @@ class TestPipeline(Base):
         with mock.patch.dict(os.environ, {"GROQ_API_KEY": ""}), \
                 mock.patch.object(enrichment, "enrich_lead", return_value={"updates": {}, "notes": "", "searches": 0}):
             msg = pipeline.run_pipeline(FakeCtx(), {})
-        self.assertEqual(msg, "Enrich: 1 enriched, 0 new fields found, 0 searches used | Judge: skipped (no AI key) | Draft: skipped (no AI key)")
+        self.assertEqual(msg, "Judge: skipped (no AI key) | Enrich: 1 enriched, 0 new fields found, 0 searches used | Draft: skipped (no AI key)")
 
 
 class TestApiAdditions(ApiBase):
@@ -648,13 +648,13 @@ class TestApiAdditions(ApiBase):
                          ("Asia/Kolkata", [0, 2], "Any thoughts?", 15))
 
     def test_changing_the_country_code_re_reads_numbers_it_could_not_understand(self):
-        lead_id = self.add(business_name="Smile Dental", phone="98765 4321")       # 9 digits: no good as a US number
+        lead_id = self.add(business_name="Smile Dental", phone="98710 43210")      # an Indian mobile: no good as a US number
         self.assertEqual(db.get_lead(lead_id)["phone"], "")
         r = self.client.put("/api/connections", json={"set": {"DEFAULT_COUNTRY_CODE": "91"}})
         self.assertEqual(r.status_code, 200, r.get_json())
         self.assertEqual(r.get_json()["phones_fixed"], 1)
         lead = db.get_lead(lead_id)
-        self.assertEqual((lead["phone"], lead["channel"]), ("+91987654321", "whatsapp"))
+        self.assertEqual((lead["phone"], lead["channel"]), ("+919871043210", "whatsapp"))
         self.assertEqual(self.client.put("/api/connections", json={"set": {"DEFAULT_COUNTRY_CODE": "abc"}}).status_code, 400)
 
     def test_scrape_can_hand_over_to_the_pipeline(self):

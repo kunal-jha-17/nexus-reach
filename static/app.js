@@ -17,7 +17,10 @@ const TRADES = ['', 'hvac', 'plumbing', 'electrical', 'pest_control', 'roofing',
 const TRADE_LABEL = { '': '—', hvac: 'HVAC', plumbing: 'Plumbing', electrical: 'Electrical',
   pest_control: 'Pest control', roofing: 'Roofing', other: 'Other' };
 const JOB_LABEL = { scrape: 'Scrape', enrich: 'Enrich', judge: 'Judge fit', draft: 'Write messages', send_bulk: 'Send emails',
-  pipeline: 'Enrich → judge → draft', followups: 'Follow-ups' };
+  pipeline: 'Judge → enrich → draft', followups: 'Follow-ups' };
+const REPLY_LABEL = { interested: 'Interested', question: 'Has a question', not_now: 'Not now / later',
+  wrong_person: 'Pointed to someone else', not_interested: 'Not interested', other: 'Other' };
+const REPLY_CHIP = { interested: 'ok', question: 'info', wrong_person: 'warn', not_now: 'stopped', not_interested: 'bad' };
 const DAY_LABEL = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 const state = {
@@ -146,6 +149,7 @@ function templateOptions(selected = '', list = null) {
 function repliesHtml(list, emptyText) {
   return list.length ? list.map((r) =>
     `<div class="list-row"><div class="grow"><b>${esc(r.business_name || '(no name)')}</b>
+       ${r.reply_category ? `<span class="chip ${REPLY_CHIP[r.reply_category] || ''}">${esc(REPLY_LABEL[r.reply_category] || r.reply_category)}</span>` : ''}
        ${r.campaign ? `<span class="chip">${esc(r.campaign)}</span>` : ''} <span class="muted">${ago(r.replied_at)}</span>
        <div class="sub quote">${r.snippet ? '“' + esc(String(r.snippet).replace(/\s+/g, ' ').slice(0, 160)) + '”' : 'Marked as replied'}</div></div>
      <button class="btn small primary" data-open="${r.id}">Open</button></div>`).join('')
@@ -211,14 +215,18 @@ $('#view-dashboard').addEventListener('click', (e) => {
 function syncScrapeForm() {
   const p = $('#sc-platform').value;
   $('#sc-query-label').textContent = p === 'instagram' ? 'Hashtag' : 'Search';
-  $('#sc-query').placeholder = p === 'instagram' ? 'dallasrealestate' : 'AC repair; furnace repair';
+  $('#sc-query').placeholder = p === 'instagram' ? 'dubaidentist' : 'dental clinic; orthodontist';
   $('#sc-location').closest('.field').hidden = p === 'instagram';
-  $('#sc-location').placeholder = p === 'yelp' ? 'Dallas, TX (required)' : 'Garland, TX; Mesquite, TX';
+  $('#sc-location').placeholder = p === 'yelp' ? 'London, UK (required)' : 'Dubai, UAE; Abu Dhabi, UAE';
 }
 $('#sc-platform').addEventListener('change', syncScrapeForm);
 
 async function loadFind() {
-  await Promise.all([loadCampaigns(), loadConfig()]);
+  await Promise.all([loadCampaigns(), loadConfig(), loadSettings()]);
+  if (!state.noSiteDefaulted) {     // website sellers want no-website businesses; everyone else wants them all
+    $('#sc-nosite').checked = !!(state.settings && state.settings.score_no_website !== false);
+    state.noSiteDefaulted = true;
+  }
   syncScrapeForm();
   const noBrowser = $('#sc-nobrowser');
   noBrowser.hidden = !!state.config.playwright;
@@ -278,6 +286,7 @@ $('#imp-go').addEventListener('click', () => run(async () => {
     box.innerHTML = `<b>${r.inserted} new</b>, ${r.merged} already known (merged)` +
       (r.skipped_empty ? `, ${r.skipped_empty} empty rows skipped` : '') +
       (r.skipped_suppressed ? `, ${r.skipped_suppressed} on do-not-contact skipped` : '') +
+      (r.skipped_closed ? `, ${r.skipped_closed} permanently closed skipped` : '') +
       `<div class="sub">Matched: ${esc(map || 'nothing')}${r.unmapped_columns.length ? ' · Not matched (kept in notes if short): ' + esc(r.unmapped_columns.join(', ')) : ''}</div>`;
     if (r.missing_name) {
       box.innerHTML += `<div class="sub bad-text"><b>${r.missing_name} of these have no business name.</b> No column looked like a name &mdash; rename that column to "Business Name" in the file and import it again (existing leads are updated, not duplicated).</div>`;
@@ -687,6 +696,8 @@ function fillCampaignSettings(d) {
     : defaultSaved ? 'Showing your account-wide default — edit it and save to give this campaign its own.'
       : 'Showing the built-in sample — edit it and save to use your own.';
   $('#cs-info').value = c.business_info || '';
+  $('#cs-cc').value = c.country_code || '';
+  $('#cs-scoreweb').value = c.score_no_website || '';
   const prioOn = !!(c.channel_priority && c.channel_priority.length);
   $('#cs-prio-on').checked = prioOn; state.csPrio.set(prioOn ? c.channel_priority : d.global.channel_priority); $('#cs-prio').hidden = !prioOn;
   const tplOn = !!(c.templates && c.templates.length);
@@ -702,6 +713,7 @@ $('#cs-save').addEventListener('click', () => run(async () => {
   const unchanged = !d.criteriaWasSaved && val === d.criteriaShown.trim();   // untouched default -> keep inheriting
   await api(`/api/campaigns/${encodeURIComponent(d.campaign.name)}`, { method: 'PUT', body: {
     description: $('#cs-desc').value, criteria: unchanged ? '' : val, business_info: $('#cs-info').value,
+    country_code: $('#cs-cc').value.trim(), score_no_website: $('#cs-scoreweb').value,
     channel_priority: $('#cs-prio-on').checked ? state.csPrio.get() : [],
     templates: $('#cs-tpl-on').checked ? state.csTpl.get() : [],
   } });
@@ -1006,11 +1018,14 @@ const CONN_GROUPS = [
     help: 'Pick one provider and paste its key. Free tiers work (Groq or Google Gemini). The model boxes are optional.',
     fields: ['LLM_PROVIDER', null, 'GROQ_API_KEY', 'GROQ_MODEL', 'OPENAI_API_KEY', 'OPENAI_MODEL', 'GEMINI_API_KEY', 'GEMINI_MODEL'] },
   { title: 'Email sending', ready: (c) => c.smtp, test: 'smtp',
-    readyLabel: (c) => (c.email_via === 'gmail_api' ? 'Ready · Gmail API' : c.email_via === 'smtp' ? 'Ready · SMTP' : 'Not set'),
-    help: 'Your Gmail address, plus either a Gmail API refresh token (works on hosts that block email ports, like Render\'s free plan — see the README) '
-      + 'or an App Password from myaccount.google.com/apppasswords (not your normal password). The App Password is also what reply checking uses.',
-    fields: ['SMTP_USER', 'SMTP_FROM_NAME', 'GMAIL_REFRESH_TOKEN', 'SMTP_PASS', 'SMTP_HOST', 'SMTP_PORT'] },
-  { title: 'Reply checking', ready: (c) => c.imap, test: 'imap', help: 'Leave these blank to reuse your email details above.',
+    readyLabel: (c) => (c.email_via === 'gmail_api' ? 'Ready · Gmail API' : c.email_via === 'smtp' ? 'Ready · SMTP' : 'Not set')
+      + (c.email_via && c.provider_cap ? ` · ~${c.provider_cap.toLocaleString()}/day` : ''),
+    help: 'Gmail: your address plus a Gmail API refresh token (works on hosts that block email ports, like Render\'s free plan) or an App Password. '
+      + 'Professional mail or a sending service (Google Workspace, Microsoft 365, Zoho, Amazon SES, SendGrid, Mailgun, Brevo, Postmark): pick it under Mail provider, '
+      + 'then enter its SMTP login and the address to send from. On Render\'s free plan use port 2525 (or 2587 for SES).',
+    fields: ['SMTP_PROVIDER', 'EMAIL_SEND_VIA', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM_EMAIL', 'SMTP_FROM_NAME', 'SMTP_HOST', 'SMTP_PORT', 'GMAIL_REFRESH_TOKEN', null] },
+  { title: 'Reply checking', ready: (c) => c.imap, test: 'imap',
+    help: 'Leave these blank to reuse your email details above. Sending through SES, SendGrid, Mailgun, Brevo or Postmark? Their login can\'t open an inbox: enter the mailbox that receives your replies (e.g. imap.zoho.in, imap.gmail.com, outlook.office365.com).',
     fields: ['IMAP_USER', 'IMAP_PASS', 'IMAP_HOST'] },
   { title: 'Phone numbers', ready: () => true, readyLabel: (c) => `+${c.country_code}`,
     help: 'The country calling code assumed for numbers written without one: 1 = US/Canada, 44 = UK, 91 = India, 61 = Australia. Numbers that start with + are always read as written.',
@@ -1023,14 +1038,32 @@ const CONN_GROUPS = [
 const CONN_LABEL = {
   LLM_PROVIDER: 'Which AI to use', GROQ_API_KEY: 'Groq API key', GROQ_MODEL: 'Groq model',
   OPENAI_API_KEY: 'OpenAI API key', OPENAI_MODEL: 'OpenAI model', GEMINI_API_KEY: 'Gemini API key',
-  GEMINI_MODEL: 'Gemini model', SMTP_USER: 'Your email address', SMTP_PASS: 'App password',
+  GEMINI_MODEL: 'Gemini model', SMTP_USER: 'Login (your email address, or the SMTP username)', SMTP_PASS: 'Password (App Password / SMTP password / API key)',
+  SMTP_FROM_EMAIL: 'Send from (if different from the login)', EMAIL_SEND_VIA: 'Send through', SMTP_PROVIDER: 'Mail provider (fills in the server)',
   SMTP_FROM_NAME: 'Sender name', SMTP_HOST: 'Mail server (SMTP)', SMTP_PORT: 'Mail server port',
   IMAP_USER: 'Inbox login', IMAP_PASS: 'Inbox password', IMAP_HOST: 'Inbox server (IMAP)',
   SERPAPI_KEY: 'SerpAPI key', SERPAPI_MONTHLY_LIMIT: 'Searches per month', IG_USERNAME: 'Burner username', IG_PASSWORD: 'Burner password',
   DEFAULT_COUNTRY_CODE: 'Default country code', GMAIL_REFRESH_TOKEN: 'Gmail API refresh token',
 };
 const CONN_PLACEHOLDER = { SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '587', IMAP_HOST: 'imap.gmail.com', SERPAPI_MONTHLY_LIMIT: '100',
-  GROQ_MODEL: 'default', OPENAI_MODEL: 'default', GEMINI_MODEL: 'default', DEFAULT_COUNTRY_CODE: '1', SMTP_FROM_NAME: 'e.g. Kunal from NeuroSpark' };
+  GROQ_MODEL: 'default', OPENAI_MODEL: 'default', GEMINI_MODEL: 'default', DEFAULT_COUNTRY_CODE: '1', SMTP_FROM_NAME: 'e.g. Kunal from NeuroSpark',
+  SMTP_FROM_EMAIL: 'e.g. kunal@yourcompany.com' };
+// Mail providers: server and port (the Render-friendly port where the provider has one).
+const SMTP_PROVIDERS = [
+  ['', 'Choose to fill in…', '', ''],
+  ['gmail', 'Gmail / Google Workspace', 'smtp.gmail.com', '587'],
+  ['m365', 'Microsoft 365 / Outlook', 'smtp.office365.com', '587'],
+  ['zoho_in', 'Zoho Mail (India data centre)', 'smtp.zoho.in', '587'],
+  ['zoho', 'Zoho Mail (global)', 'smtp.zoho.com', '587'],
+  ['ses', 'Amazon SES (Mumbai region)', 'email-smtp.ap-south-1.amazonaws.com', '2587'],
+  ['ses_us', 'Amazon SES (US East)', 'email-smtp.us-east-1.amazonaws.com', '2587'],
+  ['sendgrid', 'SendGrid', 'smtp.sendgrid.net', '2525'],
+  ['mailgun', 'Mailgun', 'smtp.mailgun.org', '2525'],
+  ['brevo', 'Brevo (Sendinblue)', 'smtp-relay.brevo.com', '2525'],
+  ['postmark', 'Postmark', 'smtp.postmarkapp.com', '2525'],
+  ['hostinger', 'Hostinger', 'smtp.hostinger.com', '465'],
+  ['godaddy', 'GoDaddy', 'smtpout.secureserver.net', '465'],
+];
 
 function renderConnections(fields) {
   const by = Object.fromEntries(fields.map((f) => [f.name, f]));
@@ -1039,6 +1072,15 @@ function renderConnections(fields) {
     const ok = g.ready(state.config);
     const inputs = g.fields.map((n) => {
       if (n === null) return '<div class="field spacer-cell"></div>';      // keeps pairs side by side
+      if (n === 'SMTP_PROVIDER') {
+        return `<div class="field"><label>${esc(CONN_LABEL[n])}</label><select id="conn-provider">${SMTP_PROVIDERS.map(([v, l]) => opt(v, l, false)).join('')}</select></div>`;
+      }
+      if (n === 'EMAIL_SEND_VIA') {
+        const f2 = by[n] || {};
+        const sel = `<select data-conn="${n}" data-orig="${esc(f2.value || '')}">${[['', 'Automatic'], ['smtp', 'SMTP server'], ['gmail_api', 'Gmail API']]
+          .map(([v, l]) => opt(v, l, v === (f2.value || ''))).join('')}</select>`;
+        return `<div class="field"><label>${esc(CONN_LABEL[n])}</label>${sel}</div>`;
+      }
       const f = by[n]; if (!f) return '';
       let input;
       if (n === 'LLM_PROVIDER') {
@@ -1065,6 +1107,15 @@ function renderConnections(fields) {
   }).join('');
 }
 
+document.addEventListener('change', (e) => {
+  if (e.target.id !== 'conn-provider') return;
+  const p = SMTP_PROVIDERS.find(([v]) => v === e.target.value); if (!p || !p[0]) return;
+  const host = $('#st-conn [data-conn="SMTP_HOST"]'), port = $('#st-conn [data-conn="SMTP_PORT"]'), via = $('#st-conn [data-conn="EMAIL_SEND_VIA"]');
+  if (host) host.value = p[2];
+  if (port) port.value = p[3];
+  if (via && p[0] !== 'gmail') via.value = 'smtp';
+  toast(`Filled in ${p[1]}'s server. Enter its SMTP login, then Save & test.`);
+});
 function collectConnChanges() {
   const set = {}, clear = [...state.connClear];
   $$('#st-conn [data-conn]').forEach((el) => {
@@ -1137,7 +1188,10 @@ async function fillSettingsView() {
   $('#st-limit').value = s.email_daily_limit; $('#st-delay').value = s.email_send_delay_seconds;
   $('#st-fudays').value = s.followup_delay_days; $('#st-fumax').value = s.max_followups;
   $('#st-warmup').checked = !!s.warmup_enabled; $('#st-footer').value = s.email_footer;
+  $('#st-autopace').checked = !!s.auto_pace; $('#st-bounce').value = s.max_bounce_rate ?? 5;
+  volumeNote();
   $('#st-autoremove').checked = !!s.auto_remove_rejected;
+  $('#st-scoreweb').checked = s.score_no_website !== false;
   $('#st-autoremove-warn').hidden = !s.auto_remove_rejected;
   $('#st-exact').checked = !!s.exact_templates; $('#st-followup').value = s.followup_template || '';
   $('#st-window').checked = !!s.send_window_enabled; $('#st-tz').value = s.timezone || '';
@@ -1163,6 +1217,26 @@ async function fillSettingsView() {
 }
 
 $('#st-autoremove').addEventListener('change', (e) => { $('#st-autoremove-warn').hidden = !e.target.checked; });
+function volumeNote() {
+  // Warn when the daily limit is more than the connected mail account can send, or more than the
+  // gap between emails allows in a day.
+  const box = $('#st-volume-note'), c = state.config || {};
+  const limit = +$('#st-limit').value || 0, delay = +$('#st-delay').value || 0, pace = $('#st-autopace').checked;
+  const notes = [];
+  if (c.provider_cap && limit > c.provider_cap) {
+    notes.push(`Your connected mail account allows about ${c.provider_cap.toLocaleString()} emails a day, so it will start refusing before ${limit.toLocaleString()}. `
+      + 'For more, connect a sending service (Amazon SES, SendGrid, Mailgun, Brevo or Postmark) under Connections.');
+  }
+  if (!pace && delay > 0 && limit > Math.floor(86400 / delay)) {
+    notes.push(`With ${delay} seconds between emails at most ${Math.floor(86400 / delay).toLocaleString()} can go out in a day. Tick "Pace automatically" or lower the gap.`);
+  }
+  if (limit >= 1000 && !c.unsubscribe_link) {
+    notes.push('Gmail and Yahoo require a one-click unsubscribe link from senders of 5,000+ a day. Set PUBLIC_URL on the server (Render sets it for you) so emails carry one.');
+  }
+  box.innerHTML = notes.map(esc).join('<br><br>'); box.hidden = !notes.length;
+}
+['#st-limit', '#st-delay', '#st-autopace'].forEach((sel) => $(sel).addEventListener('input', volumeNote));
+$('#st-autopace').addEventListener('change', volumeNote);
 $('#st-tz-mine').addEventListener('click', () => {
   try { $('#st-tz').value = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { /* very old browser */ }
 });
@@ -1174,6 +1248,8 @@ $('#st-save').addEventListener('click', () => run(async () => {
     email_daily_limit: num('#st-limit', 40), email_send_delay_seconds: num('#st-delay', 45),
     followup_delay_days: num('#st-fudays', 3), max_followups: num('#st-fumax', 2),
     warmup_enabled: $('#st-warmup').checked, auto_remove_rejected: $('#st-autoremove').checked,
+    score_no_website: $('#st-scoreweb').checked, auto_pace: $('#st-autopace').checked,
+    max_bounce_rate: num('#st-bounce', 5),
     exact_templates: $('#st-exact').checked, followup_template: $('#st-followup').value,
     send_window_enabled: $('#st-window').checked, send_start_hour: +$('#st-start').value, send_end_hour: +$('#st-end').value,
     send_days: $$('#st-days input:checked').map((c) => +c.value), timezone: $('#st-tz').value.trim(),
@@ -1340,7 +1416,7 @@ document.addEventListener('toggle', (e) => {
 /* ---------------------------------------------------------------- drawer */
 const DW_SECTIONS = [
   ['Business', [['business_name', 'Business name', 'wide'], ['contact_name', 'Contact person'], ['trade', 'Trade', 'trade'],
-    ['category_raw', 'Category (as found)'], ['address', 'Address', 'wide'], ['city', 'City'], ['state', 'State']]],
+    ['category_raw', 'Category (as found)'], ['address', 'Address', 'wide'], ['city', 'City'], ['state', 'State / region'], ['country', 'Country (2 letters)']]],
   ['Contact', [['phone', 'Phone'], ['email', 'Email'], ['website', 'Website', 'wide'], ['instagram_url', 'Instagram'],
     ['facebook_url', 'Facebook'], ['linkedin_url', 'LinkedIn'], ['yelp_url', 'Yelp page'], ['google_maps_url', 'Google Maps page']]],
   ['Tracking', [['campaign', 'Campaign'], ['stage', 'Stage', 'stage'], ['channel', 'How to reach', 'channel'], ['notes', 'Notes', 'notes']]],
@@ -1375,12 +1451,17 @@ function drawerHtml(lead, events) {
     lead.enriched_at ? `<div><b>Enriched</b> ${ago(lead.enriched_at)}${lead.enrichment_notes ? ' — ' + esc(lead.enrichment_notes) : ''}</div>` : '<div><b>Not enriched yet</b></div>',
     `<div><b>Source:</b> ${esc(lead.source || 'unknown')}${lead.last_query ? ' — ' + esc(lead.last_query) : ''} · added ${ago(lead.created_at)}</div>`,
     lead.dnc_reason ? `<div><b>Do-not-contact reason:</b> ${esc(lead.dnc_reason)}</div>` : '',
+    lead.rating || lead.review_count ? `<div><b>Google:</b> ${lead.rating ? esc(lead.rating) + '★' : ''}${lead.review_count ? ` · ${lead.review_count} reviews` : ''}${lead.opening_hours ? ' · ' + esc(lead.opening_hours) : ''}</div>` : '',
+    lead.phone_kind ? `<div><b>Phone line:</b> ${lead.phone_kind === 'landline' ? 'landline (call it &mdash; it can\'t receive WhatsApp)' : 'mobile'}</div>` : '',
+    lead.reply_category ? `<div><b>Their reply:</b> ${esc(REPLY_LABEL[lead.reply_category] || lead.reply_category)}</div>` : '',
+    lead.email_check && lead.email_check !== 'ok' ? `<div class="bad-text"><b>Email check:</b> ${esc(lead.email_check)}</div>` : '',
+    (state.drawer.branches || []).length ? `<div><b>Other branches (${state.drawer.branches.length}):</b> ${state.drawer.branches.slice(0, 8).map((b) => `<a href="#" data-open-lead="${b.id}">${esc(b.business_name || '(no name)')}</a>`).join(', ')}</div>` : '',
   ].join('');
 
   const digits = (lead.phone || '').replace(/\D/g, '');
   const links = [
     lead.phone || lead.phone_raw ? `<a class="btn small" href="tel:${esc(lead.phone || lead.phone_raw)}">Call</a>` : '',
-    digits ? `<a class="btn small" href="https://wa.me/${digits}" target="_blank" rel="noopener">WhatsApp</a>` : '',
+    digits && lead.phone_kind !== 'landline' ? `<a class="btn small" href="https://wa.me/${digits}" target="_blank" rel="noopener">WhatsApp</a>` : '',
     lead.email ? `<a class="btn small" href="mailto:${esc(lead.email)}">Email</a>` : '',
     lead.website ? `<a class="btn small" href="${esc(lead.website)}" target="_blank" rel="noopener">Website</a>` : '',
     lead.google_maps_url ? `<a class="btn small" href="${esc(lead.google_maps_url)}" target="_blank" rel="noopener">Maps</a>` : '',
@@ -1418,10 +1499,11 @@ function drawerHtml(lead, events) {
     <section class="dw-section"><h3>Activity</h3><div class="timeline">${evs}</div></section>`;
 }
 
-function openDrawer(lead, events = [], templates = null) {
+function openDrawer(lead, events = [], templates = null, branches = null) {
   // Re-rendering the lead that's already open (after a save/draft/send) keeps the scroll position.
-  const y = lead.id && lead.id === state.drawer.id ? $('#dw-body').scrollTop : 0;
-  state.drawer = { id: lead.id || null, lead, templates };
+  const same = lead.id && lead.id === state.drawer.id;
+  const y = same ? $('#dw-body').scrollTop : 0;
+  state.drawer = { id: lead.id || null, lead, templates, branches: branches || (same ? state.drawer.branches : []) || [] };
   $('#dw-title').textContent = lead.id ? lead.business_name || '(no name)' : 'New lead';
   $('#dw-sub').textContent = lead.id ? [TRADE_LABEL[lead.trade] && lead.trade ? TRADE_LABEL[lead.trade] : '', [lead.city, lead.state].filter(Boolean).join(', ')].filter(Boolean).join(' · ') : '';
   $('#dw-body').innerHTML = drawerHtml(lead, events);
@@ -1431,6 +1513,10 @@ function openDrawer(lead, events = [], templates = null) {
   const d = $('#drawer'); d.classList.add('open'); d.setAttribute('aria-hidden', 'false');
   d.scrollTop = 0; $('#dw-body').scrollTop = y;
 }
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('[data-open-lead]');
+  if (a) { e.preventDefault(); run(() => openLead(+a.dataset.openLead)); }
+});
 function closeDrawer() {
   $('#drawer').classList.remove('open'); $('#drawer').setAttribute('aria-hidden', 'true');
   $('#scrim').hidden = true; state.drawer = { id: null, lead: null, templates: null };
@@ -1439,7 +1525,7 @@ async function openLead(id) {
   if (!state.config) await loadConfig();
   if (!state.settings) await loadSettings();
   const d = await api(`/api/leads/${id}`);
-  openDrawer(d.lead, d.events, d.templates);
+  openDrawer(d.lead, d.events, d.templates, d.branches || []);
 }
 function openNewLead() {
   run(async () => {

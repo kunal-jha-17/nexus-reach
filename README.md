@@ -98,6 +98,59 @@ expired: run step 4 again and replace `GMAIL_REFRESH_TOKEN`. Until then nothing 
 
 Never commit the client file or the token: `.gitignore` already excludes `client_secret*.json`.
 
+## Sending thousands of emails a day (professional mail / sending services)
+
+One Gmail account can't do it: Google lets a free Gmail address send about 500 a day and a Google
+Workspace account about 2,000 (through SMTP or the Gmail API alike); Microsoft 365 allows about 10,000
+recipients a day. For 5,000+ a day from one connection, use a sending service: **Amazon SES**
+(Mumbai region for India), **SendGrid**, **Mailgun**, **Brevo** or **Postmark**.
+
+1. Verify your sending domain with the service and add the DNS records it gives you (SPF, DKIM) plus
+   a DMARC record. Gmail and Yahoo refuse bulk mail without all three.
+2. Settings > Connections > Email sending: pick the service under **Mail provider** (fills in the server
+   and a port that works on Render's free plan: 2525, or 2587 for SES), enter its SMTP username and
+   password (or API key), and **Send from** = your address on the verified domain. Save & test.
+3. Reply checking: an SES/SendGrid login can't open an inbox, so fill in **Inbox login / password /
+   server** for the mailbox that receives replies (Zoho, Workspace, Microsoft 365 ...).
+4. Settings > Sending: set **Emails a day** (up to 100,000), keep **Ramp up gradually** on (above 40 a
+   day it starts at 20 and grows about 30% a day -- roughly three weeks to 5,000), tick **Pace
+   automatically** to spread the day's emails over your sending hours, and leave **Pause sending when
+   bounces pass** at 5%.
+5. Make sure the server knows its own web address -- Render sets `RENDER_EXTERNAL_URL` itself; elsewhere
+   set `PUBLIC_URL` -- so every email carries a one-click unsubscribe link (required by Gmail and Yahoo
+   from anyone sending 5,000+ a day). Unsubscribes go straight onto the do-not-contact list.
+
+How it sends: one SMTP connection is reused for up to 100 emails (then reopened), a dropped connection
+is reopened automatically, addresses whose domain takes no email are skipped, and a bulk run stops by
+itself if more than your chosen share of recent emails bounced.
+
+Be careful with cold email at volume: SES, SendGrid, Mailgun and Brevo forbid unsolicited bulk email
+to bought or scraped lists in their terms and suspend accounts with high bounce or complaint rates.
+Keep bounces under 2% (clean lists, the domain check, verified emails), send only to businesses with
+a real reason to hear from you, and honour every opt-out. A long send also needs the server awake:
+Render's free plan sleeps after 15 minutes without visitors, so use a paid instance for all-day sending.
+
+## Indian leads
+
+Set the campaign's **Phone country code** to `91` (or the account default under Connections). Numbers
+are read however they're written -- `98765 43210`, `098765-43210`, `+91-98765-43210`, `011-2345 6789`,
+`+91 (0) 80 2345 6789`, toll-free `1800 ...`, even two numbers in one cell -- and anything that isn't a
+real 10-digit Indian number is rejected rather than guessed. Mobiles get WhatsApp; landlines (including
+Bengaluru `080` and Ahmedabad `079` numbers written with their area code) get Phone. Addresses give
+the city, state and PIN (`..., Bengaluru, Karnataka 560038`), state codes like `UP` or `KA` are read as
+Indian states on an Indian list, Bangalore/Bengaluru, Gurgaon/Gurugram and other renamed cities count
+as one place, and JustDial / IndiaMART style columns (Firm Name, Mobile No, Email ID, Locality,
+Pincode, Contact Person) import directly.
+
+Scraping Indian businesses: use **Google Maps** with an Indian place (`Bengaluru, Karnataka`,
+`Koramangala, Bengaluru`, `Bangalore`, `Gurgaon`, `Mumbai` ...). Numbers on those listings are read as
++91 even if your account's default country is another one (a campaign's own code still wins); add the
+city when you search a neighbourhood ("Indiranagar, Bengaluru"), so the country is known. Maps pages are
+always opened in English, so the labels the scraper reads are the same everywhere. A JustDial, Practo,
+IndiaMART, WhatsApp or free Google "business.site" page doesn't count as the business's own website.
+Yelp has no Indian listings, so a Yelp search for an Indian place is refused up front. Instagram
+searches have no place, so set the campaign's country code to 91 for Indian hashtags.
+
 ## Accounts, and where each person's data lives
 
 Anyone can have an account; **each person gets their own separate database file**, so one person's

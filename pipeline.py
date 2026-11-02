@@ -1,7 +1,7 @@
 """
 pipeline.py -- run the three "get them ready" steps in one go.
 
-    enrich  ->  judge fit  ->  draft messages
+    judge fit  ->  enrich (only leads that weren't rejected)  ->  draft messages
 
 Each step is the same job you can start on its own (enrichment.run_enrich, filtering.run_judge,
 outreach.run_draft) and, like them, only touches leads that still need it -- so running the
@@ -40,16 +40,18 @@ def run_pipeline(ctx, params):
     base = {"campaign": campaign, "ids": params.get("ids") or None}
     done = []
 
-    done.append("Enrich: " + enrichment.run_enrich(_Step(ctx, "enrich"), dict(base)))
-    if ctx.stopped:
-        return " | ".join(done) + " | stopped"
-
+    # Judge first: enrichment opens websites and spends searches and AI calls, so it's only
+    # worth doing for leads that fit (or couldn't be judged yet).
     judged = llm.is_configured("filter")
     if judged:
         done.append("Judge: " + filtering.run_judge(_Step(ctx, "judge"), dict(base)))
     else:
         ctx.log("[judge] skipped -- no AI key yet (Settings > Connections)")
         done.append("Judge: skipped (no AI key)")
+    if ctx.stopped:
+        return " | ".join(done) + " | stopped"
+
+    done.append("Enrich: " + enrichment.run_enrich(_Step(ctx, "enrich"), {**base, "skip_rejected": True}))
     if ctx.stopped:
         return " | ".join(done) + " | stopped"
 

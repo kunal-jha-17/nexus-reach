@@ -261,7 +261,7 @@ table.leads .c-biz { min-width: 200px; }
 
 /* -------------------------------------------------------- responsive */
 @media (max-width: 900px) {
-  .app { grid-template-columns: 1fr; }
+  .app { grid-template-columns: 1fr; align-content: start; }
   .rail { position: sticky; height: auto; flex-direction: row; overflow-x: auto; padding: 8px 10px; gap: 2px; z-index: 10;
     border-right: 0; border-bottom: 1px solid var(--line); align-items: center; scrollbar-width: none; }
   .rail::-webkit-scrollbar { display: none; }
@@ -282,6 +282,11 @@ table.leads .c-biz { min-width: 200px; }
 }
 /* phones: each lead becomes a small card instead of a table row that runs off the screen */
 @media (max-width: 640px) {
+  /* the menu wraps onto a second line instead of running off the side of the screen */
+  .rail { flex-wrap: wrap; overflow: visible; row-gap: 4px; padding: 8px 8px 6px; align-content: flex-start; }
+  .rail .brand { flex: 1 0 100%; padding: 2px 4px 4px; }
+  .rail a { padding: 6px 9px; font-size: 13.5px; }
+  .rail-user { margin-left: auto; padding: 0 4px; }
   .tablewrap { overflow: visible; }
   table.leads thead { display: none; }
   table.leads, table.leads tbody { display: block; }

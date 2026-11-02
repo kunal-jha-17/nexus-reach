@@ -19,14 +19,18 @@ Fixes compared with the original Outreach Desk:
   * follow-ups keep the original message; each send is an event, not an overwrite
   * emails get real subjects, a Message-ID and threading headers
 """
+import contextvars
 import email
 import imaplib
 import json
 import re
 import smtplib
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, formataddr, parseaddr
+
+import requests
 
 import config
 import db
@@ -193,24 +197,72 @@ def draft_message(lead_id, selection="", index=0, settings=None, exact=None):
 
 # ------------------------------------------------------------------- email
 
-def smtp_configured():
-    """Email can go out: an address to send from, plus either the Gmail API sign-in or an SMTP password."""
-    return bool(config.env("SMTP_USER") and (gmailapi.configured() or config.env("SMTP_PASS")))
+def from_address():
+    """The address mail is sent from: SMTP_FROM_EMAIL (needed when the SMTP login isn't an email
+    address, as with Amazon SES, SendGrid or Mailgun keys), else the login itself."""
+    return (config.env("SMTP_FROM_EMAIL") or config.env("SMTP_USER")).strip()
+
+
+def _smtp_login_ok():
+    return bool(config.env("SMTP_USER") and config.env("SMTP_PASS"))
 
 
 def email_transport():
-    """How email leaves this account: "gmail_api", "smtp", or "" when it isn't set up."""
-    if not config.env("SMTP_USER"):
+    """How email leaves this account: "gmail_api", "smtp", or "" when it isn't set up.
+    EMAIL_SEND_VIA can force one; on "auto" a mail server you typed in yourself (anything other than
+    Gmail's) wins, then the Gmail API sign-in, then Gmail's SMTP with an App Password."""
+    if not from_address():
         return ""
-    return "gmail_api" if gmailapi.configured() else "smtp" if config.env("SMTP_PASS") else ""
+    via = (config.env("EMAIL_SEND_VIA") or "auto").strip().lower()
+    if via == "smtp":
+        return "smtp" if _smtp_login_ok() else ""
+    if via == "gmail_api":
+        return "gmail_api" if gmailapi.configured() else ""
+    host = (config.env("SMTP_HOST") or "smtp.gmail.com").strip().lower()
+    if _smtp_login_ok() and host != "smtp.gmail.com":
+        return "smtp"
+    return "gmail_api" if gmailapi.configured() else "smtp" if _smtp_login_ok() else ""
+
+
+def smtp_configured():
+    """Email can go out: an address to send from, plus the Gmail API sign-in or an SMTP login."""
+    return bool(email_transport())
+
+
+def _imap_login():
+    """(user, password) for reply checking. The sending login is reused only when it is an email
+    address -- an SES/SendGrid key can't open an inbox."""
+    user = config.env("IMAP_USER")
+    if user:
+        return user, config.env("IMAP_PASS") or config.env("SMTP_PASS")
+    smtp_user = config.env("SMTP_USER")
+    if "@" in smtp_user:
+        return smtp_user, config.env("IMAP_PASS") or config.env("SMTP_PASS")
+    return "", ""
 
 
 def imap_configured():
-    return bool((config.env("IMAP_USER") or config.env("SMTP_USER"))
-                and (config.env("IMAP_PASS") or config.env("SMTP_PASS")))
+    user, pw = _imap_login()
+    return bool(user and pw)
 
 
-WARMUP_SCHEDULE = [(3, 10), (7, 20), (14, 30)]  # (days since first send, daily cap)
+# What a mailbox provider lets ONE account send a day (approximate; providers change these).
+def provider_daily_cap():
+    t = email_transport()
+    host = (config.env("SMTP_HOST") or "smtp.gmail.com").lower()
+    sender = from_address().lower()
+    if t == "gmail_api" or (t == "smtp" and host == "smtp.gmail.com"):
+        return 500 if sender.endswith(("@gmail.com", "@googlemail.com")) else 2000
+    if t == "smtp" and ("office365" in host or "outlook" in host):
+        return 10000
+    if t == "smtp" and "zoho" in host:
+        return 500
+    return None          # SES, SendGrid, Mailgun, Brevo, Postmark, your own server: set by your plan
+
+
+WARMUP_SCHEDULE = [(3, 10), (7, 20), (14, 30)]  # (days since first send, daily cap) for small limits
+# For big limits (a professional mail server): start at WARMUP_START a day and grow WARMUP_GROWTH x a day.
+WARMUP_START, WARMUP_GROWTH = 20, 1.3
 
 
 def effective_daily_limit(settings):
@@ -224,10 +276,68 @@ def effective_daily_limit(settings):
             days_in = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).days
         except ValueError:
             days_in = 0
+    if limit > 100:
+        # 20, 26, 34, 44, ... about 3 weeks to 5,000 a day: inbox providers trust a sender that grows steadily
+        return min(limit, int(WARMUP_START * WARMUP_GROWTH ** max(0, days_in)))
     for threshold, cap in WARMUP_SCHEDULE:
         if days_in < threshold:
             return min(cap, limit)
     return limit
+
+
+def warmup_days_left(settings):
+    """Days until the warm-up reaches the full daily limit (0 = there already)."""
+    limit = int(settings["email_daily_limit"])
+    if not settings.get("warmup_enabled") or limit <= 100:
+        return 0
+    import math
+    need = math.ceil(math.log(limit / WARMUP_START) / math.log(WARMUP_GROWTH)) if limit > WARMUP_START else 0
+    started = settings.get("sending_started_at")
+    try:
+        days_in = (datetime.now(timezone.utc) - datetime.fromisoformat(started)).days if started else 0
+    except ValueError:
+        days_in = 0
+    return max(0, need - days_in)
+
+
+def send_delay(settings, sent_today=None):
+    """Seconds to wait between two emails. With automatic pacing the rest of today's allowance is
+    spread over what's left of the sending window (or of the day), never faster than one a second --
+    5,000 over 9 hours is about one every 6.5 seconds."""
+    if not settings.get("auto_pace"):
+        return int(settings["email_send_delay_seconds"])
+    remaining = max(1, effective_daily_limit(settings) - (emails_sent_today(settings) if sent_today is None else sent_today))
+    zone = db.local_zone(settings)
+    now = datetime.now(timezone.utc).astimezone(zone)
+    end_hour = int(settings.get("send_end_hour", 24)) if settings.get("send_window_enabled") else 24
+    end = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=end_hour)
+    seconds_left = max(60, (end - now).total_seconds())
+    return max(1, min(3600, int(seconds_left / remaining)))
+
+
+def bounce_rate(days=7):
+    """(bounced, sent) over the last `days` days."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat(timespec="seconds")
+    with db.get_conn() as conn:
+        sent = conn.execute("SELECT COUNT(*) FROM events WHERE kind IN ('email_sent','followup_sent') AND created_at >= ?",
+                            (since,)).fetchone()[0]
+        bounced = conn.execute("SELECT COUNT(*) FROM events WHERE kind = 'bounced' AND created_at >= ?",
+                               (since,)).fetchone()[0]
+    return bounced, sent
+
+
+def too_many_bounces(settings):
+    """A reason to stop sending, or ''. Over ~5% bounces tells inbox providers the list is bad --
+    carrying on gets the sending domain blocked (and an SES/SendGrid account suspended)."""
+    limit = float(settings.get("max_bounce_rate", 5) or 0)
+    if limit <= 0:
+        return ""
+    bounced, sent = bounce_rate()
+    if sent >= 40 and bounced / sent * 100 > limit:
+        return (f"Paused: {bounced} of the last {sent} emails bounced ({bounced / sent:.0%}), above your "
+                f"{limit:g}% limit. Clean the list (remove failed addresses) before sending more -- a high "
+                "bounce rate gets your sending domain blocked. Change the limit under Settings > Sending.")
+    return ""
 
 
 def emails_sent_today(settings=None):
@@ -278,6 +388,12 @@ def email_status(settings=None):
         "smtp_configured": smtp_configured(),
         "imap_configured": imap_configured(),
         "followups_due": len(followups_due(settings)),
+        "transport": email_transport(),
+        "provider_cap": provider_daily_cap(),
+        "warmup_days_left": warmup_days_left(settings),
+        "delay_seconds": send_delay(settings, sent),
+        "bounces_7d": dict(zip(("bounced", "sent"), bounce_rate())),
+        "unsubscribe_link": bool(public_url()),
     }
 
 
@@ -294,14 +410,20 @@ def split_subject(message, lead):
 
 
 def build_email(lead, subject, body, settings, in_reply_to=None):
-    user = config.env("SMTP_USER")
+    user = from_address()
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = formataddr((config.env("SMTP_FROM_NAME"), user)) if config.env("SMTP_FROM_NAME") else user
     msg["To"] = lead["email"]
     msg["Date"] = formatdate(localtime=True)
     msg["Message-ID"] = make_msgid(domain=(user.split("@")[-1] if "@" in user else None))
-    msg["List-Unsubscribe"] = f"<mailto:{user}?subject=unsubscribe>"
+    link = unsubscribe_link(lead)
+    if link:
+        # one-click unsubscribe (RFC 8058): Gmail and Yahoo require it from anyone sending 5,000+ a day
+        msg["List-Unsubscribe"] = f"<{link}>, <mailto:{user}?subject=unsubscribe>"
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    else:
+        msg["List-Unsubscribe"] = f"<mailto:{user}?subject=unsubscribe>"
     if in_reply_to:
         msg["In-Reply-To"] = in_reply_to
         msg["References"] = in_reply_to
@@ -310,12 +432,59 @@ def build_email(lead, subject, body, settings, in_reply_to=None):
     return msg
 
 
+def public_url():
+    """This app's own web address, for links in emails. Render sets RENDER_EXTERNAL_URL itself."""
+    return (config._server_env("PUBLIC_URL") or config._server_env("RENDER_EXTERNAL_URL") or "").rstrip("/")
+
+
+def unsubscribe_token(user_id, lead_id):
+    import hashlib
+    import hmac
+    key = (config._server_env("SECRET_KEY") or "dev").encode()
+    sig = hmac.new(key, f"unsub:{user_id}:{lead_id}".encode(), hashlib.sha256).hexdigest()[:20]
+    return f"{user_id}.{lead_id}.{sig}"
+
+
+def read_unsubscribe_token(token):
+    """(user_id, lead_id) for a genuine token, else None."""
+    import hmac
+    try:
+        uid, lid, _ = token.split(".")
+        uid, lid = int(uid), int(lid)
+    except (ValueError, AttributeError):
+        return None
+    return (uid, lid) if hmac.compare_digest(unsubscribe_token(uid, lid), token) else None
+
+
+def unsubscribe_link(lead):
+    import userctx
+    base, user = public_url(), userctx.get_user()
+    if not base or not user or not lead.get("id"):
+        return ""
+    return f"{base}/u/{unsubscribe_token(user['id'], lead['id'])}"
+
+
+def unsubscribe_lead(lead_id):
+    """Someone used the unsubscribe link: never contact them again."""
+    lead = db.get_lead(lead_id)
+    if lead is None:
+        return False
+    if lead.get("email"):
+        db.add_suppression(lead["email"], "unsubscribed via link")
+    if not lead["do_not_contact"]:
+        db.update_lead(lead_id, {"do_not_contact": 1, "dnc_reason": "unsubscribed via link",
+                                 "stage": "dead" if lead["stage"] in ("new", "contacted") else lead["stage"],
+                                 "reply_category": lead.get("reply_category") or "not_interested"})
+        db.add_event(lead_id, "optout", "unsubscribe link")
+    return True
+
+
 def _explain_connect_error(e, host, port):
     if isinstance(e, smtplib.SMTPException):
         return str(e)
     return (f"Couldn't connect to {host}:{port} ({e}). If this app runs on a free hosting plan, the host may block "
-            "outgoing email ports (Render's free plan blocks 25, 465 and 587). Send through the Gmail API instead "
-            "(it uses HTTPS, which isn't blocked) -- see 'Sending through the Gmail API' in the README.")
+            "outgoing email ports (Render's free plan blocks 25, 465 and 587). Use port 2525 (SendGrid, Mailgun, Brevo, "
+            "Postmark) or 2587 (Amazon SES), or send through the Gmail API (HTTPS) -- see the README.")
 
 
 class DeliveryError(RuntimeError):
@@ -328,73 +497,135 @@ class DeliveryError(RuntimeError):
         self.recipient = recipient
 
 
+_SESSION = contextvars.ContextVar("smtp_session", default=None)
+MESSAGES_PER_CONNECTION = 100        # reconnect after this many (some servers cap messages per connection)
+
+
+def _smtp_settings():
+    host = config.env("SMTP_HOST") or "smtp.gmail.com"
+    port = config.env_int("SMTP_PORT", 587)
+    return host, port, config.env("SMTP_USER"), config.env("SMTP_PASS")
+
+
+def _smtp_connect(timeout=30):
+    """An open, logged-in SMTP connection: implicit TLS on 465/2465, STARTTLS elsewhere."""
+    host, port, user, pw = _smtp_settings()
+    netguard.check_mail_host(host, port)
+    if port in (465, 2465):
+        s = smtplib.SMTP_SSL(host, port, timeout=timeout)
+    else:
+        s = smtplib.SMTP(host, port, timeout=timeout)
+        s.starttls()                     # says EHLO first, and login() says it again over the encrypted line
+    s.login(user, pw)
+    return s
+
+
+class SmtpSession:
+    """One SMTP connection reused for a whole batch -- thousands of emails a day over a fresh
+    connection each would be slow and look like abuse to the mail server."""
+
+    def __init__(self):
+        self.conn, self.count = None, 0
+
+    def send(self, msg):
+        if self.conn is None or self.count >= MESSAGES_PER_CONNECTION:
+            self.close()
+            self.conn, self.count = _smtp_connect(), 0
+        try:
+            self.conn.send_message(msg)
+        except smtplib.SMTPServerDisconnected:
+            self.conn, self.count = _smtp_connect(), 0           # dropped while idle: reconnect once
+            self.conn.send_message(msg)
+        self.count += 1
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.quit()
+            except Exception:  # noqa: BLE001
+                pass
+        self.conn = None
+
+
+@contextmanager
+def smtp_session():
+    """Reuse one SMTP connection for every send inside this block (bulk runs, follow-ups)."""
+    if _SESSION.get() is not None:
+        yield _SESSION.get()
+        return
+    sess = SmtpSession()
+    token = _SESSION.set(sess)
+    try:
+        yield sess
+    finally:
+        _SESSION.reset(token)
+        sess.close()
+
+
 def _deliver(msg):
-    """Actually send the message. Through the Gmail API (HTTPS) when this account has a Gmail
-    sign-in; otherwise over SMTP. Returns Gmail's {"id", "threadId"} for an API send, else None.
+    """Actually send the message: through the Gmail API (HTTPS) or over SMTP, whichever
+    email_transport() picks. Returns Gmail's {"id", "threadId"} for an API send, else None.
     A follow-up can carry msg.gmail_thread_id to stay in the original Gmail conversation."""
-    if gmailapi.configured():
+    if email_transport() == "gmail_api":
         try:
             return gmailapi.send(msg, getattr(msg, "gmail_thread_id", None))
         except gmailapi.GmailError as e:
             raise DeliveryError(str(e), recipient=e.recipient)
-    host = config.env("SMTP_HOST", "smtp.gmail.com")
-    port = config.env_int("SMTP_PORT", 587)
-    user, pw = config.env("SMTP_USER"), config.env("SMTP_PASS")
+    host, port, _, _ = _smtp_settings()
+    sess = _SESSION.get()
+    one_off = sess is None
+    if one_off:
+        sess = SmtpSession()
     try:
-        netguard.check_mail_host(host, port)
+        sess.send(msg)
     except netguard.Blocked as e:
         raise DeliveryError(str(e))
-    try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=30) as s:
-                s.login(user, pw)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(host, port, timeout=30) as s:
-                s.starttls()
-                s.login(user, pw)
-                s.send_message(msg)
     except smtplib.SMTPRecipientsRefused as e:
         why = "; ".join(f"{code} {(text.decode(errors='replace') if isinstance(text, bytes) else text)}"
                         for code, text in e.recipients.values())[:200]
         raise DeliveryError(f"The mail server refused this address ({why}).", recipient=True)
     except smtplib.SMTPAuthenticationError:
-        raise DeliveryError("Your mail server refused the login. For Gmail use an App Password "
-                            "(Settings > Connections > Email sending), not your normal password.")
+        sess.close()
+        raise DeliveryError("Your mail server refused the login. For Gmail use an App Password; for SES, SendGrid "
+                            "or Mailgun use the SMTP username and password (or API key) they gave you.")
     except (OSError, smtplib.SMTPException) as e:
+        sess.close()
         raise DeliveryError(_explain_connect_error(e, host, port))
+    finally:
+        if one_off:
+            sess.close()
+    return None
 
 
 def test_smtp():
     """Check the email details (the Gmail API sign-in, or the SMTP login). Sends nothing."""
     if not smtp_configured():
-        raise SendError("Add your email address, plus a Gmail API refresh token or an App Password, first.", 400)
-    if gmailapi.configured():
+        raise SendError("Add your email address, plus a Gmail API refresh token, an App Password or your mail "
+                        "server's SMTP login, first.", 400)
+    if email_transport() == "gmail_api":
         try:
             return gmailapi.test()
         except gmailapi.GmailError as e:
             raise SendError(str(e), 400 if e.auth else 502)
-    host = config.env("SMTP_HOST", "smtp.gmail.com")
-    port = config.env_int("SMTP_PORT", 587)
-    user, pw = config.env("SMTP_USER"), config.env("SMTP_PASS")
+    host, port, user, _ = _smtp_settings()
     try:
-        netguard.check_mail_host(host, port)
+        s = _smtp_connect(timeout=12)
+        try:
+            s.quit()
+        except Exception:  # noqa: BLE001
+            pass
     except netguard.Blocked as e:
         raise SendError(str(e), 400)
-    try:
-        if port == 465:
-            with smtplib.SMTP_SSL(host, port, timeout=12) as s:
-                s.login(user, pw)
-        else:
-            with smtplib.SMTP(host, port, timeout=12) as s:
-                s.starttls()
-                s.login(user, pw)
     except smtplib.SMTPAuthenticationError:
         raise SendError("The mail server refused the login. For Gmail use an App Password (Google Account > Security > "
-                        "2-Step Verification > App passwords), not your normal password.", 400)
+                        "2-Step Verification > App passwords), not your normal password. For SES, SendGrid or Mailgun "
+                        "use the SMTP credentials from their dashboard.", 400)
     except (OSError, smtplib.SMTPException) as e:
         raise SendError(_explain_connect_error(e, host, port), 502)
-    return {"ok": True, "message": f"Connected to {host} and logged in as {user}. (Nothing was sent.)"}
+    cap = provider_daily_cap()
+    note = f" This provider allows about {cap:,} emails a day per account." if cap else ""
+    return {"ok": True, "message": f"Connected to {host}:{port} and logged in as {user}; mail will be sent from "
+                                   f"{from_address()}. (Nothing was sent.){note}"}
 
 
 def test_imap():
@@ -402,8 +633,7 @@ def test_imap():
     if not imap_configured():
         raise SendError("Add your email address and App Password first.", 400)
     host = config.env("IMAP_HOST", "imap.gmail.com")
-    user = config.env("IMAP_USER") or config.env("SMTP_USER")
-    pw = config.env("IMAP_PASS") or config.env("SMTP_PASS")
+    user, pw = _imap_login()
     try:
         netguard.check_mail_host(host, 993)
     except netguard.Blocked as e:
@@ -457,6 +687,63 @@ def _check_can_email(lead, settings, followup=False):
                         "reputation -- try again tomorrow.", 429)
 
 
+_DOMAIN_CHECKS = {}          # domain -> (verdict, checked_at); verdicts: ok | no_domain | no_mail | unknown
+_DOMAIN_TTL = 24 * 3600
+
+
+def check_email_domain(address):
+    """Free check that an address's domain exists and accepts email (an MX record, or an address
+    record as the fallback mail servers use). Asked over HTTPS (Google's public DNS) because hosts
+    such as Render block other outgoing ports. 'unknown' (couldn't ask) never stops a send."""
+    if not config.env_bool_server("EMAIL_DOMAIN_CHECK", True):
+        return "ok"
+    domain = (address or "").rpartition("@")[2].strip().lower()
+    if not domain:
+        return "no_domain"
+    if domain in FREE_MAIL_DOMAINS:
+        return "ok"
+    hit = _DOMAIN_CHECKS.get(domain)
+    now = datetime.now(timezone.utc).timestamp()
+    if hit and now - hit[1] < _DOMAIN_TTL:
+        return hit[0]
+
+    def ask(rtype):
+        r = requests.get("https://dns.google/resolve", params={"name": domain, "type": rtype}, timeout=5)
+        r.raise_for_status()
+        return r.json()
+    try:
+        mx = ask("MX")
+        if mx.get("Status") == 3:
+            verdict = "no_domain"
+        elif any(a.get("type") == 15 for a in mx.get("Answer") or []):
+            # "0 ." is a "null MX": the domain says outright that it takes no email
+            null_mx = all((a.get("data") or "").strip() in ("0 .", "0.")
+                          for a in mx["Answer"] if a.get("type") == 15)
+            verdict = "no_mail" if null_mx else "ok"
+        else:
+            a = ask("A")
+            verdict = "ok" if any(x.get("type") in (1, 28) for x in a.get("Answer") or []) else "no_mail"
+    except Exception:  # noqa: BLE001 -- no answer: don't block the send over our own lookup failing
+        return "unknown"
+    _DOMAIN_CHECKS[domain] = (verdict, now)
+    return verdict
+
+
+_DOMAIN_PROBLEM = {"no_domain": "the email's domain doesn't exist", "no_mail": "the email's domain doesn't accept email"}
+
+
+def _require_deliverable(lead):
+    """Stop before sending to an address that can only bounce (bounces hurt your sender reputation)."""
+    verdict = check_email_domain(lead.get("email"))
+    if verdict in _DOMAIN_PROBLEM:
+        why = _DOMAIN_PROBLEM[verdict]
+        db.update_lead(lead["id"], {"send_status": "failed", "email_check": why})
+        db.add_event(lead["id"], "send_failed", f"Not sent: {why} ({lead.get('email')})")
+        raise SendError(f"Not sent: {why}. Find another address or reach them another way.", 502)
+    if verdict == "ok" and lead.get("email_check") != "ok":
+        db.update_lead(lead["id"], {"email_check": "ok"})
+
+
 def send_lead_email(lead_id, force=False):
     settings = db.get_settings()
     lead = db.get_lead(lead_id)
@@ -465,6 +752,14 @@ def send_lead_email(lead_id, force=False):
         raise SendError("Write or generate a message first.", 400)
     if lead["send_status"] == "sent" and not force:
         raise SendError("Already sent. Use a follow-up instead.", 400)
+    if not force:
+        twin = db.already_emailed(lead["email"], lead_id)
+        if twin:
+            db.add_event(lead_id, "send_skipped", f"Same inbox already emailed via lead {twin['id']} "
+                                                  f"({twin['business_name']})")
+            raise SendError(f"Skipped: {lead['email']} was already emailed (lead '{twin['business_name']}'), "
+                            "e.g. another branch sharing one inbox.", 409)
+    _require_deliverable(lead)
     _ensure_sending_started(settings)
 
     subject, body = split_subject(final_message(lead), lead)
@@ -688,7 +983,48 @@ def _lead_for_reply(msg, from_addr):
         row = conn.execute(
             "SELECT * FROM leads WHERE lower(email) = ? AND send_status = 'sent' LIMIT 1", (from_addr,)
         ).fetchone()
-    return dict(row) if row else None
+        if row:
+            return dict(row)
+        # Someone else at the same business answering -- the owner replying to what reached
+        # info@, a forwarded email with no thread headers. Matched on the company's own domain
+        # (never gmail.com and the like), and only when exactly one emailed lead has it.
+        domain = from_addr.rpartition("@")[2]
+        if domain and domain not in FREE_MAIL_DOMAINS:
+            rows = conn.execute(
+                "SELECT * FROM leads WHERE send_status = 'sent' AND (website_domain = ? OR lower(email) LIKE ?) "
+                "LIMIT 2", (domain, "%@" + domain)).fetchall()
+            if len(rows) == 1:
+                return dict(rows[0])
+        # Last: the owner answering from a personal address (gmail.com and the like) with a "Re:"
+        # of a subject we sent to exactly one lead. A different company's address never matches.
+        subject = _bare_subject(msg.get("Subject", ""))
+        if domain in FREE_MAIL_DOMAINS and subject and len(subject) >= 12 and re.match(r"(?i)\s*(re|aw|sv|antw)\s*:", msg.get("Subject", "") or ""):
+            hits = {r["lead_id"] for r in conn.execute(
+                "SELECT lead_id FROM events WHERE kind IN ('email_sent','followup_sent') AND detail LIKE ? LIMIT 3",
+                (f'%"subject": {json.dumps(subject)[:-1]}%',)).fetchall()}
+            if len(hits) == 1:
+                lead = db.get_lead(hits.pop())
+                if lead and lead.get("send_status") == "sent":
+                    return lead
+    return None
+
+
+FREE_MAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.in", "yahoo.co.uk", "ymail.com", "hotmail.com",
+    "hotmail.co.uk", "outlook.com", "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com",
+    "proton.me", "protonmail.com", "gmx.com", "gmx.net", "mail.com", "zoho.com", "yandex.com", "yandex.ru",
+    "rediffmail.com", "qq.com", "163.com", "126.com",
+}
+
+
+def _bare_subject(subject):
+    """'Re: RE: Fwd: Quick question' -> 'Quick question'."""
+    s = (subject or "").strip()
+    while True:
+        t = re.sub(r"(?i)^\s*(re|aw|sv|antw|fw|fwd)\s*:\s*", "", s)
+        if t == s:
+            return s
+        s = t
 
 
 _BOUNCE_WORDS = ("undeliverable", "undelivered", "delivery status notification (failure)", "failure notice",
@@ -784,10 +1120,53 @@ def process_inbound(raw_bytes, footer=""):
         db.update_lead(lead["id"], {"stage": "replied"})
     if optout:
         db.add_suppression(from_addr, "requested via reply")
-        db.update_lead(lead["id"], {"stage": "dead", "dnc_reason": "requested via reply"})
+        db.update_lead(lead["id"], {"stage": "dead", "dnc_reason": "requested via reply",
+                                    "reply_category": "not_interested"})
         db.add_event(lead["id"], "optout", from_addr)
         return "optout"
+    db.update_lead(lead["id"], {"reply_category": classify_reply(snippet or body)})
     return "replied"
+
+
+REPLY_CATEGORIES = ("interested", "question", "not_now", "wrong_person", "not_interested", "other")
+_REPLY_RULES = [   # checked in order; the first that matches wins (used when there's no AI key)
+    ("not_interested", r"\b(not interested|no thanks|no thank you|not for us|please remove|unsubscribe|don'?t (?:contact|email)|"
+                       r"we(?:'re| are) (?:all )?(?:set|good|covered)|already have (?:a|an|one|someone)|no need)\b"),
+    ("wrong_person", r"\b(contact|speak to|reach out to|email|talk to|forward(?:ed)? (?:this|it) to)\b.{0,40}"
+                     r"\b(manager|owner|director|colleague|marketing|partner|doctor|dr\.?|person in charge)\b|"
+                     r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}"),
+    ("not_now", r"\b(not (?:right )?now|later|next (?:month|quarter|year|week)|after (?:ramadan|eid|the holidays)|"
+                r"busy (?:right now|at the moment)|maybe in|check back|circle back|get back to you)\b"),
+    ("interested", r"\b(interested|sounds good|let'?s (?:talk|chat|meet)|call me|give me a call|book|schedule|"
+                   r"set up a (?:call|meeting)|send (?:me )?(?:more )?(?:details|info)|tell me more|yes)\b"),
+    ("question", r"\?|\b(how much|price|pricing|cost|what does|how does)\b"),
+]
+
+
+def classify_reply(text):
+    """Sort a reply into one of REPLY_CATEGORIES so the hot ones are answered first. Uses the AI
+    when a key is set (it reads tone and context), else simple word rules. Never raises."""
+    text = (text or "").strip()
+    if not text:
+        return "other"
+    if llm.is_configured("filter"):
+        try:
+            reply = llm.complete(
+                "Classify this reply to a cold sales email into exactly one category:\n"
+                "interested (wants to talk / a call / details), question (asks something, e.g. price, before deciding), "
+                "not_now (maybe later), wrong_person (points to someone else), not_interested (declines), other.\n\n"
+                f"REPLY:\n{text[:1500]}\n\nAnswer with the category word only.",
+                task="filter", max_tokens=20, temperature=0)
+            word = re.sub(r"[^a-z_]", "", (reply or "").strip().lower().split()[0] if (reply or "").strip() else "")
+            if word in REPLY_CATEGORIES:
+                return word
+        except Exception:  # noqa: BLE001 -- the word rules below are a fine fallback
+            pass
+    low = text.lower()
+    for cat, pattern in _REPLY_RULES:
+        if re.search(pattern, low):
+            return cat
+    return "other"
 
 
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
@@ -821,7 +1200,7 @@ def check_replies():
     since_str = f"{since.day:02d}-{_MONTHS[since.month - 1]}-{since.year}"
     counts = {"checked": 0, "replied": 0, "suppressed": 0, "auto_replies": 0, "bounced": 0}
     imap_host = config.env("IMAP_HOST", "imap.gmail.com")
-    user = config.env("IMAP_USER") or config.env("SMTP_USER")
+    user, imap_pw = _imap_login()
     try:
         netguard.check_mail_host(imap_host, 993)
     except netguard.Blocked as e:
@@ -831,7 +1210,7 @@ def check_replies():
     try:
         mail = imaplib.IMAP4_SSL(imap_host, timeout=30)
         try:
-            mail.login(user, config.env("IMAP_PASS") or config.env("SMTP_PASS"))
+            mail.login(user, imap_pw)
             mail.select("INBOX", readonly=True)
             try:
                 validity = (mail.response("UIDVALIDITY")[1][0] or b"").decode()
@@ -975,6 +1354,9 @@ def run_send_bulk(ctx, params):
     ok, why = send_window(settings)
     if not ok:
         raise SendError(why)
+    halt = too_many_bounces(settings)
+    if halt:
+        raise SendError(halt)
     filters = {"send_status": "unsent", "channel": "email", "drafted": "yes", "dnc": "no", "open_stage": True}
     if params.get("only_fit"):
         filters["fit"] = "1"
@@ -988,8 +1370,28 @@ def run_send_bulk(ctx, params):
     ctx.progress(0, len(ids))
     ctx.log(f"{len(ids)} emails queued (limit today: {effective_daily_limit(settings)}, "
             f"already sent today: {emails_sent_today(settings)})")
+    cap = provider_daily_cap()
+    if cap and effective_daily_limit(settings) > cap:
+        ctx.log(f"Note: your mail provider allows about {cap:,} emails a day per account; your limit is higher, so "
+                "it may start refusing before you reach it. For more, use a sending service (Amazon SES, SendGrid, "
+                "Mailgun, Brevo) under Settings > Connections.")
     sent = failed = skipped = 0
     stuck = None          # a lead whose send failed for a reason that may be ours, not theirs
+    with smtp_session() if email_transport() == "smtp" else _nullcontext():
+        sent, failed, skipped, stuck = _bulk_loop(ctx, ids, settings)
+    if stuck is not None:
+        ctx.log(f"Lead {stuck[0]} was left unsent: {stuck[1]}")
+    return f"{sent} sent, {failed} failed, {skipped} skipped"
+
+
+@contextmanager
+def _nullcontext():
+    yield
+
+
+def _bulk_loop(ctx, ids, settings):
+    sent = failed = skipped = 0
+    stuck = None
     for i, lead_id in enumerate(ids, 1):
         if ctx.stopped:
             ctx.log("Stopped.")
@@ -1008,7 +1410,12 @@ def run_send_bulk(ctx, params):
                 db.add_event(stuck[0], "send_failed", stuck[1][:300])
                 failed += 1
                 stuck = None
-            if i < len(ids) and ctx.sleep(int(settings["email_send_delay_seconds"])):
+            if sent % 50 == 0:
+                halt = too_many_bounces(settings)
+                if halt:
+                    ctx.log(halt)
+                    break
+            if i < len(ids) and ctx.sleep(send_delay(settings)):
                 break
         except SendError as e:
             ctx.progress(i)
@@ -1028,9 +1435,7 @@ def run_send_bulk(ctx, params):
             else:
                 skipped += 1
             ctx.log(f"Lead {lead_id}: {e}")
-    if stuck is not None:
-        ctx.log(f"Lead {stuck[0]} was left unsent: {stuck[1]}")
-    return f"{sent} sent, {failed} failed, {skipped} skipped"
+    return sent, failed, skipped, stuck
 
 
 def run_followups(ctx, params):
@@ -1049,6 +1454,14 @@ def run_followups(ctx, params):
     due = [l for l in followups_due(settings) if not params.get("campaign") or l["campaign"] == params["campaign"]]
     ctx.progress(0, len(due))
     ctx.log(f"{len(due)} follow-ups due")
+    halt = too_many_bounces(settings)
+    if halt:
+        raise SendError(halt)
+    with smtp_session() if email_transport() == "smtp" else _nullcontext():
+        return _followup_loop(ctx, due, settings)
+
+
+def _followup_loop(ctx, due, settings):
     sent = failed = skipped = 0
     for i, lead in enumerate(due, 1):
         if ctx.stopped:
@@ -1062,7 +1475,7 @@ def run_followups(ctx, params):
             sent += 1
             ctx.log(f"Followed up with {lead['business_name'] or lead['email']}")
             ctx.progress(i)
-            if i < len(due) and ctx.sleep(int(settings["email_send_delay_seconds"])):
+            if i < len(due) and ctx.sleep(send_delay(settings)):
                 break
         except SendError as e:
             ctx.progress(i)

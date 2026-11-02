@@ -13,6 +13,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.environ["HUB_JOBS_SYNC"] = "1"
+os.environ["EMAIL_DOMAIN_CHECK"] = "0"           # no live DNS lookups from the test suite (tests that need it mock it)
 os.environ["HUB_START_THREADS"] = "0"
 os.environ["DATA_DIR"] = tempfile.mkdtemp()          # never touch the real ./data folder
 os.environ["ADOPT_LEGACY_DB"] = "0"

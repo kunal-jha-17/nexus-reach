@@ -5,6 +5,7 @@ One `leads` table is the source of truth for every stage: scraped, enriched,
 judged, drafted, sent, replied. Everything else (jobs, schedules, suppression
 list, campaigns, events, settings) sits alongside it.
 """
+import difflib
 import json
 import re
 import sqlite3
@@ -142,6 +143,13 @@ CREATE TABLE IF NOT EXISTS leads (
     website_domain TEXT DEFAULT '',
     name_key TEXT DEFAULT '',
     last_query TEXT DEFAULT '',
+    place_id TEXT DEFAULT '',
+    rating REAL,
+    opening_hours TEXT DEFAULT '',
+    country TEXT DEFAULT '',
+    phone_kind TEXT DEFAULT '',
+    reply_category TEXT DEFAULT '',
+    email_check TEXT DEFAULT '',
     created_at TEXT,
     updated_at TEXT
 );
@@ -231,14 +239,32 @@ def _migrate(conn):
     for table, cols in {
         "campaigns": {"description": "TEXT DEFAULT ''", "status": "TEXT DEFAULT 'active'",
                       "business_info": "TEXT DEFAULT ''", "templates": "TEXT DEFAULT ''",
-                      "channel_priority": "TEXT DEFAULT ''"},
+                      "channel_priority": "TEXT DEFAULT ''", "country_code": "TEXT DEFAULT ''",
+                      "score_no_website": "TEXT DEFAULT ''"},
         "jobs": {"campaign": "TEXT DEFAULT ''"},
         "schedules": {"only_no_website": "INTEGER DEFAULT 0"},
+        "leads": {"place_id": "TEXT DEFAULT ''", "rating": "REAL", "opening_hours": "TEXT DEFAULT ''",
+                  "country": "TEXT DEFAULT ''", "phone_kind": "TEXT DEFAULT ''",
+                  "reply_category": "TEXT DEFAULT ''", "email_check": "TEXT DEFAULT ''"},
     }.items():
         have = _columns(conn, table)
+        added = []
         for col, ddl in cols.items():
             if col not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+                added.append(col)
+        if table == "leads" and "phone_kind" in added:
+            # Fill the new derived columns in for leads saved by an older version, and move
+            # landlines off WhatsApp (they can't receive it).
+            for r in conn.execute("SELECT id, phone, google_maps_url, channel, channel_locked FROM leads").fetchall():
+                key = schema.place_key("", r["google_maps_url"])
+                kind = schema.phone_kind(r["phone"])
+                fields = {"phone_kind": kind, "place_id": key.split(":", 1)[1] if key else ""}
+                if r["channel"] == "whatsapp" and kind == "landline" and not r["channel_locked"]:
+                    fields["channel"] = "phone"
+                conn.execute(f"UPDATE leads SET {', '.join(k + ' = ?' for k in fields)} WHERE id = ?",
+                             (*fields.values(), r["id"]))
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_leads_place ON leads(place_id)")
     # The old "default" criteria row becomes a plain setting (it isn't a campaign).
     row = conn.execute("SELECT criteria FROM campaigns WHERE name = 'default'").fetchone()
     if row is not None:
@@ -290,6 +316,9 @@ DEFAULT_SETTINGS = {
     "sending_started_at": "",
     "default_criteria": "",   # fit criteria for leads whose campaign has none of its own
     "auto_remove_rejected": False,   # delete a lead outright the moment Judge fit rejects it
+    "score_no_website": True,        # the 0-10 score favours businesses without a website (website sellers)
+    "auto_pace": False,              # spread the day's emails evenly over the sending window
+    "max_bounce_rate": 5,            # % of recent emails bouncing at which sending pauses (0 = never)
     "exact_templates": False,        # draft by filling in the template's blanks, with no AI rewriting
     "followup_template": "",         # fixed follow-up text (placeholders allowed); blank = the AI writes one
     "reply_check_minutes": 30,       # look for replies on a timer when the inbox is connected; 0 = only by hand
@@ -340,7 +369,7 @@ LIFECYCLE_WRITABLE = {
     "campaign", "source", "stage", "send_status", "message", "template_used",
     "sent_at", "last_sent_at", "follow_up_count", "email_message_id",
     "do_not_contact", "dnc_reason", "fit", "fit_confidence", "fit_reason",
-    "enrichment_notes", "enriched_at", "judged_at", "last_query",
+    "enrichment_notes", "enriched_at", "judged_at", "last_query", "reply_category", "email_check",
 }
 
 
@@ -368,6 +397,25 @@ def _priority(conn, campaign=""):
     return [x for x in p if x in schema.CHANNELS] or schema.DEFAULT_CHANNEL_PRIORITY
 
 
+def _campaign_prefs(conn, campaign=""):
+    """(calling code, favour-no-website) for leads in this campaign: its own values if set,
+    else the account's."""
+    cc, favor = "", ""
+    if campaign:
+        r = conn.execute("SELECT country_code, score_no_website FROM campaigns WHERE name = ?",
+                         (campaign,)).fetchone()
+        if r:
+            cc, favor = r["country_code"] or "", r["score_no_website"] or ""
+    if favor not in ("yes", "no"):
+        favor = "yes" if get_settings(conn).get("score_no_website", True) else "no"
+    return cc, favor == "yes"
+
+
+def campaign_calling_code(campaign):
+    with get_conn() as conn:
+        return _campaign_prefs(conn, canonical_campaign(conn, campaign))[0]
+
+
 def canonical_campaign(conn, name):
     """Campaign names are case-insensitive: 'DFW' and 'dfw' are the same campaign."""
     name = (name or "").strip()
@@ -383,33 +431,124 @@ def ensure_campaign(conn, name):
                      (name, schema.now_iso()))
 
 
+_BRANCH_SPLIT = re.compile(r"\s+(?:-|\u2013|\u2014|\||@)\s+|\s*\(([^)]*)\)\s*$")
+
+
+def branch_label(name):
+    """'Prime Dental - Al Reem' -> 'alreem'; '' when the name carries no branch part."""
+    parts = _BRANCH_SPLIT.split(name or "")
+    tail = [p for p in parts[1:] if p]
+    return re.sub(r"[^a-z0-9]", "", tail[-1].lower()) if tail else ""
+
+
+def _different_place(row, n):
+    """True when two records clearly describe two different places, even though they share a
+    phone, website or name: both carry Google place ids that differ, or both carry branch
+    names that differ ('Prime Dental - Reem' vs 'Prime Dental - Yas')."""
+    a = schema.place_key(row["place_id"] if "place_id" in row.keys() else "", row["google_maps_url"])
+    b = schema.place_key(n.get("place_id"), n.get("google_maps_url"))
+    if a and b and a.split(":", 1)[0] == b.split(":", 1)[0] and a != b:
+        return True
+    la, lb = branch_label(row["business_name"]), branch_label(n.get("business_name"))
+    if la and lb and la != lb:
+        return True
+    # Different names on top of a different phone or a different street address: a sibling
+    # branch that shares the group's website or central number, not a second copy.
+    na, nb = (row["name_key"] or "").partition("|")[0], (n.get("name_key") or "").partition("|")[0]
+    if na and nb and na != nb and difflib.SequenceMatcher(None, na, nb).ratio() < 0.85:
+        if row["phone"] and n.get("phone") and row["phone"] != n["phone"]:
+            return True
+        if _addresses_differ(row["address"], n.get("address")):
+            return True
+    return False
+
+
+def _conflicts(row, n):
+    """For a match on the name alone: do the two records disagree on anything that identifies a
+    business? Two "Smile Dental Clinic"s in one city with different phones are two clinics."""
+    if _different_place(row, n):
+        return True
+    if row["website_domain"] and n.get("website_domain") and row["website_domain"] != n["website_domain"]:
+        return True
+    # Different phones alone could be one clinic's landline (Maps) and mobile (Instagram); with
+    # two different street addresses as well, it's two clinics.
+    if row["phone"] and n.get("phone") and row["phone"] != n["phone"]:
+        return _addresses_differ(row["address"], n.get("address"))
+    return False
+
+
+def _addr_tokens(a):
+    return {t for t in re.findall(r"[a-z0-9]+", (a or "").lower()) if len(t) > 2}
+
+
+def _addresses_differ(a, b):
+    ta, tb = _addr_tokens(a), _addr_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / min(len(ta), len(tb)) < 0.6
+
+
 def find_existing(conn, n, exclude_id=None):
-    """Find a lead that is probably the same business. Checks, in order: phone,
-    email, real-website domain, social/listing URLs, then business name (+city)."""
+    """Find a lead that is probably the same business. Checks, in order: Google place id, phone,
+    email, real-website domain, social/listing URLs, then business name (+city).
+    A shared phone or website isn't enough when the two are clearly different places (chain
+    branches), and a shared name isn't enough when phones or websites disagree."""
     excl = " AND id != ?" if exclude_id else ""
     xp = (exclude_id,) if exclude_id else ()
+    if n.get("place_id"):
+        row = conn.execute(f"SELECT * FROM leads WHERE place_id = ?{excl} LIMIT 1", (n["place_id"], *xp)).fetchone()
+        if row:
+            return row
     for col in ("phone", "email", "website_domain", "instagram_url",
                 "facebook_url", "yelp_url", "google_maps_url"):
         val = n.get(col)
         if val:
-            row = conn.execute(f"SELECT * FROM leads WHERE {col} = ?{excl} LIMIT 1", (val, *xp)).fetchone()
-            if row:
-                return row
+            for row in conn.execute(f"SELECT * FROM leads WHERE {col} = ?{excl} LIMIT 25", (val, *xp)).fetchall():
+                if col == "google_maps_url" or not _different_place(row, n):
+                    return row
     key = n.get("name_key")
     if key:
         name_part, _, city_part = key.partition("|")
         for r in conn.execute(f"SELECT * FROM leads WHERE name_key LIKE ?{excl}", (name_part + "|%", *xp)).fetchall():
             row_city = (r["name_key"] or "").partition("|")[2]
-            if not city_part or not row_city or city_part == row_city:
+            if (not city_part or not row_city or city_part == row_city) and not _conflicts(r, n):
                 return r
     return None
+
+
+def already_emailed(email, exclude_id):
+    """Another lead with this exact address that has already been emailed, or None."""
+    if not email:
+        return None
+    with get_conn() as conn:
+        r = conn.execute("SELECT id, business_name FROM leads WHERE lower(email) = lower(?) AND id != ? "
+                         "AND (send_status = 'sent' OR sent_at IS NOT NULL) LIMIT 1", (email, exclude_id)).fetchone()
+    return dict(r) if r else None
+
+
+def branches_of(lead):
+    """Other leads that are probably branches of the same business (shared phone or website)."""
+    conds, params = [], []
+    for col in ("phone", "website_domain"):
+        if lead.get(col):
+            conds.append(f"{col} = ?")
+            params.append(lead[col])
+    if not conds:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(f"SELECT id, business_name, address, stage, send_status FROM leads "
+                            f"WHERE ({' OR '.join(conds)}) AND id != ? ORDER BY id LIMIT 50",
+                            (*params, lead["id"])).fetchall()
+    return [dict(r) for r in rows]
 
 
 def _write_data(conn, lead_id, merged, extra=None):
     """Normalise a merged lead dict and write all data columns, plus the
     derived channel and score. `extra` = additional column values to set."""
-    n = schema.normalize_lead(merged)
-    score, reasons = schema.score_lead(n)
+    cc, favor = _campaign_prefs(conn, merged.get("campaign") or "")
+    with schema.calling_code(cc):
+        n = schema.normalize_lead(merged)
+    score, reasons = schema.score_lead(n, favor)
     cols = {c: n[c] for c in schema.DATA_COLUMNS}
     cols["score"], cols["score_reasons"] = score, reasons
     if not merged.get("channel_locked"):
@@ -424,14 +563,16 @@ def _write_data(conn, lead_id, merged, extra=None):
 def upsert_lead(raw, campaign="", source="", query=""):
     """Insert a lead, or merge into an existing one (blank fields only -- a
     value you already have is never overwritten). Returns (id, is_new)."""
-    n = schema.normalize_lead(raw)
     with get_conn() as conn:
+        cc, favor = _campaign_prefs(conn, canonical_campaign(conn, campaign))
+        with schema.calling_code(cc):
+            n = schema.normalize_lead(raw)
         existing = find_existing(conn, n)
         if existing:
             merged = dict(existing)
             changed = False
             for k in schema.DATA_COLUMNS:
-                if k in ("has_website", "website_domain", "name_key"):
+                if k in schema.DERIVED_COLUMNS:
                     continue
                 cur, new = merged.get(k), n.get(k)
                 if k == "review_count":
@@ -450,7 +591,7 @@ def upsert_lead(raw, campaign="", source="", query=""):
         now = schema.now_iso()
         campaign = canonical_campaign(conn, campaign)
         ensure_campaign(conn, campaign)
-        score, reasons = schema.score_lead(n)
+        score, reasons = schema.score_lead(n, favor)
         row = {c: n[c] for c in schema.DATA_COLUMNS}
         row.update({
             "campaign": campaign, "source": source or "", "last_query": query or "",
@@ -683,12 +824,15 @@ def replies_waiting(campaign="", limit=25):
         params.append(campaign)
     with get_conn() as conn:
         rows = conn.execute(
-            f"""SELECT l.id, l.business_name, l.campaign, l.channel, l.email, l.phone, l.updated_at,
+            f"""SELECT l.id, l.business_name, l.campaign, l.channel, l.email, l.phone, l.updated_at, l.reply_category,
                        (SELECT e.detail FROM events e WHERE e.lead_id = l.id AND e.kind = 'reply'
                         ORDER BY e.id DESC LIMIT 1) AS reply,
                        (SELECT e.created_at FROM events e WHERE e.lead_id = l.id AND e.kind IN ('reply', 'stage')
                         ORDER BY e.id DESC LIMIT 1) AS replied_at
-                FROM leads l WHERE {where} ORDER BY replied_at DESC, l.id DESC LIMIT ?""", (*params, limit)).fetchall()
+                FROM leads l WHERE {where}
+                ORDER BY CASE l.reply_category WHEN 'interested' THEN 0 WHEN 'question' THEN 1 WHEN 'wrong_person' THEN 2
+                         WHEN 'not_now' THEN 4 WHEN 'not_interested' THEN 5 ELSE 3 END,
+                         replied_at DESC, l.id DESC LIMIT ?""", (*params, limit)).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -856,7 +1000,8 @@ def stats(campaign=""):
 # message templates and channel order. Anything a campaign doesn't set falls back
 # to the account-wide Settings.
 
-CAMPAIGN_FIELDS = ("description", "status", "criteria", "business_info", "templates", "channel_priority")
+CAMPAIGN_FIELDS = ("description", "status", "criteria", "business_info", "templates", "channel_priority",
+                   "country_code", "score_no_website")
 
 
 def _campaign_row(r):
@@ -935,6 +1080,12 @@ def save_campaign(name, fields):
             if k == "channel_priority":
                 v = [c for c in (v or []) if c in schema.CHANNELS and c != "unknown"]
                 v = json.dumps(v) if v else ""
+            elif k == "country_code":
+                v = re.sub(r"\D", "", str(v or ""))
+                if v and not (1 <= len(v) <= 4):
+                    raise ValueError("Country code should be 1-4 digits, e.g. 971 for the UAE")
+            elif k == "score_no_website":
+                v = v if v in ("yes", "no") else ""
             elif k == "templates":
                 v = [t for t in (v or []) if (t.get("name") or "").strip() and (t.get("body") or "").strip()
                      and t.get("channel") in schema.CHANNELS]
@@ -948,7 +1099,32 @@ def save_campaign(name, fields):
             conn.execute(f"UPDATE campaigns SET {', '.join(sets)} WHERE name = ?", (*vals, name))
     if "channel_priority" in fields:
         recompute_channels(name)
+    if "country_code" in fields or "score_no_website" in fields:
+        refresh_campaign_leads(name, reread_phones="country_code" in fields)
     return get_campaign(name)
+
+
+def rescore_all():
+    """Recompute every lead's score (after the account-wide scoring choice changes)."""
+    with get_conn() as conn:
+        ids = [r["id"] for r in conn.execute("SELECT id FROM leads").fetchall()]
+    with batch():
+        for i in ids:
+            update_lead(i, {})
+
+
+def refresh_campaign_leads(campaign, reread_phones=False):
+    """Recompute score/channel for a campaign's leads (after its scoring or country changes);
+    reread_phones also re-reads numbers that were written without a country code."""
+    with get_conn() as conn:
+        rows = conn.execute("SELECT id, phone_raw FROM leads WHERE campaign = ?", (campaign,)).fetchall()
+    with batch():
+        for r in rows:
+            raw = (r["phone_raw"] or "").strip()
+            if reread_phones and raw and not raw.startswith(("+", "00")):
+                update_lead(r["id"], {"phone": raw})
+            else:
+                update_lead(r["id"], {})
 
 
 def set_campaign_criteria(name, criteria):

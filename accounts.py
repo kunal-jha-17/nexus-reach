@@ -101,7 +101,7 @@ CONNECTION_FIELDS = [
     ("LLM_PROVIDER", False), ("GROQ_API_KEY", True), ("GROQ_MODEL", False),
     ("OPENAI_API_KEY", True), ("OPENAI_MODEL", False), ("GEMINI_API_KEY", True), ("GEMINI_MODEL", False),
     ("SMTP_USER", False), ("SMTP_PASS", True), ("GMAIL_REFRESH_TOKEN", True), ("SMTP_HOST", False), ("SMTP_PORT", False),
-    ("SMTP_FROM_NAME", False), ("IMAP_USER", False), ("IMAP_PASS", True), ("IMAP_HOST", False),
+    ("SMTP_FROM_NAME", False), ("SMTP_FROM_EMAIL", False), ("EMAIL_SEND_VIA", False), ("IMAP_USER", False), ("IMAP_PASS", True), ("IMAP_HOST", False),
     ("SERPAPI_KEY", True), ("SERPAPI_MONTHLY_LIMIT", False),
     ("IG_USERNAME", False), ("IG_PASSWORD", True),
     ("DEFAULT_COUNTRY_CODE", False),
@@ -397,7 +397,8 @@ def delete_user(user_id):
 # ------------------------------------------------------------- credentials
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.\-]{0,251}[A-Za-z0-9])?$")
-_MAIL_PORTS = {"25", "465", "587", "2525", "143", "993"}
+_MAIL_PORTS = {"25", "465", "587", "2525", "2587", "2465", "143", "993"}
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[A-Za-z]{2,}$")
 
 
 def _validate_secret(name, value):
@@ -405,6 +406,10 @@ def _validate_secret(name, value):
         raise ValueError(f"'{value}' doesn't look like a mail server name (for example smtp.gmail.com).")
     if name == "SMTP_PORT" and value not in _MAIL_PORTS:
         raise ValueError("Mail server port must be one of: " + ", ".join(sorted(_MAIL_PORTS, key=int)) + ".")
+    if name == "SMTP_FROM_EMAIL" and not _EMAIL_RE.match(value):
+        raise ValueError(f"'{value}' doesn't look like an email address.")
+    if name == "EMAIL_SEND_VIA" and value not in ("auto", "smtp", "gmail_api"):
+        raise ValueError("Send through must be auto, smtp or gmail_api.")
     if name == "SERPAPI_MONTHLY_LIMIT" and not value.isdigit():
         raise ValueError("Searches per month must be a number.")
     if name == "DEFAULT_COUNTRY_CODE" and not re.fullmatch(r"\+?[1-9]\d{0,3}", value):
