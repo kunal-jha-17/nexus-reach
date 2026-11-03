@@ -135,6 +135,8 @@ def run_scheduler_once(launch_scrape, check_replies=None):
     """Start any recurring scrape that's due -- and look for replies -- for every user, each as
     that user. One person's failure (a full queue, a mailbox that's down) never stops the rest."""
     for user in accounts.all_users():
+        if (user.get("workspace_id") or user["id"]) != user["id"]:
+            continue                      # in someone's team: the owner's turn covers that workspace
         try:
             with userctx.use(user, accounts.db_path_for(user["id"])):
                 for s in db.due_schedules():

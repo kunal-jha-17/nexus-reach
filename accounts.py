@@ -167,6 +167,13 @@ def ensure():
             cols = {r[1] for r in c.execute("PRAGMA table_info(users)").fetchall()}
             if "secrets_backup" not in cols:
                 c.execute("ALTER TABLE users ADD COLUMN secrets_backup TEXT DEFAULT ''")
+            for col, ddl in (("totp_enc", "TEXT DEFAULT ''"), ("totp_backup", "TEXT DEFAULT ''"),
+                             ("workspace_id", "INTEGER"), ("role", "TEXT DEFAULT ''"), ("plan", "TEXT DEFAULT ''")):
+                if col not in cols:
+                    c.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
+            c.execute("""CREATE TABLE IF NOT EXISTS invites (
+                token TEXT PRIMARY KEY, workspace_id INTEGER, email TEXT, role TEXT,
+                invited_by INTEGER, created_at TEXT, expires_at TEXT, used_at TEXT)""")
             c.commit()
         finally:
             c.close()
@@ -200,9 +207,14 @@ def _unreadable(row):
 # ------------------------------------------------------------------- users
 
 def _ctx_user(row):
+    keys = row.keys()
+    ws = row["workspace_id"] if "workspace_id" in keys and row["workspace_id"] else row["id"]
     return {"id": row["id"], "email": row["email"], "name": row["name"] or "",
             "is_admin": bool(row["is_admin"]), "secrets": _load_secrets(row),
             "secrets_unreadable": _unreadable(row),
+            "workspace_id": ws, "role": ("owner" if ws == row["id"] else (row["role"] or "member")),
+            "plan": (row["plan"] if "plan" in keys else "") or "",
+            "totp": bool("totp_enc" in keys and row["totp_enc"]),
             # changes when the password changes, so old sessions stop working
             "pv": hashlib.sha256(row["password_hash"].encode()).hexdigest()[:12]}
 
@@ -285,11 +297,16 @@ def _adopt_legacy(target_path):
         return False
 
 
-def create_user(email, password, name="", code="", local=True):
+def create_user(email, password, name="", code="", local=True, invite=""):
     policy = signup_policy(local)
-    if not policy["allowed"]:
+    inv = invite_info(invite) if invite else None
+    if inv and schema.norm_email(email) != inv["email"]:
+        raise ValueError(f"This invite is for {inv['email']} -- sign up with that address.")
+    if inv:
+        pass                                   # an invited teammate can join even when open sign-up is off
+    elif not policy["allowed"]:
         raise ValueError("This server has reached its user limit." if policy["full"] else "Sign-ups are closed on this server.")
-    if policy["needs_code"]:
+    elif policy["needs_code"]:
         want = config._server_env("SIGNUP_CODE") or _setup_code
         if not pysecrets.compare_digest(code or "", want):
             raise CodeError("That code isn't right." if policy["code_kind"] == "invite"
@@ -316,6 +333,9 @@ def create_user(email, password, name="", code="", local=True):
     user = get_user(uid)
     with userctx.use(user, path):
         db.init_db()
+    if inv:
+        accept_invite(invite, user)
+        user = get_user(uid)
     return user
 
 
@@ -376,8 +396,11 @@ def admin_list_users():
             pass
         with _conn() as c2:
             r = c2.execute("SELECT created_at, last_login_at FROM users WHERE id = ?", (u["id"],)).fetchone()
+        import plans
         out.append({"id": u["id"], "email": u["email"], "name": u["name"], "is_admin": u["is_admin"],
-                    "leads": leads, "created_at": r["created_at"], "last_login_at": r["last_login_at"]})
+                    "leads": leads, "created_at": r["created_at"], "last_login_at": r["last_login_at"],
+                    "plan": plans.plan_name(u), "team_of": u["workspace_id"] if u["workspace_id"] != u["id"] else None,
+                    "totp": u["totp"]})
     return out
 
 
@@ -385,6 +408,8 @@ def delete_user(user_id):
     """Remove an account and its database file. Irreversible."""
     with _conn() as c:
         n = c.execute("DELETE FROM users WHERE id = ?", (user_id,)).rowcount
+        c.execute("UPDATE users SET workspace_id = NULL, role = '' WHERE workspace_id = ?", (user_id,))
+        c.execute("DELETE FROM invites WHERE workspace_id = ?", (user_id,))
     base = db_path_for(user_id)
     for suffix in ("", "-wal", "-shm"):
         try:
@@ -506,3 +531,238 @@ def record_failure(key):
 
 def clear_failures(key):
     _attempts.pop(key, None)
+
+
+# ------------------------------------------------------------ password reset links
+
+RESET_HOURS = 2
+
+
+def _sign(text):
+    import hmac
+    key = secret_key()
+    key = key.encode() if isinstance(key, str) else key
+    return hmac.new(key, text.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def reset_token(email):
+    """A link token for 'forgot password', or None for an unknown address. It stops working after
+    RESET_HOURS, or as soon as the password changes (it's signed together with the password)."""
+    row = _find(email)
+    if not row:
+        return None
+    exp = int(time.time()) + RESET_HOURS * 3600
+    pv = hashlib.sha256(row["password_hash"].encode()).hexdigest()[:12]
+    return f"{row['id']}.{exp}.{_sign('reset|' + str(row['id']) + '|' + str(exp) + '|' + pv)}"
+
+
+def reset_password(token, new):
+    import hmac
+    try:
+        uid, exp, sig = str(token or "").split(".")
+        uid, exp = int(uid), int(exp)
+    except ValueError:
+        raise ValueError("That reset link isn't valid. Ask for a new one.")
+    if exp < time.time():
+        raise ValueError("That reset link has expired. Ask for a new one.")
+    with _conn() as c:
+        row = c.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+        if not row:
+            raise ValueError("That reset link isn't valid. Ask for a new one.")
+        pv = hashlib.sha256(row["password_hash"].encode()).hexdigest()[:12]
+        if not hmac.compare_digest(_sign(f"reset|{uid}|{exp}|{pv}"), sig):
+            raise ValueError("That reset link has already been used or isn't valid. Ask for a new one.")
+        check_password(new, row["email"])
+        c.execute("UPDATE users SET password_hash = ? WHERE id = ?", (generate_password_hash(new, method=PW_METHOD), uid))
+    return get_user(uid)
+
+
+# ------------------------------------------------------------ two-step sign-in (authenticator app)
+
+def _totp_at(secret_b32, t):
+    import base64
+    import hmac
+    import struct
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    msg = struct.pack(">Q", int(t // 30))
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    o = h[-1] & 0x0F
+    return f"{(struct.unpack('>I', h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000:06d}"
+
+
+def totp_ok(secret_b32, code, now=None):
+    """RFC 6238 code check, allowing one 30-second step either side for a slow phone clock."""
+    import hmac
+    code = re.sub(r"\s", "", str(code or ""))
+    if not re.fullmatch(r"\d{6}", code):
+        return False
+    t = now if now is not None else time.time()
+    return any(hmac.compare_digest(_totp_at(secret_b32, t + d * 30), code) for d in (-1, 0, 1))
+
+
+def new_totp_secret():
+    import base64
+    return base64.b32encode(pysecrets.token_bytes(20)).decode().rstrip("=")
+
+
+def totp_uri(secret_b32, email):
+    from urllib.parse import quote
+    return f"otpauth://totp/{quote('Nexus Reach')}:{quote(email)}?secret={secret_b32}&issuer={quote('Nexus Reach')}"
+
+
+def enable_totp(user_id, secret_b32, code):
+    """Switch two-step sign-in on (after proving the app shows the right code). Returns 8 backup codes,
+    shown once; each signs in one time if the phone is lost."""
+    if not totp_ok(secret_b32, code):
+        raise ValueError("That code doesn't match. Check the time on your phone and try the newest code.")
+    backups = [f"{pysecrets.randbelow(10 ** 8):08d}" for _ in range(8)]
+    hashed = [hashlib.sha256(b.encode()).hexdigest() for b in backups]
+    with _conn() as c:
+        c.execute("UPDATE users SET totp_enc = ?, totp_backup = ? WHERE id = ?",
+                  (cryptobox.encrypt_text(secret_b32), json.dumps(hashed), user_id))
+    return backups
+
+
+def disable_totp(user_id, password):
+    with _conn() as c:
+        row = c.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row or not check_password_hash(row["password_hash"], password or ""):
+            raise ValueError("Your password isn't right.")
+        c.execute("UPDATE users SET totp_enc = '', totp_backup = '' WHERE id = ?", (user_id,))
+
+
+def check_second_factor(user_id, code):
+    """True for a current authenticator code or an unused backup code (which is then used up)."""
+    with _conn() as c:
+        row = c.execute("SELECT totp_enc, totp_backup FROM users WHERE id = ?", (user_id,)).fetchone()
+        if not row or not row["totp_enc"]:
+            return True
+        secret = cryptobox.decrypt_text(row["totp_enc"])
+        if secret and totp_ok(secret, code):
+            return True
+        digits = re.sub(r"\D", "", str(code or ""))
+        hashed = json.loads(row["totp_backup"] or "[]")
+        h = hashlib.sha256(digits.encode()).hexdigest()
+        if len(digits) == 8 and h in hashed:
+            hashed.remove(h)
+            c.execute("UPDATE users SET totp_backup = ? WHERE id = ?", (json.dumps(hashed), user_id))
+            return True
+    return False
+
+
+# ------------------------------------------------------------------- teams
+# A team is one person's workspace (their leads, campaigns, settings and connections) shared with
+# the people they invite. users.workspace_id points a teammate at the owner; NULL = their own.
+ROLES = ("admin", "member")
+INVITE_DAYS = 7
+
+
+def team_of(workspace_id):
+    with _conn() as c:
+        rows = c.execute("SELECT * FROM users WHERE id = ? OR workspace_id = ? ORDER BY (id != ?), id",
+                         (workspace_id, workspace_id, workspace_id)).fetchall()
+    return [{"id": r["id"], "email": r["email"], "name": r["name"] or "",
+             "role": "owner" if r["id"] == workspace_id else (r["role"] or "member"),
+             "last_login_at": r["last_login_at"]} for r in rows]
+
+
+def create_invite(workspace_id, email, role, invited_by):
+    email = schema.norm_email(email)
+    if not email:
+        raise ValueError("Enter the email address to invite.")
+    if role not in ROLES:
+        raise ValueError("Role must be admin or member.")
+    if any(m["email"] == email for m in team_of(workspace_id)):
+        raise ValueError("That person is already in the team.")
+    token = pysecrets.token_urlsafe(24)
+    now = time.time()
+    with _conn() as c:
+        c.execute("DELETE FROM invites WHERE workspace_id = ? AND email = ? AND used_at IS NULL", (workspace_id, email))
+        c.execute("INSERT INTO invites(token, workspace_id, email, role, invited_by, created_at, expires_at) VALUES(?,?,?,?,?,?,?)",
+                  (token, workspace_id, email, role, invited_by, schema.now_iso(),
+                   time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now + INVITE_DAYS * 86400))))
+    return token
+
+
+def invite_info(token):
+    """The open invite for this token, or None (used, expired or unknown)."""
+    if not token:
+        return None
+    with _conn() as c:
+        r = c.execute("SELECT * FROM invites WHERE token = ? AND used_at IS NULL", (token,)).fetchone()
+    if not r or r["expires_at"] < time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()):
+        return None
+    owner = get_user(r["workspace_id"])
+    if not owner:
+        return None
+    return {"token": r["token"], "workspace_id": r["workspace_id"], "email": r["email"], "role": r["role"],
+            "owner_email": owner["email"], "owner_name": owner["name"]}
+
+
+def pending_invites(workspace_id):
+    with _conn() as c:
+        rows = c.execute("SELECT token, email, role, created_at, expires_at FROM invites WHERE workspace_id = ? "
+                         "AND used_at IS NULL ORDER BY created_at DESC", (workspace_id,)).fetchall()
+    now = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+    return [dict(r) for r in rows if r["expires_at"] >= now]
+
+
+def cancel_invite(workspace_id, token):
+    with _conn() as c:
+        c.execute("DELETE FROM invites WHERE workspace_id = ? AND token = ? AND used_at IS NULL", (workspace_id, token))
+
+
+def accept_invite(token, user):
+    inv = invite_info(token)
+    if not inv:
+        raise ValueError("That invite has expired or was already used. Ask for a new one.")
+    if user["email"] != inv["email"]:
+        raise ValueError(f"This invite is for {inv['email']}, but you're signed in as {user['email']}.")
+    if inv["workspace_id"] == user["id"]:
+        raise ValueError("That's your own team.")
+    with _conn() as c:
+        if c.execute("SELECT 1 FROM users WHERE workspace_id = ?", (user["id"],)).fetchone():
+            raise ValueError("You own a team with other people in it -- remove them before joining another team.")
+        c.execute("UPDATE users SET workspace_id = ?, role = ? WHERE id = ?", (inv["workspace_id"], inv["role"], user["id"]))
+        c.execute("UPDATE invites SET used_at = ? WHERE token = ?", (schema.now_iso(), token))
+    return inv
+
+
+def set_member_role(workspace_id, user_id, role):
+    if role not in ROLES:
+        raise ValueError("Role must be admin or member.")
+    with _conn() as c:
+        n = c.execute("UPDATE users SET role = ? WHERE id = ? AND workspace_id = ?", (role, user_id, workspace_id)).rowcount
+    if not n:
+        raise ValueError("That person isn't in this team.")
+
+
+def remove_member(workspace_id, user_id):
+    """Take someone out of the team: they go back to their own (separate) workspace."""
+    with _conn() as c:
+        n = c.execute("UPDATE users SET workspace_id = NULL, role = '' WHERE id = ? AND workspace_id = ?",
+                      (user_id, workspace_id)).rowcount
+    if not n:
+        raise ValueError("That person isn't in this team.")
+
+
+def data_context(user):
+    """(the user whose data and connections this person works with, its database path).
+    A teammate works in the owner's workspace; everyone else in their own."""
+    ws = user.get("workspace_id") or user["id"]
+    if ws != user["id"]:
+        owner = get_user(ws)
+        if owner:
+            ctx = dict(owner)
+            ctx["actor"] = {"id": user["id"], "email": user["email"], "name": user["name"], "role": user["role"]}
+            return ctx, db_path_for(ws)
+    return user, db_path_for(user["id"])
+
+
+def set_plan(user_id, plan):
+    import plans
+    if plan not in plans.all_plans():
+        raise ValueError("Unknown plan.")
+    with _conn() as c:
+        if not c.execute("UPDATE users SET plan = ? WHERE id = ?", (plan, user_id)).rowcount:
+            raise ValueError("No such user.")

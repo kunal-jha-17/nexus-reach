@@ -335,12 +335,14 @@
           <h2>2. Send the emails</h2>
           <div id="em-status"></div>
           <div class="row">
-            <div class="field"><label for="em-limit">Emails a day <span class="muted">(all campaigns)</span></label>
-              <div class="row-tight"><input id="em-limit" type="number" min="1" max="100000" inputmode="numeric">
-                <button class="btn small" id="em-limit-save" type="button">Save</button></div></div>
-            <div class="field"><label for="em-max">Send at most <span class="muted">(this run; blank = up to today's limit)</span></label>
-              <input id="em-max" type="number" min="1" max="100000" inputmode="numeric" placeholder="no extra cap"></div>
+            <div class="field"><label for="em-count">How many emails</label>
+              <input id="em-count" type="number" min="1" max="100000" inputmode="numeric" placeholder="e.g. 200"></div>
+            <div class="field"><label for="em-mode">When</label>
+              <select id="em-mode"><option value="once">Once, now</option><option value="daily">Every day</option></select></div>
+            <div class="field" id="em-days-field" hidden><label for="em-days">For how many days</label>
+              <input id="em-days" type="number" min="1" max="90" value="7" inputmode="numeric"></div>
           </div>
+          <p class="hint" id="em-plan-note"></p>
           <div class="checks">
             <label class="check"><input type="checkbox" id="em-onlyfit"> <span>Only leads judged as Fits</span></label>
           </div>
@@ -527,7 +529,8 @@
             <p class="hint" style="margin:0">Add more mailboxes and the day's emails are shared between them &mdash; each with its own
               daily limit and warm-up. Five Workspace mailboxes at 400 a day send 2,000 a day together. A follow-up always
               leaves from the inbox the first email came from, and replies are checked in every inbox.</p></div>
-            <button class="btn" id="ib-add" type="button">Add an inbox</button></div>
+            <div class="row-tight"><button class="btn" id="ib-add-gmail" type="button" hidden>Add a Gmail inbox</button>
+              <button class="btn" id="ib-add" type="button">Add an inbox</button></div></div>
           <div id="ib-list"></div>
           <form id="ib-form" class="tpl" hidden autocomplete="off">
             <h3 id="ib-form-title">New inbox</h3>
@@ -582,6 +585,47 @@
                 <button type="button" class="pw-eye" data-toggle="pw-confirm" aria-label="Show password">&#128065;</button></div></div>
             <button class="btn" id="pw-save">Change password</button>
           </div>
+        </div>
+        <div class="grid two">
+          <div class="card" id="tf-card">
+            <h2>Two-step sign-in <span class="chip" id="tf-chip">off</span></h2>
+            <p class="hint">After your password, sign-in also asks for a 6-digit code from an authenticator app on your phone
+               (Google Authenticator, Microsoft Authenticator, Authy, 1Password ...). Someone who learns your password still can't get in.</p>
+            <div id="tf-off">
+              <button class="btn" id="tf-start" type="button">Turn on</button>
+              <div id="tf-setup" hidden>
+                <ol class="steps">
+                  <li>In your authenticator app choose <b>Add account → Enter a setup key</b> (or open <a id="tf-uri" href="#">this link</a> on your phone).</li>
+                  <li>Account name: <b>Nexus Reach</b>. Key: <code id="tf-secret" class="selectable"></code> (time-based).</li>
+                  <li>Type the 6-digit code the app now shows:</li>
+                </ol>
+                <div class="row-tight"><input id="tf-code" inputmode="numeric" maxlength="6" placeholder="123456" autocomplete="one-time-code">
+                  <button class="btn primary" id="tf-enable" type="button">Confirm</button></div>
+              </div>
+              <div id="tf-backups" class="notice" hidden></div>
+            </div>
+            <div id="tf-on" hidden>
+              <div class="field"><label for="tf-pw">Your password, to turn it off</label>
+                <div class="row-tight"><input id="tf-pw" type="password" autocomplete="current-password">
+                  <button class="btn" id="tf-disable" type="button">Turn off</button></div></div>
+            </div>
+          </div>
+          <div class="card" id="plan-card">
+            <h2>Your plan <span class="chip info" id="plan-name"></span></h2>
+            <div id="plan-usage"></div>
+          </div>
+        </div>
+        <div class="card" id="team-card">
+          <h2>Team <span class="count-badge" id="team-n" hidden></span></h2>
+          <p class="hint" id="team-hint">Invite the people you work with. Everyone in the team sees and works the same leads, campaigns and replies;
+             <b>admins</b> can also change settings, connections and the team, <b>members</b> can't.</p>
+          <div id="team-list"></div>
+          <div class="row" id="team-invite-row">
+            <div class="field"><label for="team-email">Invite by email</label><input id="team-email" type="email" placeholder="colleague@yourcompany.com"></div>
+            <div class="field"><label for="team-role">Role</label><select id="team-role"><option value="member">Member</option><option value="admin">Admin</option></select></div>
+            <button class="btn" id="team-invite" type="button" style="margin-bottom:12px">Send invite</button>
+          </div>
+          <div id="team-link" class="notice" hidden></div>
         </div>
         <div class="card" id="st-storage-card" hidden>
           <h2>Storage &amp; backups <span class="chip info">admin</span></h2>

@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ 'Terms of use' if page == 'terms' else 'Privacy policy' }} · Nexus Reach</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="site">
+<header class="site-head">
+  <a class="site-brand" href="/welcome"><img src="/static/img/logo-mark.png" alt="" width="26" height="26"> Nexus Reach</a>
+  <nav><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a class="btn small" href="/login">Sign in</a></nav>
+</header>
+<main class="legal">
+{% if page == 'terms' %}
+  <h1>Terms of use</h1>
+  <p class="muted">Last updated {{ updated }}. Nexus Reach is run by {{ company }}.</p>
+  <h2>Using Nexus Reach</h2>
+  <p>Nexus Reach helps you find businesses, organise them as leads and contact them. You are responsible for the lists you import or
+     collect, the messages you send and the accounts you connect, and for following the laws that apply to you and to the people you
+     contact &mdash; including anti-spam and data-protection laws such as CAN-SPAM, the GDPR, the UAE's PDPL and India's DPDP Act.</p>
+  <h2>What you may not do</h2>
+  <ul>
+    <li>Send messages to people who asked not to be contacted, or hide who you are.</li>
+    <li>Use Nexus Reach for scams, harassment, illegal products or anything that breaks a third party's terms you agreed to
+        (for example your email provider's or a website's).</li>
+    <li>Try to break, overload or get around the limits of the service or other people's accounts.</li>
+  </ul>
+  <h2>Your account and data</h2>
+  <p>Keep your password and connected keys safe. Your leads and settings are yours: you can download them at any time
+     (Settings &gt; Account &gt; Download my data) and delete your account. We may suspend accounts that break these terms.</p>
+  <h2>Plans and changes</h2>
+  <p>Plans set limits on leads, emails, inboxes and team size. We may change these terms; we'll say so in the app before changes take effect.</p>
+  <h2>No warranty</h2>
+  <p>Nexus Reach is provided as is. We aren't liable for lost business, for how third-party services (email providers, Google, Apify,
+     AI providers) treat your account, or for delivery of any message.</p>
+{% else %}
+  <h1>Privacy policy</h1>
+  <p class="muted">Last updated {{ updated }}. Nexus Reach is run by {{ company }}.</p>
+  <h2>What we keep</h2>
+  <ul>
+    <li><b>Your account:</b> name, email address, an encrypted password hash, and whether two-step sign-in is on.</li>
+    <li><b>Your workspace:</b> the leads, campaigns, messages, settings and activity you create or import.</li>
+    <li><b>Your connections:</b> API keys and email logins you add, stored encrypted and never shown back after saving.</li>
+  </ul>
+  <h2>Business contact data</h2>
+  <p>Leads are businesses' public listing and contact details that you collect or import. When someone replies STOP or uses the
+     unsubscribe link in an email, they're added to that workspace's do-not-contact list and aren't contacted again from it.
+     Anyone can ask us to remove their details: contact the address below.</p>
+  <h2>Who else sees data</h2>
+  <p>Only the services you connect, to do what you ask: your email provider (to send and read replies), the AI provider you choose
+     (lead details, to judge fit and write messages), Apify and SerpAPI (searches), and our hosting and encrypted backup storage.
+     We don't sell data.</p>
+  <h2>Your choices</h2>
+  <p>Download everything from Settings &gt; Account, delete individual leads at any time, or delete your account (which deletes its data).</p>
+{% endif %}
+  {% if contact %}<p>Questions: <a href="mailto:{{ contact }}">{{ contact }}</a></p>{% endif %}
+  <p class="hint">This is a starting template, not legal advice &mdash; have it reviewed for your business and the countries you work in.</p>
+</main>
+<footer class="site-foot"><span>&copy; 2026 Nexus Reach</span><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/welcome">Home</a></footer>
+</body>
+</html>

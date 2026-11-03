@@ -320,7 +320,8 @@ DEFAULT_SETTINGS = {
     "auto_pace": False,              # spread the day's emails evenly over the sending window
     "max_bounce_rate": 5,
     "followup_steps": [],
-    "inbox_state": {},               # extra inboxes: {id: {"started_at": ..., "imap_state": {...}}}            # [{days, body}] -- a sequence; empty = one message, max_followups times            # % of recent emails bouncing at which sending pauses (0 = never)
+    "inbox_state": {},
+    "send_plan": {},                 # a repeating send: {count, days, campaign, only_fit, start_day, until_day, last_day, active}               # extra inboxes: {id: {"started_at": ..., "imap_state": {...}}}            # [{days, body}] -- a sequence; empty = one message, max_followups times            # % of recent emails bouncing at which sending pauses (0 = never)
     "exact_templates": False,        # draft by filling in the template's blanks, with no AI rewriting
     "followup_template": "",         # fixed follow-up text (placeholders allowed); blank = the AI writes one
     "reply_check_minutes": 30,       # look for replies on a timer when the inbox is connected; 0 = only by hand
@@ -587,9 +588,13 @@ def upsert_lead(raw, campaign="", source="", query=""):
             return existing["id"], False
 
         cap = config.env_int("MAX_LEADS_PER_USER", 5000)          # 0 = unlimited
+        import plans
+        plan_cap = plans.cap("leads")
+        if plan_cap is not None:
+            cap = min(cap, plan_cap) if cap else plan_cap
         if cap and conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0] >= cap:
-            raise LimitError(f"You've reached this server's limit of {cap} leads per account. Export a CSV, then delete "
-                             "leads you no longer need (or ask the admin to raise MAX_LEADS_PER_USER).")
+            raise LimitError(f"You've reached the limit of {cap:,} leads for this account. Export a CSV, then delete "
+                             "leads you no longer need -- or upgrade the plan (ask the admin).")
         now = schema.now_iso()
         campaign = canonical_campaign(conn, campaign)
         ensure_campaign(conn, campaign)
@@ -955,6 +960,15 @@ def local_zone(settings=None):
         except Exception:  # noqa: BLE001 -- unknown name, or no time-zone data on this machine
             pass
     return timezone.utc
+
+
+def count_jobs_today(kind, settings=None):
+    """How many runs of this kind were started today (the account's own calendar day)."""
+    now = datetime.now(local_zone(settings))
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    with get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM jobs WHERE kind = ? AND created_at >= ?",
+                            (kind, start.isoformat(timespec="seconds"))).fetchone()[0]
 
 
 def count_events_today(kinds, settings=None):

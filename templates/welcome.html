@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Nexus Reach · Find, qualify and reach local businesses</title>
+<meta name="description" content="Nexus Reach finds local businesses on Google Maps, checks which ones fit what you sell, writes a personal message for each, and sends it by email or WhatsApp.">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png">
+<link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="site">
+<header class="site-head">
+  <a class="site-brand" href="/welcome"><img src="/static/img/logo-mark.png" alt="" width="26" height="26"> Nexus Reach</a>
+  <nav><a href="#how">How it works</a><a href="#plans">Plans</a><a class="btn small" href="/login">Sign in</a></nav>
+</header>
+
+<main>
+  <section class="hero">
+    <h1>Find local businesses that need you, and reach them in their language.</h1>
+    <p class="lede">Nexus Reach pulls clinics, salons, restaurants and shops from Google Maps, checks which ones fit what you sell,
+       writes a personal first message for each, and sends it by email &mdash; or hands you WhatsApp and Instagram messages to send in one click.
+       Built for agencies selling to local businesses in the UAE, India and beyond.</p>
+    <div class="row-tight"><a class="btn primary" href="/login">Create a free account</a><a class="btn" href="#how">See how it works</a></div>
+  </section>
+
+  <section id="how" class="site-grid">
+    <div class="card"><h2>1. Find</h2><p>Search Google Maps by trade and city &mdash; hundreds of places at a time &mdash; or import any spreadsheet
+      (JustDial, IndiaMART, Outscraper, your own). Duplicates and chain branches are sorted out for you.</p></div>
+    <div class="card"><h2>2. Qualify</h2><p>Emails and social profiles are found on each business's own website. An AI reads your idea of a good client and
+      marks who fits, so you only write to the ones worth it.</p></div>
+    <div class="card"><h2>3. Reach</h2><p>A personal message per lead, sent from your own mailboxes with warm-up, pacing, follow-up sequences and
+      one-click unsubscribe. Mobiles get WhatsApp, landlines get a call.</p></div>
+    <div class="card"><h2>4. Close</h2><p>Replies are picked up from your inbox and sorted: interested first, then questions, "not now" and "no".
+      See which message and channel actually gets answers.</p></div>
+  </section>
+
+  <section id="plans">
+    <h2 class="site-h2">Plans</h2>
+    <div class="site-grid three">
+      {% for key, p in plans %}
+      <div class="card{{ ' accent' if key == 'pro' else '' }}"><h2>{{ p.label or key }}</h2>
+        <ul class="ticks">
+          <li>{{ '{:,}'.format(p.leads) ~ ' leads' if p.leads else 'Unlimited leads' }}</li>
+          <li>{{ '{:,}'.format(p.emails_per_day) ~ ' emails a day' if p.emails_per_day else 'No daily email cap (your mail provider\'s limits apply)' }}</li>
+          <li>{{ p.inboxes ~ ' sending inbox' ~ ('es' if p.inboxes != 1 else '') if p.inboxes else 'Any number of sending inboxes' }}</li>
+          <li>{{ ('Team of ' ~ p.members) if p.members and p.members > 1 else ('Just you' if p.members == 1 else 'Any team size') }}</li>
+          {% if p.apify %}<li>Google Maps at scale (Apify)</li>{% endif %}
+        </ul></div>
+      {% endfor %}
+    </div>
+    <p class="hint">Contact us to switch plans.</p>
+  </section>
+</main>
+
+<footer class="site-foot"><span>&copy; 2026 Nexus Reach</span><a href="/terms">Terms</a><a href="/privacy">Privacy</a><a href="/login">Sign in</a></footer>
+</body>
+</html>

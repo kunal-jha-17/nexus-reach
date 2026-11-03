@@ -269,12 +269,17 @@ def inbox_capacity(settings=None):
 
 
 def total_daily_limit(settings=None):
-    """Today's limit across every inbox (just the main one's when there are no extras)."""
+    """Today's limit across every inbox (just the main one's when there are no extras), never more
+    than the account's plan allows."""
+    import plans
     settings = settings or db.get_settings()
     caps = inbox_capacity(settings)
     if not caps or (len(caps) == 1 and caps[0][0] is None):
-        return effective_daily_limit(settings)
-    return sum(c for _, c, _ in caps)
+        total = effective_daily_limit(settings)
+    else:
+        total = sum(c for _, c, _ in caps)
+    plan_cap = plans.cap("emails_per_day")
+    return min(total, plan_cap) if plan_cap is not None else total
 
 
 def pick_inbox(settings, inbox_id=None):
@@ -463,6 +468,7 @@ def email_status(settings=None):
         "delay_seconds": send_delay(settings, sent),
         "bounces_7d": dict(zip(("bounced", "sent"), bounce_rate())),
         "unsubscribe_link": bool(public_url()),
+        "plan": send_plan_status(settings),
     }
 
 
@@ -1520,6 +1526,97 @@ def run_draft(ctx, params):
 def _our_side_down(ctx, e):
     ctx.log(f"Stopping: {e}")
     ctx.log("Nothing was marked as failed -- fix the problem above and start sending again.")
+
+
+# ---------------------------------------------------------------- send plans
+MAX_PLAN_DAYS = 90
+
+
+def _local_day(settings, now=None):
+    return (now or datetime.now(timezone.utc)).astimezone(db.local_zone(settings)).date()
+
+
+def make_send_plan(count, mode="once", days=1, campaign="", only_fit=False):
+    """What to send: `count` emails, once now -- or every day for `days` days (today included).
+    A daily plan raises the account's daily limit to `count` if it was lower; the warm-up still
+    applies. Returns the plan saved (daily) or the run's parameters (once)."""
+    try:
+        count = int(count)
+    except (TypeError, ValueError):
+        raise SendError("Enter how many emails to send, e.g. 200.", 400)
+    if not 1 <= count <= 100000:
+        raise SendError("Send between 1 and 100,000 emails.", 400)
+    params = {"campaign": campaign or "", "only_fit": bool(only_fit), "max": count}
+    if mode == "once":
+        return {"mode": "once", "params": params}
+    if mode != "daily":
+        raise SendError("Choose once or every day.", 400)
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        raise SendError("Enter for how many days, e.g. 10.", 400)
+    if not 1 <= days <= MAX_PLAN_DAYS:
+        raise SendError(f"A daily plan runs for 1 to {MAX_PLAN_DAYS} days.", 400)
+    settings = db.get_settings()
+    today = _local_day(settings)
+    plan = {"count": count, "days": days, "campaign": campaign or "", "only_fit": bool(only_fit),
+            "start_day": today.isoformat(), "until_day": (today + timedelta(days=days - 1)).isoformat(),
+            "last_day": "", "runs": 0, "active": True}
+    changes = {"send_plan": plan}
+    if int(settings["email_daily_limit"]) < count:
+        changes["email_daily_limit"] = count
+    db.set_settings(changes)
+    return {"mode": "daily", "plan": plan, "raised_limit": "email_daily_limit" in changes}
+
+
+def stop_send_plan():
+    plan = dict(db.get_settings().get("send_plan") or {})
+    if plan:
+        plan["active"] = False
+        db.set_settings({"send_plan": plan})
+    return plan
+
+
+def send_plan_status(settings=None):
+    """The repeating send as the Outreach page shows it ({} when there is none)."""
+    settings = settings or db.get_settings()
+    plan = dict(settings.get("send_plan") or {})
+    if not plan:
+        return {}
+    today = _local_day(settings).isoformat()
+    if plan.get("active") and today > plan.get("until_day", ""):
+        plan["active"] = False
+        plan["finished"] = True
+    plan["ran_today"] = plan.get("last_day") == today
+    return plan
+
+
+def daily_send_due(settings=None, now=None):
+    """The send-run parameters for today's share of the daily plan, or None. Marks the day as done,
+    so a plan runs at most once a day -- inside the sending hours when those are switched on."""
+    settings = settings or db.get_settings()
+    plan = dict(settings.get("send_plan") or {})
+    if not plan.get("active"):
+        return None
+    today = _local_day(settings, now).isoformat()
+    if today > plan.get("until_day", ""):
+        plan["active"] = False
+        db.set_settings({"send_plan": plan})
+        return None
+    if plan.get("last_day") == today or today < plan.get("start_day", today):
+        return None
+    if not send_window(settings, now)[0] or not smtp_configured():
+        return None
+    return {"campaign": plan.get("campaign", ""), "only_fit": bool(plan.get("only_fit")), "max": int(plan["count"]),
+            "plan_day": today}
+
+
+def mark_plan_ran(day):
+    plan = dict(db.get_settings().get("send_plan") or {})
+    if plan:
+        plan["last_day"] = day
+        plan["runs"] = int(plan.get("runs") or 0) + 1
+        db.set_settings({"send_plan": plan})
 
 
 def run_send_bulk(ctx, params):

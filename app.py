@@ -36,11 +36,14 @@ import llm
 import outreach
 import persistence
 import pipeline
+import plans
 import schema
 import scraper
 import userctx
 
-PUBLIC_PATHS = {"/login", "/api/ping", "/api/auth/status", "/api/auth/login", "/api/auth/signup"}
+PUBLIC_PATHS = {"/", "/login", "/api/ping", "/api/auth/status", "/api/auth/login", "/api/auth/signup",
+                "/api/auth/forgot", "/api/auth/reset", "/reset", "/terms", "/privacy", "/welcome",
+                "/api/auth/invite", "/join"}
 _SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
 # Calls that spend real resources (browser, AI credits, mail) count extra against the rate limit.
 _HEAVY = ("/api/enrich", "/api/judge", "/api/draft", "/api/scrape", "/api/send-bulk", "/api/import",
@@ -49,6 +52,25 @@ _HEAVY = ("/api/enrich", "/api/judge", "/api/draft", "/api/scrape", "/api/send-b
 _CSP = ("default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
         "font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; "
         "frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
+
+
+_MANAGER_PATHS = ("/api/connections", "/api/inboxes", "/api/settings", "/api/team/invite", "/api/team/member",
+                  "/api/suppression", "/oauth/google/start", "/api/admin")
+
+
+def _manager_only(req):
+    """Changes a team member (not an admin) may not make: connections, inboxes, settings, the team,
+    the do-not-contact list, deleting campaigns. Reading is always fine."""
+    path, method = req.path, req.method
+    if path == "/api/connections/test":
+        return False
+    if path.startswith("/oauth/google/start"):
+        return True
+    if method in _SAFE_METHODS:
+        return False
+    if any(path.startswith(p) for p in _MANAGER_PATHS):
+        return True
+    return method == "DELETE" and path.startswith("/api/campaigns/")
 
 
 def create_app(start_threads=True):
@@ -95,12 +117,21 @@ def create_app(start_threads=True):
         return user
 
     def enter(user):
-        """Run the rest of this request as `user`."""
+        """Run the rest of this request as `user` -- working in their team's workspace when they're
+        in one (the owner's leads, settings and connections)."""
         if getattr(g, "ctx_tokens", None):
             userctx.reset_context(g.ctx_tokens)
-        prepare_user_db(user)
+        data_user, path = accounts.data_context(user)
+        prepare_user_db(data_user)
         g.user = user
-        g.ctx_tokens = userctx.set_context(user, accounts.db_path_for(user["id"]))
+        g.ctx_tokens = userctx.set_context(data_user, path)
+
+    def ws_id():
+        """The workspace (account id) whose data and connections this request works with."""
+        return g.user.get("workspace_id") or g.user["id"]
+
+    def can_manage():
+        return g.user.get("role", "owner") in ("owner", "admin")
 
     @app.before_request
     def _guard():
@@ -127,6 +158,8 @@ def create_app(start_threads=True):
                 return jsonify({"error": "Please sign in.", "auth": True}), 401
             return redirect("/login")
         enter(user)
+        if not can_manage() and _manager_only(request):
+            return jsonify({"error": "Only the team's owner or an admin can change this. Ask them, or ask to be made an admin."}), 403
         if user_limiter:
             cost = 10 if request.method != "GET" and request.path.startswith(_HEAVY) else 1
             ok, wait = user_limiter.allow(f"user|{user['id']}", cost)
@@ -230,6 +263,7 @@ def create_app(start_threads=True):
 
     def launch_scrape(platform, query, location, max_results, campaign, only_no_website=False,
                       then_pipeline=False, contacts=False):
+        plans.check_scrape(platform, db.count_jobs_today("scrape"))
         params = {"platform": platform, "query": query, "location": location,
                   "max_results": max_results, "campaign": campaign,
                   "only_no_website": bool(only_no_website), "then_pipeline": bool(then_pipeline),
@@ -253,7 +287,30 @@ def create_app(start_threads=True):
     # ------------------------------------------------------------ pages
     @app.route("/")
     def index():
+        if not current_user():
+            # A server open to sign-ups shows signed-out visitors what the product is; a private one
+            # (ALLOW_SIGNUP=0) goes straight to sign-in, as it always did.
+            if accounts.signup_policy(is_local())["allowed"] and accounts.count_users() > 0:
+                return render_template("welcome.html", plans=public_plans())
+            return redirect("/login")
         return render_template("index.html")
+
+    def public_plans():
+        return [(k, type("P", (), v)) for k, v in plans.all_plans().items() if k != "unlimited"][:4]
+
+    @app.route("/welcome")
+    def welcome():
+        return render_template("welcome.html", plans=public_plans())
+
+    @app.route("/terms")
+    def terms():
+        return render_template("legal.html", page="terms", company=config._server_env("COMPANY_NAME") or "NeuroSpark",
+                               contact=config._server_env("CONTACT_EMAIL") or "", updated="3 November 2026")
+
+    @app.route("/privacy")
+    def privacy():
+        return render_template("legal.html", page="privacy", company=config._server_env("COMPANY_NAME") or "NeuroSpark",
+                               contact=config._server_env("CONTACT_EMAIL") or "", updated="3 November 2026")
 
     @app.route("/login")
     def login_page():
@@ -283,6 +340,79 @@ def create_app(start_threads=True):
             return page("You're unsubscribed", "You won't receive any more emails from us. Sorry for the bother.")
         return page("Unsubscribe?", "Press the button and you won't receive any more emails from us.", button=True)
 
+    # ------------------------------------------------ Connect Gmail (web sign-in)
+    def _oauth_state(target):
+        import hashlib, hmac, secrets as _s
+        nonce = _s.token_urlsafe(12)
+        session["oauth_nonce"] = nonce
+        raw = f"{g.user['id']}|{target}|{nonce}"
+        sig = hmac.new(accounts.secret_key().encode() if isinstance(accounts.secret_key(), str) else accounts.secret_key(),
+                       raw.encode(), hashlib.sha256).hexdigest()[:24]
+        return f"{raw}|{sig}"
+
+    def _read_state(state):
+        import hashlib, hmac
+        try:
+            uid, target, nonce, sig = state.split("|")
+        except (ValueError, AttributeError):
+            return None
+        key = accounts.secret_key()
+        key = key.encode() if isinstance(key, str) else key
+        good = hmac.new(key, f"{uid}|{target}|{nonce}".encode(), hashlib.sha256).hexdigest()[:24]
+        if not hmac.compare_digest(good, sig) or nonce != session.get("oauth_nonce") or str(g.user["id"]) != uid:
+            return None
+        return target
+
+    def _redirect_uri():
+        base = outreach.public_url() or request.host_url.rstrip("/")
+        return f"{base}/oauth/google/callback"
+
+    @app.route("/oauth/google/start")
+    def google_start():
+        import gmailapi
+        if not gmailapi.web_client_ready():
+            return redirect("/#settings/connections?gmail=noclient")
+        target = request.args.get("target") if request.args.get("target") in ("main", "inbox") else "main"
+        return redirect(gmailapi.consent_url(_redirect_uri(), _oauth_state(target),
+                                             request.args.get("hint") or ""))
+
+    @app.route("/oauth/google/callback")
+    def google_callback():
+        import gmailapi
+        from urllib.parse import quote
+        target = _read_state(request.args.get("state", ""))
+        session.pop("oauth_nonce", None)
+        if target is None:
+            return redirect("/#settings/connections?gmail=" + quote("error:That sign-in link expired. Try Connect Gmail again."))
+        if request.args.get("error"):
+            return redirect("/#settings/connections?gmail=" + quote("error:Google sign-in was cancelled."))
+        try:
+            refresh, email = gmailapi.exchange_code(request.args.get("code", ""), _redirect_uri())
+        except gmailapi.GmailError as e:
+            return redirect("/#settings/connections?gmail=" + quote("error:" + str(e)))
+        if not email:
+            return redirect("/#settings/connections?gmail=" + quote("error:Google didn't say which address signed in. Try again."))
+        if target == "main":
+            updates = {"GMAIL_REFRESH_TOKEN": refresh}
+            current = config.env("SMTP_USER")
+            if not current or current.lower() != email.lower():
+                updates["SMTP_USER"] = email
+            accounts.set_secrets(ws_id(), updates)
+        else:
+            cur = inboxes.extra()
+            existing = next((x for x in cur if (x.get("from_email") or "").lower() == email.lower()), None)
+            if not existing:
+                try:
+                    plans.check_inboxes(len(cur) + 1)
+                except plans.PlanLimit as e:
+                    return redirect("/#settings/connections?gmail=" + quote("error:" + str(e)))
+            ib = inboxes.clean({"label": email, "from_email": email, "gmail_refresh_token": refresh, "send_via": "gmail_api",
+                                "daily_limit": (existing or {}).get("daily_limit") or (400 if not email.endswith("@gmail.com") else 100)},
+                               existing)
+            cur = [ib if x["id"] == ib["id"] else x for x in cur] if existing else cur + [ib]
+            inboxes.save_all(ws_id(), cur)
+        return redirect("/#settings/connections?gmail=" + quote("ok:" + email))
+
     @app.route("/api/ping")
     def ping():
         """Point an uptime monitor here (keeps a sleeping free host awake, which keeps storage synced)."""
@@ -300,7 +430,9 @@ def create_app(start_threads=True):
         session.permanent = True
 
     def public_user(u):
-        return {"id": u["id"], "email": u["email"], "name": u["name"], "is_admin": u["is_admin"]}
+        return {"id": u["id"], "email": u["email"], "name": u["name"], "is_admin": u["is_admin"],
+                "totp": bool(u.get("totp")), "role": u.get("role", "owner"), "workspace_id": u.get("workspace_id", u["id"]),
+                "plan": u.get("plan", "")}
 
     def is_local():
         return accounts.is_local_request(request.remote_addr, request.headers)
@@ -319,7 +451,7 @@ def create_app(start_threads=True):
             return jsonify({"error": "Too many attempts. Wait a few minutes and try again."}), 429
         try:
             user = accounts.create_user(b.get("email"), b.get("password"), b.get("name", ""),
-                                        b.get("code", ""), local=is_local())
+                                        b.get("code", ""), local=is_local(), invite=b.get("invite") or "")
         except accounts.CodeError:
             accounts.record_failure(key)          # guessing codes counts; typos and weak passwords don't
             raise
@@ -337,9 +469,185 @@ def create_app(start_threads=True):
         if not user:
             accounts.record_failure(key)
             return jsonify({"error": "That email and password don't match."}), 401
+        if user.get("totp"):
+            code = (b.get("code") or "").strip()
+            if not code:
+                return jsonify({"need_code": True, "error": "Enter the 6-digit code from your authenticator app."}), 401
+            if not accounts.check_second_factor(user["id"], code):
+                accounts.record_failure(key)
+                return jsonify({"need_code": True, "error": "That code isn't right. Use the newest code, or a backup code."}), 401
         accounts.clear_failures(key)
         start_session(user)
         return jsonify({"ok": True, "user": public_user(user)})
+
+    @app.route("/api/auth/forgot", methods=["POST"])
+    def auth_forgot():
+        """Email a reset link. The answer is the same whether or not the address has an account."""
+        import mailer
+        email = (body().get("email") or "").strip()
+        key = f"forgot|{request.remote_addr}"
+        if accounts.throttled(key):
+            return jsonify({"error": "Too many requests. Wait 15 minutes and try again."}), 429
+        accounts.record_failure(key)                  # counts every request, so it can't be used to flood an inbox
+        token = accounts.reset_token(email) if email else None
+        sent = False
+        if token:
+            base = outreach.public_url() or request.host_url.rstrip("/")
+            link = f"{base}/reset?t={token}"
+            try:
+                sent = mailer.send(schema.norm_email(email), "Reset your Nexus Reach password",
+                                   f"Someone (hopefully you) asked to reset the password for {email}.\n\n"
+                                   f"Choose a new password here (the link works for {accounts.RESET_HOURS} hours, once):\n{link}\n\n"
+                                   "If it wasn't you, ignore this email -- your password stays as it is.")
+            except Exception:  # noqa: BLE001 -- never reveal mail trouble to an anonymous visitor
+                traceback.print_exc()
+        return jsonify({"ok": True, "message": "If that address has an account, a reset link is on its way. Check your inbox "
+                        "(and spam). No email after a few minutes? Ask the person who runs this server to reset it."})
+
+    @app.route("/reset")
+    def reset_page():
+        return redirect("/login?reset=" + (request.args.get("t") or ""))
+
+    @app.route("/api/auth/reset", methods=["POST"])
+    def auth_reset():
+        b = body()
+        key = f"reset|{request.remote_addr}"
+        if accounts.throttled(key):
+            return jsonify({"error": "Too many attempts. Wait 15 minutes and try again."}), 429
+        try:
+            user = accounts.reset_password(b.get("token"), b.get("password"))
+        except ValueError:
+            accounts.record_failure(key)
+            raise
+        if user.get("totp"):
+            return jsonify({"ok": True, "message": "Password changed. Sign in with it and your authenticator code."})
+        start_session(user)
+        return jsonify({"ok": True})
+
+    # ------------------------------------------------------------------ teams
+    def team_view():
+        ws = ws_id()
+        owner = accounts.get_user(ws) or g.user
+        members = accounts.team_of(ws)
+        for m in members:
+            m["me"] = m["id"] == g.user["id"]
+        return jsonify({"owner": {"id": owner["id"], "email": owner["email"], "name": owner["name"]},
+                        "members": members, "my_role": g.user.get("role", "owner"), "can_manage": can_manage(),
+                        "invites": accounts.pending_invites(ws) if can_manage() else [],
+                        "limits": plans.limits_for(owner)})
+
+    @app.route("/api/plan")
+    def plan_get():
+        owner = accounts.get_user(ws_id()) or g.user
+        lim = plans.limits_for(owner)
+        st = outreach.email_status()
+        usage = {"leads": db.stats()["total"], "emails_per_day": st["sent_today"],
+                 "inboxes": 1 + len(inboxes.extra()), "members": len(accounts.team_of(ws_id())),
+                 "scrapes_per_day": db.count_jobs_today("scrape")}
+        return jsonify({"plan": lim, "usage": usage, "plans": plans.all_plans() if is_admin() else {}})
+
+    @app.route("/api/admin/users/<int:user_id>/plan", methods=["POST"])
+    def admin_set_plan(user_id):
+        if not is_admin():
+            return jsonify({"error": "Only the admin can change plans."}), 403
+        accounts.set_plan(user_id, body().get("plan"))
+        return jsonify({"users": accounts.admin_list_users(), "plans": plans.all_plans()})
+
+    @app.route("/api/team")
+    def team_get():
+        return team_view()
+
+    @app.route("/api/team/invite", methods=["POST"])
+    def team_invite():
+        import mailer
+        b = body()
+        owner = accounts.get_user(ws_id())
+        plans.check_members(owner, len(accounts.team_of(ws_id())) + len(accounts.pending_invites(ws_id())))
+        token = accounts.create_invite(ws_id(), b.get("email"), b.get("role") or "member", g.user["id"])
+        base = outreach.public_url() or request.host_url.rstrip("/")
+        link = f"{base}/join?t={token}"
+        email = schema.norm_email(b.get("email"))
+        sent = False
+        try:
+            sent = mailer.send(email, f"{g.user['name'] or g.user['email']} invited you to Nexus Reach",
+                               f"{g.user['name'] or g.user['email']} invited you to work on their leads in Nexus Reach.\n\n"
+                               f"Join here (the link works for {accounts.INVITE_DAYS} days):\n{link}\n")
+        except Exception:  # noqa: BLE001 -- the link is shown on screen anyway
+            traceback.print_exc()
+        r = team_view().get_json()
+        r.update({"link": link, "emailed": bool(sent)})
+        return jsonify(r)
+
+    @app.route("/api/team/invite/<token>", methods=["DELETE"])
+    def team_invite_cancel(token):
+        accounts.cancel_invite(ws_id(), token)
+        return team_view()
+
+    @app.route("/api/team/member/<int:uid>", methods=["POST"])
+    def team_member_role(uid):
+        accounts.set_member_role(ws_id(), uid, body().get("role"))
+        return team_view()
+
+    @app.route("/api/team/member/<int:uid>", methods=["DELETE"])
+    def team_member_remove(uid):
+        if uid == ws_id():
+            raise ValueError("The owner can't be removed from their own team.")
+        accounts.remove_member(ws_id(), uid)
+        return team_view()
+
+    @app.route("/api/team/leave", methods=["POST"])
+    def team_leave():
+        if ws_id() == g.user["id"]:
+            raise ValueError("This is your own workspace -- there's no team to leave.")
+        accounts.remove_member(ws_id(), g.user["id"])
+        enter(accounts.get_user(g.user["id"]))
+        return jsonify({"ok": True})
+
+    @app.route("/api/team/accept", methods=["POST"])
+    def team_accept():
+        inv = accounts.accept_invite(body().get("token"), g.user)
+        enter(accounts.get_user(g.user["id"]))
+        return jsonify({"ok": True, "owner": inv["owner_email"]})
+
+    @app.route("/join")
+    def team_join():
+        from urllib.parse import quote
+        token = request.args.get("t") or ""
+        if not current_user():
+            return redirect("/login?invite=" + quote(token))
+        try:
+            inv = accounts.accept_invite(token, current_user())
+        except ValueError as e:
+            return redirect("/#dashboard?toast=" + quote(str(e)))
+        return redirect("/#dashboard?toast=" + quote(f"You joined {inv['owner_name'] or inv['owner_email']}'s team."))
+
+    @app.route("/api/auth/invite")
+    def invite_lookup():
+        inv = accounts.invite_info(request.args.get("t"))
+        if not inv:
+            return jsonify({"error": "That invite has expired or was already used. Ask for a new one."}), 404
+        return jsonify({"email": inv["email"], "owner": inv["owner_name"] or inv["owner_email"],
+                        "exists": accounts._find(inv["email"]) is not None})
+
+    @app.route("/api/auth/2fa/setup", methods=["POST"])
+    def twofa_setup():
+        secret = accounts.new_totp_secret()
+        session["totp_pending"] = secret
+        return jsonify({"secret": secret, "uri": accounts.totp_uri(secret, g.user["email"])})
+
+    @app.route("/api/auth/2fa/enable", methods=["POST"])
+    def twofa_enable():
+        secret = session.get("totp_pending")
+        if not secret:
+            raise ValueError("Start the set-up again.")
+        backups = accounts.enable_totp(g.user["id"], secret, body().get("code"))
+        session.pop("totp_pending", None)
+        return jsonify({"ok": True, "backup_codes": backups})
+
+    @app.route("/api/auth/2fa/disable", methods=["POST"])
+    def twofa_disable():
+        accounts.disable_totp(g.user["id"], body().get("password"))
+        return jsonify({"ok": True})
 
     @app.route("/api/auth/logout", methods=["POST"])
     def auth_logout():
@@ -371,7 +679,7 @@ def create_app(start_threads=True):
     @app.route("/api/connections", methods=["PUT"])
     def connections_put():
         b = body()
-        accounts.set_secrets(g.user["id"], b.get("set") or {}, b.get("clear") or [])
+        accounts.set_secrets(ws_id(), b.get("set") or {}, b.get("clear") or [])
         enter(accounts.get_user(g.user["id"]))     # so the reply reflects the new values
         reread = 0
         if "DEFAULT_COUNTRY_CODE" in (b.get("set") or {}) or "DEFAULT_COUNTRY_CODE" in (b.get("clear") or []):
@@ -416,16 +724,18 @@ def create_app(start_threads=True):
         b = body()
         cur = inboxes.extra()
         existing = next((x for x in cur if x["id"] == b.get("id")), None) if b.get("id") else None
+        if not existing:
+            plans.check_inboxes(len(cur) + 1)
         ib = inboxes.clean(b, existing)
         cur = [ib if x["id"] == ib["id"] else x for x in cur] if existing else cur + [ib]
-        inboxes.save_all(g.user["id"], cur)
+        inboxes.save_all(ws_id(), cur)
         enter(accounts.get_user(g.user["id"]))
         return inboxes_view()
 
     @app.route("/api/inboxes/<iid>", methods=["DELETE"])
     def inboxes_delete(iid):
         cur = [x for x in inboxes.extra() if x["id"] != iid]
-        inboxes.save_all(g.user["id"], cur)
+        inboxes.save_all(ws_id(), cur)
         enter(accounts.get_user(g.user["id"]))
         return inboxes_view()
 
@@ -447,6 +757,7 @@ def create_app(start_threads=True):
             "provider_cap": outreach.provider_daily_cap(),
             "unsubscribe_link": bool(outreach.public_url()),
             "gmail_api_client": bool(config.env("GOOGLE_CLIENT_ID") and config.env("GOOGLE_CLIENT_SECRET")),
+            "gmail_redirect_uri": _redirect_uri(),
             "imap": outreach.imap_configured(),
             "serpapi": bool(config.env("SERPAPI_KEY")),
             "apify": bool(config.env("APIFY_TOKEN")),
@@ -835,6 +1146,30 @@ def create_app(start_threads=True):
              "max": whole_number(b.get("max"), None, 1, 100000) if b.get("max") not in (None, "") else None}
         return jsonify({"job_id": jobs.start_job("send_bulk", p, outreach.run_send_bulk)})
 
+    @app.route("/api/send-plan", methods=["POST"])
+    def send_plan_start():
+        """One control for sending: N emails once now, or N every day for D days."""
+        if not outreach.smtp_configured():
+            raise ValueError("Email isn't set up: add your email details under Settings > Connections.")
+        b = body()
+        out = outreach.make_send_plan(b.get("count"), b.get("mode") or "once", b.get("days", 1),
+                                      b.get("campaign") or "", bool(b.get("only_fit")))
+        job_id = None
+        if out["mode"] == "once":
+            job_id = jobs.start_job("send_bulk", out["params"], outreach.run_send_bulk)
+        else:
+            due = outreach.daily_send_due()
+            if due:
+                job_id = jobs.start_job("send_bulk", due, outreach.run_send_bulk)
+                outreach.mark_plan_ran(due["plan_day"])
+        out["job_id"] = job_id
+        out["email"] = outreach.email_status()
+        return jsonify(out)
+
+    @app.route("/api/send-plan", methods=["DELETE"])
+    def send_plan_stop():
+        return jsonify({"plan": outreach.stop_send_plan()})
+
     @app.route("/api/check-replies", methods=["POST"])
     def check_replies():
         return jsonify(outreach.check_replies())
@@ -934,7 +1269,17 @@ def create_app(start_threads=True):
 
     # ------------------------------------------------------- background
     if start_threads and os.environ.get("HUB_START_THREADS", "1") != "0":
-        jobs.start_scheduler(launch_scrape, outreach.auto_check_replies)
+        def account_tick():
+            """Once a minute for each account: check the inbox, and start today's share of a daily send."""
+            outreach.auto_check_replies()
+            due = outreach.daily_send_due()
+            if due:
+                try:
+                    jobs.start_job("send_bulk", due, outreach.run_send_bulk)
+                except jobs.JobBusy:
+                    return                    # a send is already running: try again next minute
+                outreach.mark_plan_ran(due["plan_day"])
+        jobs.start_scheduler(launch_scrape, account_tick)
 
     return app
 

@@ -142,3 +142,61 @@ def test():
     _credentials(force_refresh=True)
     return {"ok": True, "message": "The Gmail API accepted your sign-in and handed out an access token. "
                                    "Email will be sent through it (nothing was sent just now)."}
+
+
+# ------------------------------------------------------------ "Connect Gmail" (in the browser)
+# The same sign-in as tools/gmail_auth.py, done on the website: Google sends the person back to
+# <PUBLIC_URL>/oauth/google/callback with a one-time code, which is swapped for a refresh token.
+# The OAuth client must list that address under "Authorized redirect URIs".
+AUTH_URI = "https://accounts.google.com/o/oauth2/v2/auth"
+WEB_SCOPES = f"openid email {SCOPE}"
+
+
+def web_client_ready():
+    return bool(config._server_env("GOOGLE_CLIENT_ID") and config._server_env("GOOGLE_CLIENT_SECRET"))
+
+
+def consent_url(redirect_uri, state, login_hint=""):
+    from urllib.parse import urlencode
+    q = {"client_id": config._server_env("GOOGLE_CLIENT_ID"), "redirect_uri": redirect_uri, "response_type": "code",
+         "scope": WEB_SCOPES, "access_type": "offline", "prompt": "consent", "include_granted_scopes": "true",
+         "state": state}
+    if login_hint:
+        q["login_hint"] = login_hint
+    return f"{AUTH_URI}?{urlencode(q)}"
+
+
+def exchange_code(code, redirect_uri):
+    """One-time code -> (refresh token, the Google address that signed in)."""
+    try:
+        r = requests.post(TOKEN_URI, data={
+            "code": code, "client_id": config._server_env("GOOGLE_CLIENT_ID"),
+            "client_secret": config._server_env("GOOGLE_CLIENT_SECRET"), "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code"}, timeout=20)
+    except requests.RequestException as e:
+        raise GmailError(f"Couldn't reach Google ({e}).")
+    data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+    if r.status_code != 200:
+        why = data.get("error_description") or data.get("error") or r.text[:200]
+        if "redirect_uri_mismatch" in str(data.get("error", "")):
+            why = (f"Google doesn't know this site's address yet. In Google Cloud Console > Credentials > your "
+                   f"OAuth client, add {redirect_uri} under Authorized redirect URIs, save, wait a few minutes "
+                   "and try again.")
+        raise GmailError(f"Google refused the sign-in: {why}")
+    refresh = data.get("refresh_token")
+    if not refresh:
+        raise GmailError("Google didn't hand out a long-lived sign-in. Remove Nexus Reach under myaccount.google.com > "
+                         "Security > Third-party access, then connect again.")
+    granted = set((data.get("scope") or "").split())
+    if SCOPE not in granted:
+        raise GmailError("The 'send email on your behalf' permission wasn't ticked. Connect again and allow it.")
+    email = ""
+    idt = data.get("id_token") or ""
+    if idt.count(".") == 2:
+        import json as _json
+        part = idt.split(".")[1]
+        try:
+            email = _json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("email", "")
+        except (ValueError, TypeError):
+            email = ""
+    return refresh, email

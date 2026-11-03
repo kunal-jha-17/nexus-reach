@@ -89,7 +89,24 @@ function parseHash() {
 }
 const campaignHash = (name) => `#campaign/${encodeURIComponent(name)}`;
 
+function takeHashMessage() {
+  // "#settings/connections?gmail=ok:me@x.com" after Google sends the person back: show it once, then tidy the address
+  const q = location.hash.indexOf('?');
+  if (q === -1) return;
+  const params = new URLSearchParams(location.hash.slice(q + 1));
+  history.replaceState(null, '', location.pathname + location.hash.slice(0, q));
+  const g = params.get('gmail');
+  if (g) {
+    if (g.startsWith('ok:')) setTimeout(() => toast(`Gmail connected: ${g.slice(3)} can now send.`, 'ok'), 300);
+    else if (g === 'noclient') setTimeout(() => toast('This server has no GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET yet — add both on the host first.', 'err'), 300);
+    else setTimeout(() => toast(g.replace(/^error:/, ''), 'err'), 300);
+  }
+  const t = params.get('toast');
+  if (t) setTimeout(() => toast(t, 'ok'), 300);
+}
+
 function route() {
+  takeHashMessage();
   let [view, param] = parseHash();
   if (!VIEWS.includes(view)) view = 'dashboard';
   if (view === 'campaign' && !param) view = 'campaigns';
@@ -879,20 +896,25 @@ async function loadOutreach() {
   ]);
   const checked = !es.imap_configured ? 'inbox not connected' : !es.reply_check_minutes ? 'only when you press Check'
     : `automatic, every ${es.reply_check_minutes} min` + (es.last_reply_check_at ? ` (last ${ago(es.last_reply_check_at)})` : '');
-  if (document.activeElement !== $('#em-limit')) $('#em-limit').value = es.max_limit;
+  state.emailStatus = es;
+  const plan = es.plan || {};
+  if (!$('#em-count').value) $('#em-count').value = plan.active ? plan.count : Math.min(es.remaining || es.daily_limit, es.daily_limit) || '';
+  planNote();
   const capNote = es.provider_cap && es.max_limit > es.provider_cap
     ? `<div class="kv"><span>Your mail account</span><b class="warn-text">allows about ${es.provider_cap.toLocaleString()} a day</b></div>` : '';
   $('#em-status').innerHTML =
     `<div class="kv"><span>Sent today (all campaigns)</span><b>${es.sent_today.toLocaleString()} of ${es.daily_limit.toLocaleString()}</b></div>` +
     (es.warmup_active ? `<div class="kv"><span>Warm-up</span><b>${es.daily_limit.toLocaleString()} today of your ${es.max_limit.toLocaleString()}/day`
       + (es.warmup_days_left ? ` · full limit in about ${plural(es.warmup_days_left, 'day')}` : '') + '</b></div>' : '') +
+    (plan.active ? `<div class="kv"><span>Daily plan</span><b>${plan.count.toLocaleString()} a day until ${esc(plan.until_day)}${plan.campaign ? ` · ${esc(plan.campaign)}` : ''}
+       · ${plan.ran_today ? 'today\'s run started' : 'next run when sending hours open'} <button class="linklike" id="em-plan-stop">Stop</button></b></div>`
+      : plan.finished ? `<div class="kv"><span>Daily plan</span><b>finished on ${esc(plan.until_day)}</b></div>` : '') +
     (es.inboxes && es.inboxes.length > 1 ? `<div class="kv"><span>Sending inboxes</span><b>${es.inboxes.length} in rotation</b></div>` : '') +
     capNote +
     `<div class="kv"><span>Gap between emails</span><b>${es.delay_seconds}s${state.settings && state.settings.auto_pace ? ' (paced automatically)' : ''}</b></div>` +
     (es.window_open ? '' : `<div class="kv"><span>Sending hours</span><b class="warn-text">closed right now</b></div>`) +
     `<div class="kv"><span>Reply checking</span><b>${esc(checked)}</b></div>` +
     (es.window_open ? '' : `<p class="hint" style="margin-top:8px">${esc(es.window_note)}</p>`);
-  $('#em-send').disabled = !es.smtp_configured || !es.window_open;
   $('#em-replies').disabled = !es.imap_configured;
 
   badge('#rp-n', replies.length);
@@ -963,22 +985,43 @@ $('#dr-go').addEventListener('click', () => run(async () => {
     force: $('#dr-force').checked, exact: $('#dr-exact').checked } });
   toast('Writing messages…', 'ok'); refreshJobs();
 }));
+function planNote() {
+  const es = state.emailStatus || {}, n = +$('#em-count').value || 0, daily = $('#em-mode').value === 'daily';
+  $('#em-days-field').hidden = !daily;
+  $('#em-send').textContent = daily ? 'Start daily sending' : 'Start sending';
+  $('#em-send').disabled = !es.smtp_configured || (!daily && !es.window_open);
+  const notes = [];
+  if (n && !daily && n > (es.remaining ?? n)) {
+    notes.push(`Only ${(es.remaining || 0).toLocaleString()} more can go out today (${es.warmup_active ? 'the warm-up' : 'your daily limit'}); the rest stay queued for your next run.`);
+  }
+  if (n && daily) {
+    const d = +$('#em-days').value || 1;
+    notes.push(`${n.toLocaleString()} a day for ${d} day${d === 1 ? '' : 's'} — up to ${(n * d).toLocaleString()} emails, one run a day inside your sending hours.`);
+    if (es.warmup_active && n > es.daily_limit) notes.push(`While the account warms up, today allows ${es.daily_limit.toLocaleString()}; it grows each day until it reaches ${n.toLocaleString()}.`);
+    if (es.provider_cap && n > es.provider_cap) notes.push(`Your mail account allows about ${es.provider_cap.toLocaleString()} a day — add more sending inboxes (Settings → Connections) or a sending service for more.`);
+  }
+  $('#em-plan-note').textContent = notes.join(' ');
+}
+['#em-count', '#em-days'].forEach((sel) => $(sel).addEventListener('input', planNote));
+$('#em-mode').addEventListener('change', planNote);
 $('#em-send').addEventListener('click', () => run(async () => {
-  const camp = $('#dr-campaign').value;
-  const cap = $('#em-max').value.trim();
-  if (!confirm(`Start sending emails to ${cap ? `up to ${(+cap).toLocaleString()} leads` : 'every lead'} with a message${camp ? ` in "${camp}"` : ''}, paced by your delay and daily limit?`)) return;
-  const max = $('#em-max').value.trim();
-  await api('/api/send-bulk', { method: 'POST', body: { campaign: camp, only_fit: $('#em-onlyfit').checked, max: max ? +max : null } });
-  toast('Sending started.', 'ok'); refreshJobs();
+  const camp = $('#dr-campaign').value, n = Math.round(+$('#em-count').value), daily = $('#em-mode').value === 'daily';
+  const days = Math.round(+$('#em-days').value || 1);
+  if (!n || n < 1) throw new Error('Enter how many emails to send, e.g. 200');
+  const what = daily ? `${n.toLocaleString()} emails every day for ${days} day${days === 1 ? '' : 's'}` : `up to ${n.toLocaleString()} emails now`;
+  if (!confirm(`Send ${what}${camp ? ` in "${camp}"` : ''}, paced by your sending settings?`)) return;
+  const r = await api('/api/send-plan', { method: 'POST', body: { count: n, mode: daily ? 'daily' : 'once', days, campaign: camp, only_fit: $('#em-onlyfit').checked } });
+  toast(daily ? `Daily sending set up until ${r.plan.until_day}${r.job_id ? ' — today\'s run has started' : ' — it starts when your sending hours open'}.`
+    + (r.raised_limit ? ` Your daily limit was raised to ${n.toLocaleString()}.` : '') : 'Sending started.', 'ok');
+  refreshJobs(); loadOutreach();
 }));
-$('#em-limit-save').addEventListener('click', () => run(async () => {
-  const v = Math.round(+$('#em-limit').value);
-  if (!v || v < 1) throw new Error('Enter how many emails a day, e.g. 500');
-  state.settings = await api('/api/settings', { method: 'PUT', body: { email_daily_limit: v } });
-  toast(`Daily limit set to ${state.settings.email_daily_limit.toLocaleString()} emails.`, 'ok');
-  loadOutreach();
-}));
-$('#em-limit').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#em-limit-save').click(); });
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#em-plan-stop')) return;
+  run(async () => {
+    if (!confirm('Stop the daily sending plan? A run already going today carries on until you stop it under Recent runs.')) return;
+    await api('/api/send-plan', { method: 'DELETE' }); toast('Daily plan stopped.', 'ok'); loadOutreach();
+  });
+});
 $('#em-replies').addEventListener('click', () => run(async () => {
   const b = $('#em-replies'); b.disabled = true; b.textContent = 'Checking…';
   try {
@@ -1215,6 +1258,10 @@ function renderConnections(fields) {
       <div class="hint">${esc(g.help)}</div>
       ${g.test === 'smtp' && by.GMAIL_REFRESH_TOKEN && by.GMAIL_REFRESH_TOKEN.set && !state.config.gmail_api_client
         ? '<div class="notice">A Gmail API refresh token is saved, but this server has no GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET yet, so it can\'t be used. Add both on the host (Render > Environment).</div>' : ''}
+      ${g.test === 'smtp' && state.config.gmail_api_client ? `<div class="row actions" style="margin:6px 0 10px">
+        <a class="btn" href="/oauth/google/start?target=main">${state.config.email_via === 'gmail_api' ? 'Reconnect Gmail' : 'Connect Gmail'}</a>
+        <span class="hint">Sign in with Google and allow "send email on your behalf" &mdash; no App Password or script needed.
+          Google must list <code>${esc(state.config.gmail_redirect_uri || '')}</code> as an authorized redirect URI.</span></div>` : ''}
       <div class="conn-grid">${inputs}</div>
       ${g.test ? `<div class="row actions conn-test"><button class="btn small" data-conn-test="${g.test}">Save &amp; test this connection</button>
         <span class="hint" data-conn-result="${g.test}">Saves any changes above, then tests the connection.</span></div>` : ''}</div>`;
@@ -1283,6 +1330,7 @@ async function loadInboxes() {
   const d = await api('/api/inboxes');
   state.inboxes = d.inboxes;
   badge('#ib-n', d.inboxes.length);
+  $('#ib-add-gmail').hidden = !(state.config && state.config.gmail_api_client);
   const via = (t) => (t === 'gmail_api' ? 'Gmail API' : t === 'smtp' ? 'SMTP' : 'not ready');
   const mainRow = `<div class="list-row"><div class="grow"><b>Main inbox</b> <span class="muted">${esc(d.main.from_email || 'not set up')}</span>
       <div class="sub">${via(d.main.transport)} · ${d.main.sent_today.toLocaleString()} of ${d.main.limit_today.toLocaleString()} sent today
@@ -1311,6 +1359,7 @@ function inboxForm(ib) {
   f.hidden = false; f.scrollIntoView({ block: 'nearest' });
 }
 $('#ib-add').addEventListener('click', () => inboxForm(null));
+$('#ib-add-gmail').addEventListener('click', () => { location.href = '/oauth/google/start?target=inbox'; });
 $('#ib-cancel').addEventListener('click', () => { $('#ib-form').hidden = true; });
 $('#ib-provider').addEventListener('change', (e) => {
   const p = SMTP_PROVIDERS.find(([v]) => v === e.target.value); if (!p || !p[0]) return;
@@ -1400,6 +1449,7 @@ async function fillSettingsView() {
     : 'Rejected leads are kept, not deleted — filter by Fit = Rejected to review them.';
   state.tplEditor.set(s.templates); state.prioEditor.set(s.channel_priority);
   $('#ac-name').value = (state.me && state.me.name) || '';
+  renderTwoStep(); renderTeam(); renderPlan();
   await renderSuppression();
   const conn = await api('/api/connections');
   renderConnections(conn.fields);
@@ -1527,22 +1577,110 @@ $('#stor-backup').addEventListener('click', () => run(async () => {
   toast(`Backed up ${r.files_backed_up} files.`, 'ok'); renderStorage();
 }));
 
+/* ------------------------------------------------------ two-step sign-in */
+function renderTwoStep() {
+  const on = !!(state.config && state.config.user && state.config.user.totp);
+  $('#tf-chip').textContent = on ? 'on' : 'off'; $('#tf-chip').className = 'chip ' + (on ? 'ok' : '');
+  $('#tf-on').hidden = !on; $('#tf-off').hidden = on;
+}
+$('#tf-start').addEventListener('click', () => run(async () => {
+  const r = await api('/api/auth/2fa/setup', { method: 'POST' });
+  $('#tf-secret').textContent = r.secret.replace(/(.{4})/g, '$1 ').trim(); $('#tf-uri').href = r.uri;
+  $('#tf-setup').hidden = false; $('#tf-start').hidden = true; $('#tf-code').focus();
+}));
+$('#tf-enable').addEventListener('click', () => run(async () => {
+  const r = await api('/api/auth/2fa/enable', { method: 'POST', body: { code: $('#tf-code').value } });
+  $('#tf-setup').hidden = true;
+  $('#tf-backups').hidden = false;
+  $('#tf-backups').innerHTML = `<b>Two-step sign-in is on.</b> Save these backup codes somewhere safe &mdash; each one signs you in once if you lose your phone. They won't be shown again:<br><code class="selectable">${r.backup_codes.join('  ')}</code>`;
+  await loadConfig(); $('#tf-chip').textContent = 'on'; $('#tf-chip').className = 'chip ok';
+  toast('Two-step sign-in is on.', 'ok');
+}));
+$('#tf-disable').addEventListener('click', () => run(async () => {
+  await api('/api/auth/2fa/disable', { method: 'POST', body: { password: $('#tf-pw').value } });
+  $('#tf-pw').value = ''; await loadConfig(); renderTwoStep(); $('#tf-start').hidden = false; toast('Two-step sign-in is off.', 'ok');
+}));
+
 async function renderUsers() {
   const card = $('#st-users-card');
   card.hidden = !(state.me && state.me.is_admin);
   if (card.hidden) return;
-  const list = await api('/api/admin/users');
+  const [list, plan] = await Promise.all([api('/api/admin/users'), api('/api/plan')]);
+  const names = Object.entries(plan.plans || {});
   $('#st-users').innerHTML = list.map((u) =>
-    `<div class="list-row"><div class="grow"><b>${esc(u.email)}</b>${u.is_admin ? ' <span class="chip info">admin</span>' : ''}
+    `<div class="list-row"><div class="grow"><b>${esc(u.email)}</b>${u.is_admin ? ' <span class="chip info">admin</span>' : ''}${u.team_of ? ' <span class="chip">in a team</span>' : ''}${u.totp ? ' <span class="chip ok">2-step</span>' : ''}
        <div class="sub">${u.leads === null ? '' : u.leads + ' leads · '}${u.last_login_at ? 'last signed in ' + ago(u.last_login_at) : 'never signed in'}</div></div>
+     ${u.is_admin ? '<span class="muted">Unlimited</span>' : `<select data-user-plan="${u.id}" aria-label="Plan for ${esc(u.email)}">${names.map(([k, p]) => opt(k, p.label || k, k === u.plan)).join('')}</select>`}
      ${u.id === state.me.id ? '' : `<button class="btn small danger" data-user-del="${u.id}" data-email="${esc(u.email)}">Delete</button>`}</div>`).join('');
 }
+$('#st-users').addEventListener('change', (e) => {
+  const sel = e.target.closest('[data-user-plan]'); if (!sel) return;
+  run(async () => { await api(`/api/admin/users/${sel.dataset.userPlan}/plan`, { method: 'POST', body: { plan: sel.value } }); toast('Plan changed.', 'ok'); });
+});
 $('#st-users').addEventListener('click', (e) => run(async () => {
   const b = e.target.closest('[data-user-del]'); if (!b) return;
   if (!confirm(`Delete ${b.dataset.email} and ALL of their leads, campaigns and settings? This cannot be undone.`)) return;
   await api(`/api/admin/users/${b.dataset.userDel}`, { method: 'DELETE' });
   toast('Account deleted.', 'ok'); renderUsers();
 }));
+
+/* ------------------------------------------------------------------ plan */
+async function renderPlan() {
+  const d = await api('/api/plan');
+  const p = d.plan, u = d.usage;
+  $('#plan-name').textContent = p.label || p.name;
+  const rows = [['leads', 'Leads kept'], ['emails_per_day', 'Emails today'], ['inboxes', 'Sending inboxes'],
+    ['members', 'People in the team'], ['scrapes_per_day', 'Scrape runs today']];
+  $('#plan-usage').innerHTML = rows.map(([k, label]) => {
+    const lim = p[k], used = u[k] || 0, pct = lim ? Math.min(100, Math.round(100 * used / lim)) : 0;
+    return `<div class="kv"><span>${label}</span><b>${used.toLocaleString()}${lim ? ` of ${lim.toLocaleString()}` : ' (no limit)'}</b></div>`
+      + (lim ? `<div class="bar"><span style="width:${pct}%" class="${pct >= 90 ? 'hot' : ''}"></span></div>` : '');
+  }).join('') + `<div class="kv"><span>Google Maps via Apify</span><b>${p.apify ? 'included' : 'not included'}</b></div>`
+    + (p.name !== 'unlimited' ? '<p class="hint" style="margin-top:8px">Need more? Ask the person who runs this server to change your plan.</p>' : '');
+}
+
+/* ------------------------------------------------------------------ team */
+async function renderTeam() {
+  const d = await api('/api/team');
+  const mine = d.my_role;
+  badge('#team-n', d.members.length > 1 ? d.members.length : 0);
+  $('#team-invite-row').hidden = !d.can_manage;
+  $('#team-hint').innerHTML = mine === 'owner'
+    ? 'Invite the people you work with. Everyone in the team sees and works the same leads, campaigns and replies; <b>admins</b> can also change settings, connections and the team, <b>members</b> can\'t.'
+    : `You're working in <b>${esc(d.owner.name || d.owner.email)}</b>'s team as ${mine === 'admin' ? 'an <b>admin</b>' : 'a <b>member</b>'}. <button class="linklike" id="team-leave">Leave the team</button>`;
+  $('#team-list').innerHTML = d.members.map((m) =>
+    `<div class="list-row"><div class="grow"><b>${esc(m.name || m.email)}</b>${m.me ? ' <span class="muted">(you)</span>' : ''} <span class="chip ${m.role === 'owner' ? 'info' : ''}">${m.role}</span>
+       <div class="sub">${esc(m.email)} · ${m.last_login_at ? 'last signed in ' + ago(m.last_login_at) : 'never signed in'}</div></div>
+     ${d.can_manage && m.role !== 'owner' && !m.me ? `<select data-team-role="${m.id}" aria-label="Role">${['member', 'admin'].map((r) => opt(r, r, r === m.role)).join('')}</select>
+       <button class="btn small danger" data-team-remove="${m.id}" data-email="${esc(m.email)}">Remove</button>` : ''}</div>`).join('')
+    + (d.invites || []).map((i) => `<div class="list-row"><div class="grow"><b>${esc(i.email)}</b> <span class="chip warn">invited</span>
+       <div class="sub">as ${esc(i.role)} · until ${esc(i.expires_at.slice(0, 10))}</div></div>
+       <button class="btn small" data-team-cancel="${esc(i.token)}">Cancel invite</button></div>`).join('');
+}
+$('#team-invite').addEventListener('click', () => run(async () => {
+  const r = await api('/api/team/invite', { method: 'POST', body: { email: $('#team-email').value, role: $('#team-role').value } });
+  $('#team-email').value = '';
+  $('#team-link').hidden = false;
+  $('#team-link').innerHTML = (r.emailed ? 'Invite emailed. You can also share this link:' : 'Couldn\'t email the invite (no email connection on the server) — send them this link yourself:')
+    + `  <code class="selectable">${esc(r.link)}</code>`;
+  renderTeam();
+}));
+$('#team-card').addEventListener('change', (e) => {
+  const sel = e.target.closest('[data-team-role]'); if (!sel) return;
+  run(async () => { await api(`/api/team/member/${sel.dataset.teamRole}`, { method: 'POST', body: { role: sel.value } }); toast('Role changed.', 'ok'); renderTeam(); });
+});
+$('#team-card').addEventListener('click', (e) => {
+  const rm = e.target.closest('[data-team-remove]'), cancel = e.target.closest('[data-team-cancel]'), leave = e.target.closest('#team-leave');
+  if (rm) run(async () => {
+    if (!confirm(`Remove ${rm.dataset.email} from the team? They go back to their own (separate) workspace.`)) return;
+    await api(`/api/team/member/${rm.dataset.teamRemove}`, { method: 'DELETE' }); renderTeam();
+  });
+  if (cancel) run(async () => { await api(`/api/team/invite/${encodeURIComponent(cancel.dataset.teamCancel)}`, { method: 'DELETE' }); renderTeam(); });
+  if (leave) run(async () => {
+    if (!confirm('Leave this team? You go back to your own workspace and lose access to the team\'s leads.')) return;
+    await api('/api/team/leave', { method: 'POST' }); location.href = '/';
+  });
+});
 
 /* ------------------------------------------------------------------ jobs */
 let pollTimer = null;

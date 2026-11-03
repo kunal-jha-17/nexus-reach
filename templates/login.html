@@ -34,7 +34,25 @@
     <div class="field"><label for="li-pw">Password</label>
       <div class="pw-wrap"><input id="li-pw" type="password" autocomplete="current-password" required>
         <button type="button" class="pw-eye" data-toggle="li-pw" aria-label="Show password">&#128065;</button></div></div>
+    <div class="field" id="li-code-field" hidden><label for="li-code">Code from your authenticator app <span class="muted">(or a backup code)</span></label>
+      <input id="li-code" inputmode="numeric" autocomplete="one-time-code" maxlength="10"></div>
     <button class="btn primary wide" type="submit">Sign in</button>
+    <p class="auth-links"><button type="button" class="linklike" id="show-forgot">Forgot your password?</button></p>
+  </form>
+
+  <form id="forgot-form" hidden>
+    <p class="muted">Enter your account's email and we'll send you a link to choose a new password.</p>
+    <div class="field"><label for="fg-email">Email</label><input id="fg-email" type="email" autocomplete="email" required></div>
+    <button class="btn primary wide" type="submit">Send reset link</button>
+    <p class="auth-links"><button type="button" class="linklike" id="back-login">Back to sign in</button></p>
+  </form>
+
+  <form id="reset-form" hidden>
+    <p class="muted">Choose a new password for your account.</p>
+    <div class="field"><label for="rs-pw">New password <span class="muted">(at least 8 characters)</span></label>
+      <div class="pw-wrap"><input id="rs-pw" type="password" autocomplete="new-password" minlength="8" required>
+        <button type="button" class="pw-eye" data-toggle="rs-pw" aria-label="Show password">&#128065;</button></div></div>
+    <button class="btn primary wide" type="submit">Save new password</button>
   </form>
 
   <form id="signup-form" autocomplete="on" hidden>
@@ -51,6 +69,7 @@
   </form>
 
   <div id="auth-msg" class="result err" role="alert" hidden></div>
+  <p class="auth-foot muted"><a href="/welcome">About</a> · <a href="/terms">Terms</a> · <a href="/privacy">Privacy</a></p>
 </main>
 <script src="/static/login.js"></script>
 </body>

@@ -153,8 +153,10 @@ searches have no place, so set the campaign's country code to 91 for Indian hash
 
 ## Phase 2: volume tools
 
-- **Daily limit on the Outreach page.** "Emails a day" sits next to Start sending (it's the same setting
-  as under Settings > Sending), and **Send at most** caps a single run ("send 300 now, the rest later").
+- **One sending control on the Outreach page.** "How many emails" plus "When": **Once, now** sends that
+  many in one run (anything left stays queued); **Every day** sends that many each day for the number of
+  days you choose (1-90), one run a day inside your sending hours, until the last day or until you press
+  Stop. A daily plan raises the daily limit to that number if it was lower; warm-up still applies.
 - **Follow-up sequences.** Settings > Messaging > "Use a sequence": up to 10 follow-ups, each with its own
   wait (days after the previous message) and its own text -- leave a step's text empty and the AI writes
   it for each lead. A campaign can have its own sequence (campaign settings). Without a sequence, the
@@ -174,6 +176,35 @@ searches have no place, so set the campaign's country code to 91 for Indian hash
   JUDGE_WORKERS, default 3; set either to 1 for one at a time).
 - **What's working.** A table on the Outreach page: for each template, channel and campaign -- contacted,
   replied, interested, replied after a follow-up, bounced, opted out and won, with rates.
+
+## Phase 3: accounts, teams and plans
+
+- **Connect Gmail with one button.** Settings > Connections > Email sending > **Connect Gmail** (and
+  Sending inboxes > **Add a Gmail inbox**): the user signs in with Google and the refresh token is saved
+  for them -- no script, no copying tokens. One-time step for whoever runs the server: in Google Cloud
+  Console > Credentials > your OAuth client (type **Web application**), add this **Authorised redirect
+  URI**: `https://YOUR-APP.onrender.com/oauth/google/callback` (Settings > Connections shows the exact
+  address). Set `PUBLIC_URL` to the site's address so links are built right. While the Google app is in
+  "Testing", only the Google accounts listed as test users can connect; publish it (and pass Google's
+  verification for the gmail.send scope) before strangers sign up.
+- **Forgot password.** The sign-in page has "Forgot your password?". The reset link is valid for 2 hours
+  and works once. It's emailed through `SYSTEM_SMTP_HOST / SYSTEM_SMTP_PORT / SYSTEM_SMTP_USER /
+  SYSTEM_SMTP_PASS / SYSTEM_SMTP_FROM` if set, otherwise through the admin account's own email connection.
+- **Two-step sign-in.** Settings > Account > Two-step sign-in: scan the code with any authenticator app.
+  Eight one-time backup codes are shown once. The secret is stored encrypted.
+- **Teams.** Settings > Account > Team: invite people by email as **member** (finds leads, writes and
+  sends messages, handles replies) or **admin** (also settings, connections, inboxes and the team).
+  Everyone works in the owner's leads and uses the owner's connections. Invite links last 7 days and work
+  even when public sign-up is closed. Removing someone sends them back to their own (empty) workspace.
+- **Plans.** Free / Pro / Agency / Unlimited limit leads kept, emails a day, sending inboxes, team size,
+  scrape runs a day and Apify. New sign-ups get `DEFAULT_PLAN` (default `unlimited`, so nothing changes
+  until you choose); the admin is never limited and changes anyone's plan under People using this server.
+  Change the numbers with `PLANS_JSON`, e.g. `{"pro": {"label": "Pro", "leads": 20000, "emails_per_day": 2000}}`.
+- **Homepage, Terms and Privacy.** Signed-out visitors see a homepage at `/` (when sign-up is open), plus
+  `/terms` and `/privacy`, filled in with `COMPANY_NAME` and `CONTACT_EMAIL`. They're a starting draft,
+  not legal advice -- have them checked before you charge anyone.
+- **Not built yet:** taking payments (Razorpay/Stripe checkout that switches the plan automatically) and
+  moving from SQLite files to Postgres. Plans are switched by the admin by hand for now.
 
 ## Accounts, and where each person's data lives
 

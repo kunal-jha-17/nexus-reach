@@ -285,8 +285,12 @@ class TestAuthAPI(ApiBase):
         self.assertEqual(anon.get("/api/leads").status_code, 401)
         self.assertEqual(anon.get("/api/campaigns").status_code, 401)
         self.assertEqual(anon.get("/api/export.csv").status_code, 401)
-        r = anon.get("/")
-        self.assertEqual((r.status_code, r.headers["Location"]), (302, "/login"))
+        r = anon.get("/")                                 # open sign-up: the public homepage, with a way in
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'href="/login"', r.data)
+        with mock.patch.dict(os.environ, {"ALLOW_SIGNUP": "0"}):   # a private server: straight to sign-in
+            r = anon.get("/")
+            self.assertEqual((r.status_code, r.headers["Location"]), (302, "/login"))
         self.assertEqual(anon.get("/api/ping").status_code, 200)
         self.assertEqual(anon.get("/static/app.css").status_code, 200)
 

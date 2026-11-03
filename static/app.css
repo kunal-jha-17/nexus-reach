@@ -424,3 +424,37 @@ table.perf th, table.perf td { padding: 8px 10px; border-bottom: 1px solid var(-
 table.perf th { font-weight: 600; color: var(--muted); font-size: 12.5px; }
 table.perf .num { text-align: right; white-space: nowrap; }
 @media (max-width: 640px) { table.perf { font-size: 12.5px; } table.perf th, table.perf td { padding: 6px; } }
+
+.auth-links { margin: 10px 0 0; text-align: center; font-size: 13.5px; }
+.auth-foot { margin: 18px 0 0; text-align: center; font-size: 12.5px; }
+.auth-foot a { color: inherit; }
+.result.ok { background: var(--ok-soft); color: var(--ok); }
+
+.steps { margin: 6px 0 10px 18px; padding: 0; font-size: 13.5px; line-height: 1.6; }
+.selectable { user-select: all; font-size: 13.5px; letter-spacing: .04em; }
+
+.bar { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin: -4px 0 8px; }
+.bar span { display: block; height: 100%; background: var(--accent); }
+.bar span.hot { background: var(--bad); }
+
+/* public pages: homepage, terms, privacy */
+.site { background: var(--paper); }
+.site-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 24px; background: var(--surface); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.site-brand { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 16px; color: var(--ink); text-decoration: none; }
+.site-head nav { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.site-head nav a:not(.btn) { color: var(--ink); text-decoration: none; }
+.site main { max-width: 1040px; margin: 0 auto; padding: 32px 20px 48px; }
+.hero { padding: 24px 0 32px; max-width: 760px; }
+.hero h1 { font-size: 34px; line-height: 1.15; margin-bottom: 14px; }
+.lede { font-size: 16px; color: var(--muted); margin-bottom: 20px; }
+.site-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; margin-bottom: 32px; }
+.site-grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.site-h2 { font-size: 20px; margin: 8px 0 14px; }
+.ticks { margin: 6px 0 0 18px; padding: 0; line-height: 1.8; }
+.legal { max-width: 760px !important; }
+.legal h1 { margin-bottom: 6px; }
+.legal h2 { margin-top: 22px; }
+.legal ul { padding-left: 20px; line-height: 1.7; }
+.site-foot { display: flex; gap: 16px; justify-content: center; padding: 18px; color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); }
+.site-foot a { color: inherit; }
+@media (max-width: 760px) { .site-grid, .site-grid.three { grid-template-columns: 1fr; } .hero h1 { font-size: 26px; } }
