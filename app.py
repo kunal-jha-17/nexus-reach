@@ -29,6 +29,7 @@ import enrichment
 import exports
 import filtering
 import importer
+import inboxes
 import jobs
 import limits
 import llm
@@ -228,10 +229,11 @@ def create_app(start_threads=True):
         return summary
 
     def launch_scrape(platform, query, location, max_results, campaign, only_no_website=False,
-                      then_pipeline=False):
+                      then_pipeline=False, contacts=False):
         params = {"platform": platform, "query": query, "location": location,
                   "max_results": max_results, "campaign": campaign,
-                  "only_no_website": bool(only_no_website), "then_pipeline": bool(then_pipeline)}
+                  "only_no_website": bool(only_no_website), "then_pipeline": bool(then_pipeline),
+                  "contacts": bool(contacts)}
         return jobs.start_job("scrape", params, scrape_job, queue_lock=jobs.SCRAPE_LOCK)
 
     # Asking Playwright where its browser is starts a helper process (tens of MB, half a second).
@@ -381,10 +383,60 @@ def create_app(start_threads=True):
     @app.route("/api/connections/test", methods=["POST"])
     def connections_test():
         kind = body().get("kind")
-        fn = {"smtp": outreach.test_smtp, "imap": outreach.test_imap, "llm": outreach.test_llm}.get(kind)
+        import apify
+        fn = {"smtp": outreach.test_smtp, "imap": outreach.test_imap, "llm": outreach.test_llm,
+              "apify": apify.test}.get(kind)
         if not fn:
             raise ValueError("Unknown test")
         return jsonify(fn())
+
+    # ---------------------------------------------------- sending inboxes
+    def inboxes_view():
+        settings = db.get_settings()
+        caps = {(ib["id"] if ib else "main"): (cap, n) for ib, cap, n in outreach.inbox_capacity(settings)}
+        out = []
+        for ib in inboxes.extra():
+            with inboxes.using(ib):
+                via = outreach.email_transport()
+                pc = outreach.provider_daily_cap()
+            cap, n = caps.get(ib["id"], (0, 0))
+            out.append(inboxes.public(ib, {"transport": via, "limit_today": cap, "sent_today": n, "provider_cap": pc}))
+        main_cap, main_sent = caps.get("main", (0, 0))
+        return jsonify({"main": {"from_email": outreach.from_address(), "transport": outreach.email_transport(),
+                                 "limit_today": main_cap, "sent_today": main_sent,
+                                 "daily_limit": int(settings["email_daily_limit"])},
+                        "inboxes": out, "total_today": outreach.total_daily_limit(settings)})
+
+    @app.route("/api/inboxes", methods=["GET"])
+    def inboxes_get():
+        return inboxes_view()
+
+    @app.route("/api/inboxes", methods=["POST"])
+    def inboxes_save():
+        b = body()
+        cur = inboxes.extra()
+        existing = next((x for x in cur if x["id"] == b.get("id")), None) if b.get("id") else None
+        ib = inboxes.clean(b, existing)
+        cur = [ib if x["id"] == ib["id"] else x for x in cur] if existing else cur + [ib]
+        inboxes.save_all(g.user["id"], cur)
+        enter(accounts.get_user(g.user["id"]))
+        return inboxes_view()
+
+    @app.route("/api/inboxes/<iid>", methods=["DELETE"])
+    def inboxes_delete(iid):
+        cur = [x for x in inboxes.extra() if x["id"] != iid]
+        inboxes.save_all(g.user["id"], cur)
+        enter(accounts.get_user(g.user["id"]))
+        return inboxes_view()
+
+    @app.route("/api/inboxes/<iid>/test", methods=["POST"])
+    def inboxes_test(iid):
+        ib = inboxes.get(iid)
+        if ib is None:
+            raise outreach.SendError("Inbox not found", 404)
+        kind = body().get("kind") or "smtp"
+        with inboxes.using(ib):
+            return jsonify(outreach.test_imap() if kind == "imap" else outreach.test_smtp())
 
     @app.route("/api/config-status")
     def config_status():
@@ -397,6 +449,7 @@ def create_app(start_threads=True):
             "gmail_api_client": bool(config.env("GOOGLE_CLIENT_ID") and config.env("GOOGLE_CLIENT_SECRET")),
             "imap": outreach.imap_configured(),
             "serpapi": bool(config.env("SERPAPI_KEY")),
+            "apify": bool(config.env("APIFY_TOKEN")),
             "instagram_login": bool(config.env("IG_USERNAME") and config.env("IG_PASSWORD")),
             "playwright": browser_ready(),
             "user": public_user(g.user),
@@ -541,17 +594,20 @@ def create_app(start_threads=True):
     def scrape_start():
         b = body()
         platform = b.get("platform")
-        if platform not in ("google_maps", "yelp", "instagram"):
+        if platform not in scraper.PLATFORMS:
             raise ValueError("Choose a platform")
+        if platform == "apify_maps" and not config.env("APIFY_TOKEN"):
+            raise ValueError("Add your Apify API token under Settings > Connections first (apify.com > Settings > Integrations).")
         # Several terms and/or places may be given, separated by ';' -- every pair is searched.
         pairs = scraper.plan_searches(b)                 # raises ValueError if empty or too many
         queries = "; ".join(dict.fromkeys(q for q, _ in pairs))
         locations = "; ".join(dict.fromkeys(loc for _, loc in pairs if loc))
         if platform == "yelp" and not locations:
             raise ValueError("Yelp needs a location, e.g. Dallas, TX")
-        job_id = launch_scrape(platform, queries, locations, whole_number(b.get("max_results"), 30, 1, 200),
+        top = 5000 if platform == "apify_maps" else 200
+        job_id = launch_scrape(platform, queries, locations, whole_number(b.get("max_results"), 30, 1, top),
                                (b.get("campaign") or "").strip(), bool(b.get("only_no_website")),
-                               bool(b.get("then_pipeline")))
+                               bool(b.get("then_pipeline")), bool(b.get("contacts")))
         return jsonify({"job_id": job_id, "searches": len(pairs)})
 
     @app.route("/api/suggest")
@@ -569,7 +625,7 @@ def create_app(start_threads=True):
     @app.route("/api/schedules", methods=["POST"])
     def schedules_add():
         b = body()
-        if b.get("platform") not in ("google_maps", "yelp", "instagram"):
+        if b.get("platform") not in scraper.PLATFORMS:
             raise ValueError("Choose a platform")
         pairs = scraper.plan_searches(b)                 # the same checks a one-off scrape gets
         queries = "; ".join(dict.fromkeys(q for q, _ in pairs))
@@ -775,7 +831,8 @@ def create_app(start_threads=True):
             raise ValueError("Email isn't set up: add your email details under Settings > Connections.")
         b = body()
         p = {"campaign": b.get("campaign") or "", "only_fit": bool(b.get("only_fit")),
-             "ids": b.get("ids") or None}
+             "ids": b.get("ids") or None,
+             "max": whole_number(b.get("max"), None, 1, 100000) if b.get("max") not in (None, "") else None}
         return jsonify({"job_id": jobs.start_job("send_bulk", p, outreach.run_send_bulk)})
 
     @app.route("/api/check-replies", methods=["POST"])
@@ -821,6 +878,8 @@ def create_app(start_threads=True):
                   "score_no_website", "auto_pace"):
             if k in b:
                 clean[k] = bool(b[k])
+        if "followup_steps" in b:
+            clean["followup_steps"] = db.clean_followup_steps(b["followup_steps"])
         if "followup_template" in b:
             clean["followup_template"] = str(b["followup_template"] or "").strip()
         if "send_days" in b:
@@ -861,6 +920,10 @@ def create_app(start_threads=True):
         return jsonify({"removed": db.remove_suppression(body().get("value", ""))})
 
     # ------------------------------------------------------------- stats
+    @app.route("/api/performance")
+    def performance():
+        return jsonify(db.performance(request.args.get("campaign", "")))
+
     @app.route("/api/stats")
     def stats():
         s = db.stats(request.args.get("campaign", ""))

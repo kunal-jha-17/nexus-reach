@@ -20,6 +20,7 @@ Differences from the original enrich script:
   * progress is saved per lead, so a stopped run resumes where it left off
 """
 import re
+import threading
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -29,6 +30,7 @@ import config
 import db
 import llm
 import netguard
+import parallel
 import schema
 
 HEADERS = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -188,6 +190,9 @@ def scan_website(url):
 
 # ------------------------------------------------------------ web search
 
+_SEARCH_LOCK = threading.Lock()
+
+
 def serp_limit():
     return config.env_int("SERPAPI_MONTHLY_LIMIT", 100)
 
@@ -324,11 +329,12 @@ def enrich_lead(lead, max_searches=None):
     serp_results = []
     if config.env("SERPAPI_KEY") and max_searches > 0 and (lead.get("business_name") or "").strip():
         for f in still:
-            if searches >= max_searches or serp_remaining() <= 0:
-                break
             loc = " " + ", ".join(x for x in (lead.get("city"), lead.get("state")) if x) if lead.get("city") else ""
             q = QUERY_TEMPLATES[f].format(n=lead["business_name"], l=loc)
-            res = serp_search(q)
+            with _SEARCH_LOCK:           # leads enriched side by side mustn't overspend the monthly budget
+                if searches >= max_searches or serp_remaining() <= 0:
+                    break
+                res = serp_search(q)
             if res is None:
                 break
             searches += 1
@@ -398,36 +404,49 @@ def run_enrich(ctx, params):
     ctx.progress(0, len(ids))
     ctx.log(f"Enriching {len(ids)} leads (search budget left this month: {serp_remaining()})")
 
-    total_found = total_searches = done = failed = 0
-    for i, lead_id in enumerate(ids, 1):
-        if ctx.stopped:
-            ctx.log("Stopped.")
-            break
+    st = {"found": 0, "searches": 0, "done": 0, "failed": 0, "seen": 0}
+
+    def work(lead_id):
         lead = db.get_lead(lead_id)
         if lead is None:                 # deleted by something else while this run was going
-            ctx.progress(i)
-            continue
+            return None
         try:
-            res = enrich_lead(lead)
-        except Exception as e:  # noqa: BLE001 -- one bad lead shouldn't stop the batch
-            failed += 1
-            ctx.log(f"{lead['business_name']}: failed ({e}) -- will retry next run")
-            ctx.progress(i)
-            continue
+            return lead, enrich_lead(lead), None
+        except Exception as e:  # noqa: BLE001
+            return lead, None, e
+
+    def save(i, lead_id, out, err):
+        st["seen"] += 1
+        if out is None and err is None:
+            ctx.progress(st["seen"])
+            return
+        lead, res, err = out if out is not None else ({"business_name": f"Lead {lead_id}"}, None, err)
+        if err is not None:              # one bad lead shouldn't stop the batch
+            st["failed"] += 1
+            ctx.log(f"{lead['business_name']}: failed ({err}) -- will retry next run")
+            ctx.progress(st["seen"])
+            return
         fields = dict(res["updates"])
         fields["enriched_at"] = schema.now_iso()
         note = res["notes"]
         if note:                          # what the latest run found -- not an ever-growing pile
             fields["enrichment_notes"] = note[:600]
-        db.update_lead(lead_id, fields)
+        if db.update_lead(lead_id, fields) is None:   # deleted while it was being looked up
+            ctx.progress(st["seen"])
+            return
         if res["updates"]:
             db.add_event(lead_id, "enriched", ", ".join(res["updates"]))
-        total_found += len(res["updates"])
-        total_searches += res["searches"]
-        done += 1
+        st["found"] += len(res["updates"])
+        st["searches"] += res["searches"]
+        st["done"] += 1
         ctx.log(f"{lead['business_name']}: " + (", ".join(res["updates"]) or "nothing new found"))
-        ctx.progress(i)
-        if ctx.sleep(0.3):
-            break
+        ctx.progress(st["seen"])
+
+    # Several leads at once: each one mostly waits on a website or the AI, so 4 together finish
+    # about 4x sooner. ENRICH_WORKERS=1 goes back to one at a time.
+    parallel.run(ctx, ids, work, save, workers=config.env_int("ENRICH_WORKERS", 4))
+    if ctx.stopped:
+        ctx.log("Stopped.")
+    total_found, total_searches, done, failed = st["found"], st["searches"], st["done"], st["failed"]
     return (f"{done} enriched, {total_found} new fields found, {total_searches} searches used"
             + (f", {failed} failed" if failed else ""))

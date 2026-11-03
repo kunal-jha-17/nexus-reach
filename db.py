@@ -240,7 +240,7 @@ def _migrate(conn):
         "campaigns": {"description": "TEXT DEFAULT ''", "status": "TEXT DEFAULT 'active'",
                       "business_info": "TEXT DEFAULT ''", "templates": "TEXT DEFAULT ''",
                       "channel_priority": "TEXT DEFAULT ''", "country_code": "TEXT DEFAULT ''",
-                      "score_no_website": "TEXT DEFAULT ''"},
+                      "score_no_website": "TEXT DEFAULT ''", "followup_steps": "TEXT DEFAULT ''"},
         "jobs": {"campaign": "TEXT DEFAULT ''"},
         "schedules": {"only_no_website": "INTEGER DEFAULT 0"},
         "leads": {"place_id": "TEXT DEFAULT ''", "rating": "REAL", "opening_hours": "TEXT DEFAULT ''",
@@ -318,7 +318,9 @@ DEFAULT_SETTINGS = {
     "auto_remove_rejected": False,   # delete a lead outright the moment Judge fit rejects it
     "score_no_website": True,        # the 0-10 score favours businesses without a website (website sellers)
     "auto_pace": False,              # spread the day's emails evenly over the sending window
-    "max_bounce_rate": 5,            # % of recent emails bouncing at which sending pauses (0 = never)
+    "max_bounce_rate": 5,
+    "followup_steps": [],
+    "inbox_state": {},               # extra inboxes: {id: {"started_at": ..., "imap_state": {...}}}            # [{days, body}] -- a sequence; empty = one message, max_followups times            # % of recent emails bouncing at which sending pauses (0 = never)
     "exact_templates": False,        # draft by filling in the template's blanks, with no AI rewriting
     "followup_template": "",         # fixed follow-up text (placeholders allowed); blank = the AI writes one
     "reply_check_minutes": 30,       # look for replies on a timer when the inbox is connected; 0 = only by hand
@@ -994,6 +996,42 @@ def stats(campaign=""):
         }
 
 
+def performance(campaign=""):
+    """What's working: for every template, channel and campaign -- how many leads were contacted,
+    how many answered, how many were interested, bounced or opted out. A lead counts once, however
+    many follow-ups it got."""
+    where, params = "WHERE l.sent_at IS NOT NULL", []
+    if campaign:
+        where += " AND l.campaign = ?"
+        params.append(campaign)
+    def rows(group_sql):
+        with get_conn() as conn:
+            out = []
+            for r in conn.execute(f"""
+                SELECT {group_sql} AS name, COUNT(*) AS contacted,
+                       SUM(EXISTS(SELECT 1 FROM events e WHERE e.lead_id = l.id AND e.kind = 'reply')) AS replied,
+                       SUM(l.reply_category IN ('interested', 'question')) AS interested,
+                       SUM(EXISTS(SELECT 1 FROM events e WHERE e.lead_id = l.id AND e.kind = 'bounced')) AS bounced,
+                       SUM(EXISTS(SELECT 1 FROM events e WHERE e.lead_id = l.id AND e.kind = 'optout')) AS opted_out,
+                       SUM(l.stage IN ('qualified', 'won')) AS qualified, SUM(l.stage = 'won') AS won,
+                       SUM(l.follow_up_count > 0 AND EXISTS(SELECT 1 FROM events e WHERE e.lead_id = l.id AND e.kind = 'reply'
+                           AND e.id > (SELECT MIN(f.id) FROM events f WHERE f.lead_id = l.id
+                                       AND f.kind IN ('followup_sent', 'manual_followup')))) AS replied_after_followup
+                FROM leads l {where} GROUP BY 1 ORDER BY contacted DESC LIMIT 50""", params).fetchall():
+                d = {k: (r[k] or 0) if k != "name" else r[k] for k in r.keys()}
+                n = d["contacted"] or 1
+                d["reply_rate"] = round(100 * d["replied"] / n, 1)
+                d["interested_rate"] = round(100 * d["interested"] / n, 1)
+                d["bounce_rate"] = round(100 * d["bounced"] / n, 1)
+                out.append(d)
+            return out
+    return {
+        "by_template": rows("COALESCE(NULLIF(l.template_used, ''), '(written by the AI, no template)')"),
+        "by_channel": rows("l.channel"),
+        "by_campaign": [] if campaign else rows("COALESCE(NULLIF(l.campaign, ''), '(no campaign)')"),
+    }
+
+
 # ----------------------------------------------------------------- campaigns
 # A campaign is a named push at one audience (e.g. "dallas-hvac"): its own leads,
 # its own dashboard, and optionally its own fit criteria, "about you" text,
@@ -1001,12 +1039,12 @@ def stats(campaign=""):
 # to the account-wide Settings.
 
 CAMPAIGN_FIELDS = ("description", "status", "criteria", "business_info", "templates", "channel_priority",
-                   "country_code", "score_no_website")
+                   "country_code", "score_no_website", "followup_steps")
 
 
 def _campaign_row(r):
     d = dict(r)
-    for k in ("templates", "channel_priority"):
+    for k in ("templates", "channel_priority", "followup_steps"):
         try:
             d[k] = json.loads(d[k]) if d.get(k) else None
         except ValueError:
@@ -1086,6 +1124,9 @@ def save_campaign(name, fields):
                     raise ValueError("Country code should be 1-4 digits, e.g. 971 for the UAE")
             elif k == "score_no_website":
                 v = v if v in ("yes", "no") else ""
+            elif k == "followup_steps":
+                v = clean_followup_steps(v)
+                v = json.dumps(v) if v else ""
             elif k == "templates":
                 v = [t for t in (v or []) if (t.get("name") or "").strip() and (t.get("body") or "").strip()
                      and t.get("channel") in schema.CHANNELS]
@@ -1102,6 +1143,22 @@ def save_campaign(name, fields):
     if "country_code" in fields or "score_no_website" in fields:
         refresh_campaign_leads(name, reread_phones="country_code" in fields)
     return get_campaign(name)
+
+
+def clean_followup_steps(steps):
+    """[{days, body}, ...] -> up to 10 steps with 1-365 days; body may be '' (the AI writes it)."""
+    out = []
+    for x in (steps or [])[:10]:
+        if not isinstance(x, dict):
+            continue
+        try:
+            days = int(x.get("days"))
+        except (TypeError, ValueError):
+            raise ValueError("Each follow-up step needs a number of days to wait.")
+        if not 1 <= days <= 365:
+            raise ValueError("Follow-up steps wait between 1 and 365 days.")
+        out.append({"days": days, "body": str(x.get("body") or "").strip()[:4000]})
+    return out
 
 
 def rescore_all():
@@ -1179,6 +1236,8 @@ def effective_settings(campaign=""):
                     s["templates"] = d["templates"]
                 if d["channel_priority"]:
                     s["channel_priority"] = d["channel_priority"]
+                if d.get("followup_steps"):
+                    s["followup_steps"] = d["followup_steps"]
     return s
 
 

@@ -151,6 +151,30 @@ IndiaMART, WhatsApp or free Google "business.site" page doesn't count as the bus
 Yelp has no Indian listings, so a Yelp search for an Indian place is refused up front. Instagram
 searches have no place, so set the campaign's country code to 91 for Indian hashtags.
 
+## Phase 2: volume tools
+
+- **Daily limit on the Outreach page.** "Emails a day" sits next to Start sending (it's the same setting
+  as under Settings > Sending), and **Send at most** caps a single run ("send 300 now, the rest later").
+- **Follow-up sequences.** Settings > Messaging > "Use a sequence": up to 10 follow-ups, each with its own
+  wait (days after the previous message) and its own text -- leave a step's text empty and the AI writes
+  it for each lead. A campaign can have its own sequence (campaign settings). Without a sequence, the
+  single follow-up message and the "Follow up after / Follow-ups per lead" settings work as before.
+- **Several sending inboxes.** Settings > Connections > Sending inboxes > Add an inbox. Each inbox has its
+  own login, daily limit and warm-up; every email goes from the inbox with the most room left today, so
+  limits add up (5 mailboxes x 400 = 2,000 a day). A follow-up always leaves from the inbox the first email
+  came from (same conversation), replies and bounces are checked in every inbox, and an inbox can be
+  paused. Passwords are stored encrypted with the account's other keys and never sent back to the browser.
+- **Google Maps via Apify.** Find leads > Where: "Google Maps via Apify". Needs an Apify API token
+  (Settings > Connections). Up to 5,000 places a search, run on Apify's machines (no browser on this
+  server, no CAPTCHAs here), saved as they arrive with rating, hours, place id and -- if you tick it --
+  emails and social profiles. The form estimates the cost (about $4 per 1,000 places; your Apify plan
+  decides the real price) and the run log reports what Apify actually charged. Stopping the run in the
+  app stops it on Apify too.
+- **Faster enrichment and judging.** Several leads are worked on at once (ENRICH_WORKERS, default 4;
+  JUDGE_WORKERS, default 3; set either to 1 for one at a time).
+- **What's working.** A table on the Outreach page: for each template, channel and campaign -- contacted,
+  replied, interested, replied after a follow-up, bounced, opted out and won, with rates.
+
 ## Accounts, and where each person's data lives
 
 Anyone can have an account; **each person gets their own separate database file**, so one person's

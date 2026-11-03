@@ -12,9 +12,13 @@ filter script:
   * rejected leads are never deleted -- filter the Leads tab by Fit = No to
     spot-check them
 """
+import threading
+import time
+
 import config
 import db
 import llm
+import parallel
 import schema
 
 DEFAULT_CRITERIA = """TARGET PROFILE:
@@ -112,36 +116,56 @@ def run_judge(ctx, params):
     ctx.progress(0, len(ids))
     ctx.log(f"Judging {len(ids)} leads")
 
-    criteria_cache = {}
-    kept = rejected = failed = removed = 0
-    for i, lead_id in enumerate(ids, 1):
-        if ctx.stopped:
-            ctx.log("Stopped.")
-            break
+    criteria_cache, cache_lock = {}, threading.Lock()
+    st = {"kept": 0, "rejected": 0, "failed": 0, "removed": 0, "seen": 0, "fatal": None}
+    delay = config.env_int("FILTER_DELAY_MS", 700) / 1000
+
+    def criteria_for(camp):
+        with cache_lock:
+            if camp not in criteria_cache:
+                criteria_cache[camp] = db.get_campaign_criteria(camp) or DEFAULT_CRITERIA
+            return criteria_cache[camp]
+
+    def work(lead_id):
         lead = db.get_lead(lead_id)
         if lead is None:   # deleted by something else mid-run
-            ctx.progress(i)
-            continue
-        camp = lead.get("campaign") or ""
-        if camp not in criteria_cache:
-            criteria_cache[camp] = db.get_campaign_criteria(camp) or DEFAULT_CRITERIA
+            return None
         try:
-            res = judge_lead(lead, criteria_cache[camp])
+            res = judge_lead(lead, criteria_for(lead.get("campaign") or ""))
         except Exception as e:  # noqa: BLE001
-            failed += 1
-            ctx.log(f"{lead['business_name']}: could not judge ({e}) -- left unjudged")
-            ctx.progress(i)
-            if isinstance(e, llm.LLMError) and "not set" in str(e):
-                raise  # no API key: no point trying the rest
-            continue
-        db.update_lead(lead_id, {
+            return lead, None, e
+        if delay:
+            time.sleep(delay)            # each worker paces its own AI requests
+        return lead, res, None
+
+    class _Halt:                         # stop handing out work once the AI key turns out to be missing
+        @property
+        def stopped(self):
+            return ctx.stopped or st["fatal"] is not None
+
+    def save(i, lead_id, out, err):
+        st["seen"] += 1
+        if out is None and err is None:
+            ctx.progress(st["seen"])
+            return
+        lead, res, err = out if out is not None else ({"business_name": f"Lead {lead_id}"}, None, err)
+        if err is not None:
+            st["failed"] += 1
+            ctx.log(f"{lead['business_name']}: could not judge ({err}) -- left unjudged")
+            ctx.progress(st["seen"])
+            if isinstance(err, llm.LLMError) and "not set" in str(err):
+                st["fatal"] = err        # no API key: no point trying the rest
+            return
+        if db.update_lead(lead_id, {
             "fit": 1 if res["fits"] else 0,
             "fit_confidence": res["confidence"],
             "fit_reason": res["reason"],
             "judged_at": schema.now_iso(),
-        })
-        kept += res["fits"]
-        rejected += (not res["fits"])
+        }) is None:                      # deleted while it was being judged
+            ctx.progress(st["seen"])
+            return
+        st["kept"] += res["fits"]
+        st["rejected"] += (not res["fits"])
         ctx.log(f"{lead['business_name']}: {'FIT' if res['fits'] else 'reject'} ({res['confidence']}) {res['reason']}")
         if not res["fits"] and auto_remove:
             # Only a lead nobody has touched yet -- never one that's been drafted, sent, replied to
@@ -150,12 +174,17 @@ def run_judge(ctx, params):
                         and not lead["notes"] and not lead["contact_name"])
             if untouched:
                 db.delete_leads([lead_id])
-                removed += 1
+                st["removed"] += 1
                 ctx.log(f"  -> removed (auto-remove is on, and nothing had been done with this lead yet)")
             else:
                 ctx.log(f"  -> kept despite rejecting: it already has notes, a draft, or activity on it")
-        ctx.progress(i)
-        if ctx.sleep(config.env_int("FILTER_DELAY_MS", 700) / 1000):
-            break
+        ctx.progress(st["seen"])
+
+    parallel.run(_Halt(), ids, work, save, workers=config.env_int("JUDGE_WORKERS", 3))
+    if st["fatal"] is not None:
+        raise st["fatal"]
+    if ctx.stopped:
+        ctx.log("Stopped.")
+    kept, rejected, failed, removed = st["kept"], st["rejected"], st["failed"], st["removed"]
     return (f"{kept} fit, {rejected} rejected" + (f" ({removed} auto-removed)" if removed else "")
             + (f", {failed} could not be judged (left blank, will retry)" if failed else ""))

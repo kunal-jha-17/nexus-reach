@@ -35,6 +35,7 @@ import requests
 import config
 import db
 import gmailapi
+import inboxes
 import llm
 import netguard
 import schema
@@ -225,8 +226,71 @@ def email_transport():
 
 
 def smtp_configured():
-    """Email can go out: an address to send from, plus the Gmail API sign-in or an SMTP login."""
-    return bool(email_transport())
+    """Email can go out: an address to send from, plus the Gmail API sign-in or an SMTP login --
+    in the main inbox or in at least one extra inbox."""
+    if inboxes.current_id() != "main" or email_transport():
+        return bool(email_transport())
+    return any(True for _ in _usable_extras())
+
+
+def _usable_extras():
+    for ib in inboxes.extra():
+        if ib.get("enabled", True):
+            with inboxes.using(ib):
+                if email_transport():
+                    yield ib
+
+
+def _inbox_state(settings, inbox_id):
+    return dict((settings.get("inbox_state") or {}).get(inbox_id) or {})
+
+
+def _put_inbox_state(inbox_id, **values):
+    allst = dict(db.get_settings().get("inbox_state") or {})
+    cur = dict(allst.get(inbox_id) or {})
+    cur.update(values)
+    allst[inbox_id] = cur
+    db.set_settings({"inbox_state": allst})
+
+
+def inbox_capacity(settings=None):
+    """[(inbox or None for the main one, its limit today, sent today)] for every inbox that can send.
+    Each has its own daily limit and its own warm-up (counted from its own first email)."""
+    settings = settings or db.get_settings()
+    sent = inboxes.sent_today_by_inbox(settings)
+    out = []
+    if email_transport():
+        out.append((None, effective_daily_limit(settings), sent.get("main", 0)))
+    for ib in _usable_extras():
+        own = dict(settings, email_daily_limit=int(ib.get("daily_limit") or 50),
+                   sending_started_at=_inbox_state(settings, ib["id"]).get("started_at", ""))
+        out.append((ib, effective_daily_limit(own), sent.get(ib["id"], 0)))
+    return out
+
+
+def total_daily_limit(settings=None):
+    """Today's limit across every inbox (just the main one's when there are no extras)."""
+    settings = settings or db.get_settings()
+    caps = inbox_capacity(settings)
+    if not caps or (len(caps) == 1 and caps[0][0] is None):
+        return effective_daily_limit(settings)
+    return sum(c for _, c, _ in caps)
+
+
+def pick_inbox(settings, inbox_id=None):
+    """The inbox the next email goes from: the one with the most room left today (as a share of its
+    limit), or the given one (a follow-up stays in its thread). Returns (inbox or None, ok)."""
+    caps = inbox_capacity(settings)
+    if inbox_id is not None:
+        for ib, cap, sent in caps:
+            if (ib["id"] if ib else "main") == inbox_id:
+                return ib, sent < cap
+        inbox_id = None                                     # that inbox was removed: use another
+    room = [(sent / cap if cap else 1, i, ib) for i, (ib, cap, sent) in enumerate(caps) if sent < cap]
+    if not room:
+        return None, False
+    room.sort(key=lambda x: (x[0], x[1]))
+    return room[0][2], True
 
 
 def _imap_login():
@@ -372,9 +436,11 @@ def send_window(settings=None, now=None):
 
 def email_status(settings=None):
     settings = settings or db.get_settings()
-    eff = effective_daily_limit(settings)
+    eff = total_daily_limit(settings)
     sent = emails_sent_today(settings)
     window_ok, window_why = send_window(settings)
+    caps = inbox_capacity(settings)
+    full = int(settings["email_daily_limit"]) + sum(int(ib.get("daily_limit") or 0) for ib, _, _ in caps if ib)
     return {
         "window_open": window_ok, "window_note": window_why,
         "hand_followups_due": len(hand_followups_due(settings)),
@@ -382,9 +448,12 @@ def email_status(settings=None):
         "last_reply_check_at": settings.get("last_reply_check_at") or "",
         "sent_today": sent,
         "daily_limit": eff,
-        "max_limit": int(settings["email_daily_limit"]),
+        "max_limit": full if any(ib for ib, _, _ in caps) else int(settings["email_daily_limit"]),
         "remaining": max(0, eff - sent),
-        "warmup_active": bool(settings.get("warmup_enabled")) and eff < int(settings["email_daily_limit"]),
+        "warmup_active": bool(settings.get("warmup_enabled")) and eff < (full if any(ib for ib, _, _ in caps)
+                                                                        else int(settings["email_daily_limit"])),
+        "inboxes": [{"id": ib["id"] if ib else "main", "label": (ib.get("label") if ib else from_address()),
+                     "limit_today": cap, "sent_today": n} for ib, cap, n in caps],
         "smtp_configured": smtp_configured(),
         "imap_configured": imap_configured(),
         "followups_due": len(followups_due(settings)),
@@ -549,17 +618,18 @@ class SmtpSession:
 
 @contextmanager
 def smtp_session():
-    """Reuse one SMTP connection for every send inside this block (bulk runs, follow-ups)."""
+    """Reuse one SMTP connection per inbox for every send inside this block (bulk runs, follow-ups)."""
     if _SESSION.get() is not None:
         yield _SESSION.get()
         return
-    sess = SmtpSession()
-    token = _SESSION.set(sess)
+    pool = {}
+    token = _SESSION.set(pool)
     try:
-        yield sess
+        yield pool
     finally:
         _SESSION.reset(token)
-        sess.close()
+        for sess in pool.values():
+            sess.close()
 
 
 def _deliver(msg):
@@ -572,10 +642,12 @@ def _deliver(msg):
         except gmailapi.GmailError as e:
             raise DeliveryError(str(e), recipient=e.recipient)
     host, port, _, _ = _smtp_settings()
-    sess = _SESSION.get()
-    one_off = sess is None
+    pool = _SESSION.get()
+    one_off = pool is None
     if one_off:
         sess = SmtpSession()
+    else:
+        sess = pool.setdefault(inboxes.current_id(), SmtpSession())
     try:
         sess.send(msg)
     except netguard.Blocked as e:
@@ -662,6 +734,12 @@ def test_llm():
 
 
 def _ensure_sending_started(settings):
+    iid = inboxes.current_id()
+    if iid != "main":
+        if not _inbox_state(settings, iid).get("started_at"):
+            _put_inbox_state(iid, started_at=schema.now_iso())
+            settings["inbox_state"] = db.get_settings().get("inbox_state") or {}
+        return
     if not settings.get("sending_started_at"):
         db.set_settings({"sending_started_at": schema.now_iso()})
         settings["sending_started_at"] = schema.now_iso()
@@ -679,7 +757,7 @@ def _check_can_email(lead, settings, followup=False):
     if not smtp_configured():
         raise SendError("Email isn't set up: add your email address and App Password under "
                         "Settings > Connections.", 400)
-    eff = effective_daily_limit(settings)
+    eff = total_daily_limit(settings)
     sent = emails_sent_today(settings)
     if sent >= eff:
         note = " (still warming up the account)" if eff < int(settings["email_daily_limit"]) else ""
@@ -760,6 +838,14 @@ def send_lead_email(lead_id, force=False):
             raise SendError(f"Skipped: {lead['email']} was already emailed (lead '{twin['business_name']}'), "
                             "e.g. another branch sharing one inbox.", 409)
     _require_deliverable(lead)
+    ib, ok = pick_inbox(settings)
+    if not ok:
+        raise SendError("Every sending inbox has reached its limit for today -- the rest go out tomorrow.", 429)
+    with inboxes.using(ib):
+        return _send_first_email(lead_id, lead, settings)
+
+
+def _send_first_email(lead_id, lead, settings):
     _ensure_sending_started(settings)
 
     subject, body = split_subject(final_message(lead), lead)
@@ -783,8 +869,12 @@ def send_lead_email(lead_id, force=False):
     if lead["stage"] == "new":
         fields["stage"] = "contacted"
     db.update_lead(lead_id, fields)
-    db.add_event(lead_id, "email_sent", json.dumps({"subject": subject, "message_id": msg["Message-ID"],
-                                                    "thread_id": sent.get("threadId", "") if isinstance(sent, dict) else ""}))
+    detail = {"subject": subject, "message_id": msg["Message-ID"],
+              "thread_id": sent.get("threadId", "") if isinstance(sent, dict) else ""}
+    if inboxes.current_id() != "main":
+        detail["inbox"] = inboxes.current_id()
+        detail["from"] = from_address()
+    db.add_event(lead_id, "email_sent", json.dumps(detail))
     return {"ok": True, "subject": subject}
 
 
@@ -816,35 +906,72 @@ def _followup_cutoff(settings):
             ).isoformat(timespec="seconds")
 
 
+MAX_SEQUENCE_STEPS = 10
+
+
+def followup_plan(campaign="", settings=None):
+    """The follow-up sequence for a campaign: [(days to wait after the previous message, text), ...].
+    Text '' means the AI writes that step. From the campaign's own steps, else the account's steps
+    (Settings > Messaging), else the single follow-up message repeated `max_followups` times."""
+    eff = db.effective_settings(campaign) if settings is None else settings
+    steps = [x for x in (eff.get("followup_steps") or []) if isinstance(x, dict)]
+    if steps:
+        out = []
+        for x in steps[:MAX_SEQUENCE_STEPS]:
+            try:
+                days = max(1, min(365, int(x.get("days") or 1)))
+            except (TypeError, ValueError):
+                days = 3
+            out.append((days, str(x.get("body") or "").strip()))
+        return out
+    return [(int(eff["followup_delay_days"]), (eff.get("followup_template") or "").strip())] * int(eff["max_followups"])
+
+
+def _due_by_plan(rows):
+    """Keep the leads whose next step's wait has passed (each campaign can have its own sequence)."""
+    plans, now, out = {}, datetime.now(timezone.utc), []
+    for r in rows:
+        camp = r["campaign"] or ""
+        if camp not in plans:
+            plans[camp] = followup_plan(camp)
+        plan, step = plans[camp], r["follow_up_count"] or 0
+        if step >= len(plan):
+            continue
+        try:
+            last = datetime.fromisoformat(r["last_sent_at"])
+        except (TypeError, ValueError):
+            continue
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if now - last >= timedelta(days=plan[step][0]):
+            out.append(dict(r))
+    return out
+
+
 def followups_due(settings=None):
-    """Emailed leads who haven't answered and are due a nudge (sent as a reply in the same thread)."""
-    settings = settings or db.get_settings()
+    """Emailed leads who haven't answered and are due their next follow-up (sent as a reply in
+    the same thread). Each campaign's own sequence decides how many and how far apart."""
     with db.get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM leads
                WHERE email != '' AND email_message_id != '' AND send_status = 'sent'
                  AND stage = 'contacted' AND do_not_contact = 0
-                 AND follow_up_count < ? AND last_sent_at IS NOT NULL AND last_sent_at < ?
-               ORDER BY last_sent_at""",
-            (int(settings["max_followups"]), _followup_cutoff(settings)),
-        ).fetchall()
-    return [dict(r) for r in rows]
+                 AND follow_up_count < ? AND last_sent_at IS NOT NULL
+               ORDER BY last_sent_at""", (MAX_SEQUENCE_STEPS,)).fetchall()
+    return _due_by_plan(rows)
 
 
 def hand_followups_due(settings=None):
     """The same, for leads you messaged by hand (WhatsApp, Instagram, Facebook, Yelp, SMS):
-    contacted, no reply recorded, and the follow-up delay has passed."""
-    settings = settings or db.get_settings()
+    contacted, no reply recorded, and the next step's wait has passed."""
     with db.get_conn() as conn:
         rows = conn.execute(
             """SELECT * FROM leads
                WHERE email_message_id = '' AND send_status = 'sent' AND channel != 'unknown'
                  AND stage = 'contacted' AND do_not_contact = 0
-                 AND follow_up_count < ? AND last_sent_at IS NOT NULL AND last_sent_at < ?
-               ORDER BY last_sent_at""",
-            (int(settings["max_followups"]), _followup_cutoff(settings)),
-        ).fetchall()
-    return [dict(r) for r in rows]
+                 AND follow_up_count < ? AND last_sent_at IS NOT NULL
+               ORDER BY last_sent_at""", (MAX_SEQUENCE_STEPS,)).fetchall()
+    return _due_by_plan(rows)
 
 
 def _first_email(lead_id):
@@ -866,7 +993,9 @@ def followup_text(lead, settings=None):
     """The nudge to send this lead: your own follow-up message (Settings > Messaging) with the
     blanks filled in, or -- when that's empty -- a short one written by the AI."""
     settings = settings or db.effective_settings(lead.get("campaign") or "")
-    fixed = (settings.get("followup_template") or "").strip()
+    plan = followup_plan(lead.get("campaign") or "", settings)
+    step = lead.get("follow_up_count") or 0
+    fixed = plan[step][1] if step < len(plan) else (settings.get("followup_template") or "").strip()
     if fixed:
         return final_message(lead, _clean_message(fixed, "phone"))
     if not llm.is_configured("draft"):
@@ -892,16 +1021,25 @@ def send_followup(lead_id):
     settings = db.get_settings()
     lead = db.get_lead(lead_id)
     _check_can_email(lead, settings)
-    if lead["follow_up_count"] >= int(settings["max_followups"]):
-        raise SendError(f"Already sent the maximum of {settings['max_followups']} follow-ups.", 400)
+    plan = followup_plan(lead["campaign"] or "")
+    if lead["follow_up_count"] >= len(plan):
+        raise SendError(f"Already sent all {len(plan)} follow-ups in this sequence.", 400)
     if not lead["email_message_id"]:
         raise SendError("This lead hasn't been emailed yet.", 400)
+    first = _first_email(lead_id)
+    ib, ok = pick_inbox(settings, first.get("inbox") or "main")
+    if not ok:
+        raise SendError("The inbox this lead was first emailed from has reached its limit for today.", 429)
+    with inboxes.using(ib):
+        return _send_followup_as(lead_id, lead, settings, first)
 
+
+def _send_followup_as(lead_id, lead, settings, first):
     text = followup_text(lead)
-    orig = _original_subject(lead_id) or f"Quick question for {lead['business_name'] or 'you'}"
+    orig = first.get("subject") or f"Quick question for {lead['business_name'] or 'you'}"
     subject = orig if orig.lower().startswith("re:") else f"Re: {orig}"
     msg = build_email(lead, subject, text, settings, in_reply_to=lead["email_message_id"])
-    msg.gmail_thread_id = _first_email(lead_id).get("thread_id") or None     # same conversation in Gmail
+    msg.gmail_thread_id = first.get("thread_id") or None     # same conversation in Gmail
     try:
         _deliver(msg)
     except Exception as e:  # noqa: BLE001
@@ -913,8 +1051,10 @@ def send_followup(lead_id):
 
     db.update_lead(lead_id, {"follow_up_count": lead["follow_up_count"] + 1,
                              "last_sent_at": schema.now_iso()})
-    db.add_event(lead_id, "followup_sent",
-                 json.dumps({"subject": subject, "message_id": msg["Message-ID"], "text": text}))
+    detail = {"subject": subject, "message_id": msg["Message-ID"], "text": text}
+    if inboxes.current_id() != "main":
+        detail["inbox"] = inboxes.current_id()
+    db.add_event(lead_id, "followup_sent", json.dumps(detail))
     return {"ok": True, "message": text}
 
 
@@ -1183,14 +1323,47 @@ def _worth_reading(header_bytes):
 
 
 def check_replies():
+    """Look through every connected inbox (the main one and any extra sending inboxes) for
+    replies to -- and bounces of -- emails we sent.
+
+    Read or unread makes no difference -- a reply you already opened on your phone still counts.
+    Nothing is marked as read. Each check carries on from where the last one stopped, so after
+    the first run only new mail is looked at."""
+    targets = [None] if imap_configured() else []
+    for ib in inboxes.extra():
+        if ib.get("enabled", True):
+            with inboxes.using(ib):
+                if imap_configured():
+                    targets.append(ib)
+    if not targets:
+        raise SendError("Reply checking isn't set up: add your email details under Settings > Connections.", 400)
+    total = {"checked": 0, "replied": 0, "suppressed": 0, "auto_replies": 0, "bounced": 0}
+    problems = []
+    for ib in targets:
+        with inboxes.using(ib):
+            try:
+                c = _check_one_inbox()
+            except SendError as e:
+                if len(targets) == 1:
+                    raise
+                problems.append(f"{(ib or {}).get('label') or from_address()}: {e}")
+                continue
+        for k in total:
+            total[k] += c.get(k, 0)
+    db.set_settings({"last_reply_check_at": schema.now_iso()})
+    if problems:
+        total["problems"] = problems
+    return total
+
+
+def _check_one_inbox():
     """Look through the inbox for replies to (and bounces of) emails we sent.
 
     Read or unread makes no difference -- a reply you already opened on your phone still counts.
     Nothing is marked as read. Each check carries on from where the last one stopped, so after
     the first run only new mail is looked at."""
-    if not imap_configured():
-        raise SendError("Reply checking isn't set up: add your email details under Settings > Connections.", 400)
     settings = db.get_settings()
+    iid = inboxes.current_id()
     since = datetime.now(timezone.utc) - timedelta(days=45)
     if settings.get("sending_started_at"):
         try:
@@ -1205,7 +1378,7 @@ def check_replies():
         netguard.check_mail_host(imap_host, 993)
     except netguard.Blocked as e:
         raise SendError(str(e), 400)
-    state = settings.get("imap_state") or {}
+    state = (settings.get("imap_state") if iid == "main" else _inbox_state(settings, iid).get("imap_state")) or {}
     new_state = None
     try:
         mail = imaplib.IMAP4_SSL(imap_host, timeout=30)
@@ -1261,10 +1434,11 @@ def check_replies():
                 pass
     except (imaplib.IMAP4.error, OSError) as e:
         raise SendError(f"Couldn't check the inbox: {e}", 502)
-    saved = {"last_reply_check_at": schema.now_iso()}
     if new_state and new_state != state:
-        saved["imap_state"] = new_state
-    db.set_settings(saved)
+        if iid == "main":
+            db.set_settings({"imap_state": new_state})
+        else:
+            _put_inbox_state(iid, imap_state=new_state)
     return counts
 
 
@@ -1368,8 +1542,9 @@ def run_send_bulk(ctx, params):
         filters["ids"] = params["ids"]
     ids = db.select_ids(filters)
     ctx.progress(0, len(ids))
-    ctx.log(f"{len(ids)} emails queued (limit today: {effective_daily_limit(settings)}, "
-            f"already sent today: {emails_sent_today(settings)})")
+    ctx.log(f"{len(ids)} emails queued (limit today: {total_daily_limit(settings)}, "
+            f"already sent today: {emails_sent_today(settings)})"
+            + (f", at most {params['max']} this run" if params.get("max") else ""))
     cap = provider_daily_cap()
     if cap and effective_daily_limit(settings) > cap:
         ctx.log(f"Note: your mail provider allows about {cap:,} emails a day per account; your limit is higher, so "
@@ -1377,8 +1552,8 @@ def run_send_bulk(ctx, params):
                 "Mailgun, Brevo) under Settings > Connections.")
     sent = failed = skipped = 0
     stuck = None          # a lead whose send failed for a reason that may be ours, not theirs
-    with smtp_session() if email_transport() == "smtp" else _nullcontext():
-        sent, failed, skipped, stuck = _bulk_loop(ctx, ids, settings)
+    with smtp_session():
+        sent, failed, skipped, stuck = _bulk_loop(ctx, ids, settings, int(params.get("max") or 0))
     if stuck is not None:
         ctx.log(f"Lead {stuck[0]} was left unsent: {stuck[1]}")
     return f"{sent} sent, {failed} failed, {skipped} skipped"
@@ -1389,10 +1564,13 @@ def _nullcontext():
     yield
 
 
-def _bulk_loop(ctx, ids, settings):
+def _bulk_loop(ctx, ids, settings, most=0):
     sent = failed = skipped = 0
     stuck = None
     for i, lead_id in enumerate(ids, 1):
+        if most and sent >= most:
+            ctx.log(f"Sent the {most} you asked for in this run -- the rest stay queued.")
+            break
         if ctx.stopped:
             ctx.log("Stopped.")
             break
@@ -1457,7 +1635,7 @@ def run_followups(ctx, params):
     halt = too_many_bounces(settings)
     if halt:
         raise SendError(halt)
-    with smtp_session() if email_transport() == "smtp" else _nullcontext():
+    with smtp_session():
         return _followup_loop(ctx, due, settings)
 
 

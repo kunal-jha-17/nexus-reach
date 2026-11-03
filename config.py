@@ -10,7 +10,9 @@ their own quota. See USER_SETTABLE below for exactly which names that covers.
 Day-to-day settings (templates, limits, channel order...) live in the Settings
 tab and are stored in each user's own database instead.
 """
+import contextvars
 import os
+from contextlib import contextmanager
 from pathlib import Path
 
 import userctx
@@ -30,7 +32,7 @@ USER_SETTABLE = {
     "SMTP_USER", "SMTP_PASS", "SMTP_HOST", "SMTP_PORT", "SMTP_FROM_NAME", "SMTP_FROM_EMAIL", "EMAIL_SEND_VIA",
     "IMAP_USER", "IMAP_PASS", "IMAP_HOST",
     "SERPAPI_KEY", "SERPAPI_MONTHLY_LIMIT",
-    "IG_USERNAME", "IG_PASSWORD",
+    "IG_USERNAME", "IG_PASSWORD", "APIFY_TOKEN",
     "DEFAULT_COUNTRY_CODE", "GMAIL_REFRESH_TOKEN",
 }
 # The server owner may share their AI keys with everyone (SHARE_LLM_WITH_USERS=1).
@@ -43,7 +45,26 @@ def _server_env(name, default=""):
     return os.environ.get(name, default)
 
 
+_OVERRIDES = contextvars.ContextVar("env_overrides", default=None)
+
+
+@contextmanager
+def overrides(values):
+    """Inside this block env(name) answers from `values` for the names it holds -- used to send
+    as one of several inboxes without touching the account's main settings. A blank value means
+    "not set" (it does NOT fall back to the account's own value)."""
+    token = _OVERRIDES.set(dict(values or {}))
+    try:
+        yield
+    finally:
+        _OVERRIDES.reset(token)
+
+
 def env(name, default=""):
+    ov = _OVERRIDES.get()
+    if ov is not None and name in ov:
+        v = ov[name]
+        return default if v in (None, "") else str(v)
     user = userctx.get_user()
     if user is not None and name in USER_SETTABLE:
         own = (user.get("secrets") or {}).get(name)

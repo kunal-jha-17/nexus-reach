@@ -245,13 +245,10 @@ class TestFiltering(Base):
     def test_judge_and_failure_leaves_unjudged(self):
         a = self.add(business_name="Good HVAC", category_raw="HVAC contractor")
         b = self.add(business_name="Flaky Roofing", category_raw="Roofer")
-        replies = ['{"fits": true, "confidence": "high", "reason": "no website"}', llm.LLMError("boom")]
-
-        def fake(prompt, **kw):
-            r = replies.pop(0)
-            if isinstance(r, Exception):
-                raise r
-            return r
+        def fake(prompt, **kw):            # leads are judged side by side: answer by lead, not by call order
+            if "Flaky Roofing" in prompt:
+                raise llm.LLMError("boom")
+            return '{"fits": true, "confidence": "high", "reason": "no website"}'
         with mock.patch.object(llm, "complete", side_effect=fake):
             out = filtering.run_judge(FakeCtx(), {})
         la, lb = db.get_lead(a), db.get_lead(b)

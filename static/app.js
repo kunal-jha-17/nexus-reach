@@ -218,6 +218,27 @@ function syncScrapeForm() {
   $('#sc-query').placeholder = p === 'instagram' ? 'dubaidentist' : 'dental clinic; orthodontist';
   $('#sc-location').closest('.field').hidden = p === 'instagram';
   $('#sc-location').placeholder = p === 'yelp' ? 'London, UK (required)' : 'Dubai, UAE; Abu Dhabi, UAE';
+  const apify = p === 'apify_maps';
+  $('#sc-max').max = apify ? 5000 : 200;
+  if (!apify && +$('#sc-max').value > 200) $('#sc-max').value = 200;
+  $('#sc-contacts-row').hidden = !apify;
+  if (state.config) {
+    const needBrowser = !apify;
+    $('#sc-go').disabled = needBrowser ? !state.config.playwright : !state.config.apify;
+    $('#sc-schedule').disabled = needBrowser ? !state.config.playwright : !state.config.apify;
+    const nb = $('#sc-nobrowser');
+    if (apify) {
+      nb.hidden = !!state.config.apify;
+      nb.innerHTML = 'Add your Apify API token under <a href="#settings/connections">Settings → Connections</a> to scrape through Apify '
+        + '(apify.com → Settings → Integrations). Apify charges your account about $4 per 1,000 places (check its pricing page).';
+    } else {
+      nb.hidden = !!state.config.playwright;
+      nb.innerHTML = "This server doesn't have the scraping browser installed &mdash; most free hosts " +
+        "(including a plain Render deploy) can't have one added in the build step. Use <b>Google Maps via Apify</b> above, " +
+        "or scrape on your own computer and <a href=\"#find\">import the CSV here</a>. (Self-hosting? The included " +
+        "<code>Dockerfile</code> bundles the browser so scraping works on the server too &mdash; see the README.)";
+    }
+  }
 }
 $('#sc-platform').addEventListener('change', syncScrapeForm);
 
@@ -228,16 +249,6 @@ async function loadFind() {
     state.noSiteDefaulted = true;
   }
   syncScrapeForm();
-  const noBrowser = $('#sc-nobrowser');
-  noBrowser.hidden = !!state.config.playwright;
-  if (!state.config.playwright) {
-    noBrowser.innerHTML = "This server doesn't have the scraping browser installed &mdash; most free hosts " +
-      "(including a plain Render deploy) can't have one added in the build step. Scrape on your own computer " +
-      "instead, then <a href=\"#find\">import the CSV here</a>. (Self-hosting? The included <code>Dockerfile</code> " +
-      "bundles the browser so scraping works on the server too &mdash; see the README.)";
-  }
-  $('#sc-go').disabled = !state.config.playwright;
-  $('#sc-schedule').disabled = !state.config.playwright;
   if (state.prefillCampaign) {
     $('#imp-campaign').value = state.prefillCampaign; $('#sc-campaign').value = state.prefillCampaign;
     state.prefillCampaign = '';
@@ -255,7 +266,8 @@ function scrapeBody() {
   const tidy = (v) => v.split(/[;\n]+/).map((x) => x.trim()).filter(Boolean).join('; ');
   return { platform: $('#sc-platform').value, query: tidy($('#sc-query').value), location: tidy($('#sc-location').value),
     max_results: +$('#sc-max').value || 30, campaign: $('#sc-campaign').value.trim(),
-    only_no_website: $('#sc-nosite').checked, then_pipeline: $('#sc-then').checked };
+    only_no_website: $('#sc-nosite').checked, then_pipeline: $('#sc-then').checked,
+    contacts: $('#sc-platform').value === 'apify_maps' && $('#sc-contacts').checked };
 }
 $('#sc-go').addEventListener('click', () => run(async () => {
   const r = await api('/api/scrape', { method: 'POST', body: scrapeBody() });
@@ -384,6 +396,14 @@ function updateScrapePlan() {
   const q = splitMulti($('#sc-query').value).length;
   const l = $('#sc-platform').value === 'instagram' ? 0 : splitMulti($('#sc-location').value).length;
   const n = q * Math.max(l, 1), max = +$('#sc-max').value || 30;
+  if ($('#sc-platform').value === 'apify_maps' && n >= 1) {
+    const places = n * max, usd = places * 4 / 1000;
+    el.hidden = false; el.className = 'hint' + (n > 40 ? ' bad-text' : '');
+    el.textContent = n > 40 ? `That's ${n} searches — the most one run can do is 40.`
+      : `${n} search${n === 1 ? '' : 'es'} × up to ${max.toLocaleString()} places = at most ${places.toLocaleString()} places, `
+        + `about $${usd.toFixed(2)} on Apify at ~$4 per 1,000${$('#sc-contacts').checked ? ' plus the contact add-on' : ''} (your Apify plan decides the real price).`;
+    return;
+  }
   if (n <= 1) { el.hidden = true; return; }
   el.hidden = false;
   el.className = 'hint' + (n > 40 ? ' bad-text' : '');
@@ -391,7 +411,7 @@ function updateScrapePlan() {
     ? `That's ${n} searches — the most one run can do is 40. Remove some, or split it into two runs.`
     : `${q} search term${q === 1 ? '' : 's'}${l ? ` × ${l} place${l === 1 ? '' : 's'}` : ''} = ${n} searches, run one after another, up to ${max} listings each (${n * max} listings checked at most).`;
 }
-['#sc-query', '#sc-location', '#sc-max', '#sc-platform'].forEach((s) => ['input', 'change'].forEach((ev) => $(s).addEventListener(ev, updateScrapePlan)));
+['#sc-query', '#sc-location', '#sc-max', '#sc-platform', '#sc-contacts'].forEach((s) => ['input', 'change'].forEach((ev) => $(s).addEventListener(ev, updateScrapePlan)));
 attachSuggest('#f-q', 'lead_search');
 
 /* ------------------------------------------------------------ leads table */
@@ -697,6 +717,8 @@ function fillCampaignSettings(d) {
       : 'Showing the built-in sample — edit it and save to use your own.';
   $('#cs-info').value = c.business_info || '';
   $('#cs-cc').value = c.country_code || '';
+  state.csSeq.set(c.followup_steps || []);
+  $('#cs-seq-on').checked = !!(c.followup_steps || []).length; seqToggle($('#cs-seq-on').checked, '#cs-seq', '#cs-seq-add');
   $('#cs-scoreweb').value = c.score_no_website || '';
   const prioOn = !!(c.channel_priority && c.channel_priority.length);
   $('#cs-prio-on').checked = prioOn; state.csPrio.set(prioOn ? c.channel_priority : d.global.channel_priority); $('#cs-prio').hidden = !prioOn;
@@ -714,6 +736,7 @@ $('#cs-save').addEventListener('click', () => run(async () => {
   await api(`/api/campaigns/${encodeURIComponent(d.campaign.name)}`, { method: 'PUT', body: {
     description: $('#cs-desc').value, criteria: unchanged ? '' : val, business_info: $('#cs-info').value,
     country_code: $('#cs-cc').value.trim(), score_no_website: $('#cs-scoreweb').value,
+    followup_steps: $('#cs-seq-on').checked ? state.csSeq.get() : [],
     channel_priority: $('#cs-prio-on').checked ? state.csPrio.get() : [],
     templates: $('#cs-tpl-on').checked ? state.csTpl.get() : [],
   } });
@@ -856,9 +879,16 @@ async function loadOutreach() {
   ]);
   const checked = !es.imap_configured ? 'inbox not connected' : !es.reply_check_minutes ? 'only when you press Check'
     : `automatic, every ${es.reply_check_minutes} min` + (es.last_reply_check_at ? ` (last ${ago(es.last_reply_check_at)})` : '');
+  if (document.activeElement !== $('#em-limit')) $('#em-limit').value = es.max_limit;
+  const capNote = es.provider_cap && es.max_limit > es.provider_cap
+    ? `<div class="kv"><span>Your mail account</span><b class="warn-text">allows about ${es.provider_cap.toLocaleString()} a day</b></div>` : '';
   $('#em-status').innerHTML =
-    `<div class="kv"><span>Sent today (all campaigns)</span><b>${es.sent_today} of ${es.daily_limit}</b></div>` +
-    (es.warmup_active ? `<div class="kv"><span>Warm-up</span><b>capped below your ${es.max_limit}/day limit for now</b></div>` : '') +
+    `<div class="kv"><span>Sent today (all campaigns)</span><b>${es.sent_today.toLocaleString()} of ${es.daily_limit.toLocaleString()}</b></div>` +
+    (es.warmup_active ? `<div class="kv"><span>Warm-up</span><b>${es.daily_limit.toLocaleString()} today of your ${es.max_limit.toLocaleString()}/day`
+      + (es.warmup_days_left ? ` · full limit in about ${plural(es.warmup_days_left, 'day')}` : '') + '</b></div>' : '') +
+    (es.inboxes && es.inboxes.length > 1 ? `<div class="kv"><span>Sending inboxes</span><b>${es.inboxes.length} in rotation</b></div>` : '') +
+    capNote +
+    `<div class="kv"><span>Gap between emails</span><b>${es.delay_seconds}s${state.settings && state.settings.auto_pace ? ' (paced automatically)' : ''}</b></div>` +
     (es.window_open ? '' : `<div class="kv"><span>Sending hours</span><b class="warn-text">closed right now</b></div>`) +
     `<div class="kv"><span>Reply checking</span><b>${esc(checked)}</b></div>` +
     (es.window_open ? '' : `<p class="hint" style="margin-top:8px">${esc(es.window_note)}</p>`);
@@ -900,7 +930,32 @@ async function loadOutreach() {
      <button class="btn small" data-hfudone="${l.id}">Mark followed up</button></div>`).join('')
     : '<div class="empty small"><b>No follow-ups due by hand</b>Leads you messaged who haven\'t replied show up here after your follow-up delay.</div>';
   state.handQueue = Object.fromEntries([...queue, ...hfu].map((l) => [l.id, l]));
+  state.perf = await api('/api/performance' + (q ? `?${q}` : ''));
+  renderPerformance();
 }
+function renderPerformance() {
+  const p = state.perf || {}, tab = state.perfTab || 'by_template';
+  $$('#pf-tabs [data-pf]').forEach((b) => { b.setAttribute('aria-pressed', String(b.dataset.pf === tab)); b.hidden = b.dataset.pf === 'by_campaign' && !(p.by_campaign || []).length; });
+  const rows = p[tab] || [];
+  const label = (r) => (tab === 'by_channel' ? (CHANNEL_LABEL[r.name] || r.name) : r.name);
+  const best = rows.length > 1 ? Math.max(...rows.filter((r) => r.contacted >= 20).map((r) => r.reply_rate), -1) : -1;
+  $('#pf-table').innerHTML = rows.length ? `<table class="perf"><thead><tr><th>${tab === 'by_template' ? 'Template' : tab === 'by_channel' ? 'Channel' : 'Campaign'}</th>
+      <th class="num">Contacted</th><th class="num">Replied</th><th class="num">Interested</th><th class="num">Replied after a follow-up</th>
+      <th class="num">Bounced</th><th class="num">Opted out</th><th class="num">Won</th></tr></thead><tbody>${rows.map((r) =>
+      `<tr><td>${esc(label(r))}${r.reply_rate === best && best > 0 ? ' <span class="chip ok">best</span>' : ''}</td>
+        <td class="num">${r.contacted.toLocaleString()}</td>
+        <td class="num">${r.replied} <span class="muted">(${r.reply_rate}%)</span></td>
+        <td class="num">${r.interested} <span class="muted">(${r.interested_rate}%)</span></td>
+        <td class="num">${r.replied_after_followup}</td>
+        <td class="num ${r.bounce_rate > 3 ? 'bad-text' : ''}">${r.bounced} <span class="muted">(${r.bounce_rate}%)</span></td>
+        <td class="num">${r.opted_out}</td><td class="num">${r.won}</td></tr>`).join('')}</tbody></table>
+      <p class="hint" style="margin-top:8px">Fewer than about 50 contacted per row is too few to tell two templates apart.</p>`
+    : '<div class="empty small"><b>Nothing to compare yet</b>Once you\'ve contacted some leads, reply and interest rates show up here.</div>';
+}
+$('#pf-tabs').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-pf]'); if (!b) return;
+  state.perfTab = b.dataset.pf; renderPerformance();
+});
 $('#dr-campaign').addEventListener('change', () => run(loadOutreach));
 $('#dr-exact').addEventListener('change', () => { state.exactTouched = true; });
 $('#dr-go').addEventListener('click', () => run(async () => {
@@ -910,10 +965,20 @@ $('#dr-go').addEventListener('click', () => run(async () => {
 }));
 $('#em-send').addEventListener('click', () => run(async () => {
   const camp = $('#dr-campaign').value;
-  if (!confirm(`Start sending emails to every lead with a message${camp ? ` in "${camp}"` : ''}, paced by your delay and daily limit?`)) return;
-  await api('/api/send-bulk', { method: 'POST', body: { campaign: camp, only_fit: $('#em-onlyfit').checked } });
+  const cap = $('#em-max').value.trim();
+  if (!confirm(`Start sending emails to ${cap ? `up to ${(+cap).toLocaleString()} leads` : 'every lead'} with a message${camp ? ` in "${camp}"` : ''}, paced by your delay and daily limit?`)) return;
+  const max = $('#em-max').value.trim();
+  await api('/api/send-bulk', { method: 'POST', body: { campaign: camp, only_fit: $('#em-onlyfit').checked, max: max ? +max : null } });
   toast('Sending started.', 'ok'); refreshJobs();
 }));
+$('#em-limit-save').addEventListener('click', () => run(async () => {
+  const v = Math.round(+$('#em-limit').value);
+  if (!v || v < 1) throw new Error('Enter how many emails a day, e.g. 500');
+  state.settings = await api('/api/settings', { method: 'PUT', body: { email_daily_limit: v } });
+  toast(`Daily limit set to ${state.settings.email_daily_limit.toLocaleString()} emails.`, 'ok');
+  loadOutreach();
+}));
+$('#em-limit').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('#em-limit-save').click(); });
 $('#em-replies').addEventListener('click', () => run(async () => {
   const b = $('#em-replies'); b.disabled = true; b.textContent = 'Checking…';
   try {
@@ -975,6 +1040,35 @@ function TemplateEditor(root) {
   };
 }
 
+function SequenceEditor(root) {
+  // Follow-up steps: wait N days after the previous message, then send this (blank = the AI writes it).
+  let list = [];
+  function render() {
+    root.innerHTML = list.map((st, i) =>
+      `<div class="tpl" data-i="${i}"><div class="row">
+         <div class="field"><label>Follow-up ${i + 1}: wait (days after the previous message)</label>
+           <input data-s="days" type="number" min="1" max="365" value="${esc(st.days)}"></div>
+         <button class="btn small danger" data-s-del="${i}">Remove</button></div>
+         <textarea data-s="body" rows="3" aria-label="Follow-up ${i + 1} text"
+           placeholder="Leave empty and the AI writes a short nudge for each lead. Blanks like {business_name} work.">${esc(st.body || '')}</textarea></div>`).join('')
+      || '<div class="empty small"><b>No steps</b>Add a step to start the sequence.</div>';
+  }
+  root.addEventListener('input', (e) => {
+    const box = e.target.closest('.tpl'); if (!box || !e.target.dataset.s) return;
+    list[+box.dataset.i][e.target.dataset.s] = e.target.dataset.s === 'days' ? +e.target.value : e.target.value;
+  });
+  root.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-s-del]'); if (!b) return;
+    list.splice(+b.dataset.sDel, 1); render();
+  });
+  return {
+    set(v) { list = (v || []).map((x) => ({ days: x.days, body: x.body || '' })); render(); },
+    get() { return list.map((x) => ({ days: Math.max(1, Math.round(+x.days || 1)), body: x.body || '' })); },
+    add() { if (list.length >= 10) return toast('A sequence can have up to 10 follow-ups.'); const last = list[list.length - 1];
+      list.push({ days: last ? Math.min(365, last.days + 2) : 3, body: '' }); render(); },
+  };
+}
+
 function PriorityEditor(root) {
   let items = [];
   const all = CHANNELS.filter((c) => c !== 'unknown');
@@ -1010,6 +1104,23 @@ state.tplEditor = TemplateEditor($('#st-templates'));
 state.prioEditor = PriorityEditor($('#st-priority'));
 state.csTpl = TemplateEditor($('#cs-tpl'));
 state.csPrio = PriorityEditor($('#cs-prio'));
+state.seqEditor = SequenceEditor($('#st-seq'));
+state.csSeq = SequenceEditor($('#cs-seq'));
+const seqToggle = (on, box, add) => { $(box).hidden = !on; $(add).hidden = !on; };
+$('#st-seq-on').addEventListener('change', (e) => {
+  if (e.target.checked && !state.seqEditor.get().length) {
+    // start from what's set now: the single message, repeated
+    const s = state.settings || {}, n = Math.max(1, Math.min(10, +($('#st-fumax').value || s.max_followups || 2))), d = +($('#st-fudays').value || s.followup_delay_days || 3);
+    state.seqEditor.set(Array.from({ length: n }, () => ({ days: d, body: $('#st-followup').value })));
+  }
+  seqToggle(e.target.checked, '#st-seq', '#st-seq-add');
+});
+$('#st-seq-add').addEventListener('click', () => state.seqEditor.add());
+$('#cs-seq-on').addEventListener('change', (e) => {
+  if (e.target.checked && !state.csSeq.get().length) state.csSeq.set([{ days: 3, body: '' }, { days: 4, body: '' }]);
+  seqToggle(e.target.checked, '#cs-seq', '#cs-seq-add');
+});
+$('#cs-seq-add').addEventListener('click', () => state.csSeq.add());
 $('#st-tpl-add').addEventListener('click', () => state.tplEditor.add());
 
 /* ------------------------------------------------------------- settings */
@@ -1034,6 +1145,9 @@ const CONN_GROUPS = [
     fields: ['SERPAPI_KEY', 'SERPAPI_MONTHLY_LIMIT'] },
   { title: 'Instagram scraping', ready: (c) => c.instagram_login, help: 'Use a burner account, never your real one. Optional.',
     fields: ['IG_USERNAME', 'IG_PASSWORD'] },
+  { title: 'Apify (Google Maps at scale)', ready: (c) => c.apify, test: 'apify',
+    help: 'Scrape hundreds or thousands of Google Maps places a search on Apify\'s machines instead of this server. Token: apify.com → Settings → Integrations. Apify bills your account per place (about $4 per 1,000; free usage each month).',
+    fields: ['APIFY_TOKEN', null] },
 ];
 const CONN_LABEL = {
   LLM_PROVIDER: 'Which AI to use', GROQ_API_KEY: 'Groq API key', GROQ_MODEL: 'Groq model',
@@ -1043,7 +1157,7 @@ const CONN_LABEL = {
   SMTP_FROM_NAME: 'Sender name', SMTP_HOST: 'Mail server (SMTP)', SMTP_PORT: 'Mail server port',
   IMAP_USER: 'Inbox login', IMAP_PASS: 'Inbox password', IMAP_HOST: 'Inbox server (IMAP)',
   SERPAPI_KEY: 'SerpAPI key', SERPAPI_MONTHLY_LIMIT: 'Searches per month', IG_USERNAME: 'Burner username', IG_PASSWORD: 'Burner password',
-  DEFAULT_COUNTRY_CODE: 'Default country code', GMAIL_REFRESH_TOKEN: 'Gmail API refresh token',
+  DEFAULT_COUNTRY_CODE: 'Default country code', GMAIL_REFRESH_TOKEN: 'Gmail API refresh token', APIFY_TOKEN: 'Apify API token',
 };
 const CONN_PLACEHOLDER = { SMTP_HOST: 'smtp.gmail.com', SMTP_PORT: '587', IMAP_HOST: 'imap.gmail.com', SERPAPI_MONTHLY_LIMIT: '100',
   GROQ_MODEL: 'default', OPENAI_MODEL: 'default', GEMINI_MODEL: 'default', DEFAULT_COUNTRY_CODE: '1', SMTP_FROM_NAME: 'e.g. Kunal from NeuroSpark',
@@ -1164,6 +1278,82 @@ $('#conn-save').addEventListener('click', () => run(async () => {
   toast(r ? 'Connections saved.' : 'Nothing changed.');
 }));
 
+/* ------------------------------------------------------ sending inboxes */
+async function loadInboxes() {
+  const d = await api('/api/inboxes');
+  state.inboxes = d.inboxes;
+  badge('#ib-n', d.inboxes.length);
+  const via = (t) => (t === 'gmail_api' ? 'Gmail API' : t === 'smtp' ? 'SMTP' : 'not ready');
+  const mainRow = `<div class="list-row"><div class="grow"><b>Main inbox</b> <span class="muted">${esc(d.main.from_email || 'not set up')}</span>
+      <div class="sub">${via(d.main.transport)} · ${d.main.sent_today.toLocaleString()} of ${d.main.limit_today.toLocaleString()} sent today
+      (limit ${d.main.daily_limit.toLocaleString()}/day, set under Sending) · details in Email sending above</div></div></div>`;
+  $('#ib-list').innerHTML = mainRow + d.inboxes.map((ib) =>
+    `<div class="list-row" data-ib-row="${esc(ib.id)}"><div class="grow"><b>${esc(ib.label)}</b>
+       ${ib.enabled ? '' : '<span class="chip stopped">paused</span>'} ${ib.transport ? '' : '<span class="chip warn">not ready</span>'}
+       <div class="sub">${esc(ib.from_email || ib.smtp_user)} · ${via(ib.transport)} · ${ib.sent_today.toLocaleString()} of ${ib.limit_today.toLocaleString()} today
+       (limit ${ib.daily_limit.toLocaleString()}/day${ib.provider_cap && ib.daily_limit > ib.provider_cap ? `, but the provider allows ~${ib.provider_cap.toLocaleString()}` : ''})</div>
+       <div class="sub" data-ib-result="${esc(ib.id)}"></div></div>
+     <button class="btn small" data-ib-test="${esc(ib.id)}">Test</button>
+     <button class="btn small" data-ib-toggle="${esc(ib.id)}">${ib.enabled ? 'Pause' : 'Resume'}</button>
+     <button class="btn small" data-ib-edit="${esc(ib.id)}">Edit</button>
+     <button class="btn small danger" data-ib-del="${esc(ib.id)}">Remove</button></div>`).join('')
+    + (d.inboxes.length ? `<p class="hint" style="margin-top:8px">All inboxes together: up to <b>${d.total_today.toLocaleString()}</b> emails today.</p>` : '');
+}
+function inboxForm(ib) {
+  const f = $('#ib-form');
+  $('#ib-provider').innerHTML = SMTP_PROVIDERS.map(([v, l]) => opt(v, l, false)).join('');
+  $$('#ib-form [data-ib]').forEach((el) => {
+    const k = el.dataset.ib;
+    if (el.type === 'password') { el.value = ''; el.placeholder = ib && ib[k + '_set'] ? 'saved' : 'not set'; } else el.value = ib ? (ib[k] ?? '') : (k === 'daily_limit' ? 50 : '');
+  });
+  f.dataset.id = ib ? ib.id : '';
+  $('#ib-form-title').textContent = ib ? `Edit ${ib.label}` : 'New inbox';
+  f.hidden = false; f.scrollIntoView({ block: 'nearest' });
+}
+$('#ib-add').addEventListener('click', () => inboxForm(null));
+$('#ib-cancel').addEventListener('click', () => { $('#ib-form').hidden = true; });
+$('#ib-provider').addEventListener('change', (e) => {
+  const p = SMTP_PROVIDERS.find(([v]) => v === e.target.value); if (!p || !p[0]) return;
+  $('#ib-form [data-ib="smtp_host"]').value = p[2]; $('#ib-form [data-ib="smtp_port"]').value = p[3];
+  const imap = { gmail: 'imap.gmail.com', m365: 'outlook.office365.com', zoho_in: 'imap.zoho.in', zoho: 'imap.zoho.com',
+    hostinger: 'imap.hostinger.com', godaddy: 'imap.secureserver.net' }[p[0]];
+  if (imap) $('#ib-form [data-ib="imap_host"]').value = imap;
+  if (p[0] !== 'gmail') $('#ib-form [data-ib="send_via"]').value = 'smtp';
+});
+$('#ib-form').addEventListener('submit', (e) => {
+  e.preventDefault();
+  run(async () => {
+    const b = { id: $('#ib-form').dataset.id || undefined };
+    $$('#ib-form [data-ib]').forEach((el) => { b[el.dataset.ib] = el.dataset.ib === 'daily_limit' ? +el.value : el.value.trim(); });
+    await api('/api/inboxes', { method: 'POST', body: b });
+    $('#ib-form').hidden = true; toast('Inbox saved. Press Test to check its login.', 'ok');
+    await loadConfig(); await loadInboxes();
+  });
+});
+$('#ib-list').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  const id = b.dataset.ibTest || b.dataset.ibToggle || b.dataset.ibEdit || b.dataset.ibDel; if (!id) return;
+  const ib = (state.inboxes || []).find((x) => x.id === id);
+  run(async () => {
+    if (b.dataset.ibEdit) return inboxForm(ib);
+    if (b.dataset.ibDel) {
+      if (!confirm(`Remove ${ib.label}? Follow-ups to leads first emailed from it will go from another inbox.`)) return;
+      await api(`/api/inboxes/${encodeURIComponent(id)}`, { method: 'DELETE' }); return loadInboxes();
+    }
+    if (b.dataset.ibToggle) {
+      await api('/api/inboxes', { method: 'POST', body: { id, enabled: !ib.enabled } }); return loadInboxes();
+    }
+    const out = $(`[data-ib-result="${id}"]`); out.textContent = 'Testing…'; out.className = 'sub';
+    try {
+      const r = await api(`/api/inboxes/${encodeURIComponent(id)}/test`, { method: 'POST', body: { kind: 'smtp' } });
+      let msg = '✓ ' + r.message;
+      try { const i = await api(`/api/inboxes/${encodeURIComponent(id)}/test`, { method: 'POST', body: { kind: 'imap' } }); msg += ' Replies: ✓ ' + i.message; }
+      catch (err) { msg += ' Replies: ✗ ' + err.message; }
+      out.textContent = msg; out.className = 'sub ok-text';
+    } catch (err) { out.textContent = '✗ ' + err.message; out.className = 'sub bad-text'; }
+  });
+});
+
 const SETTINGS_TABS = ['messaging', 'sending', 'connections', 'account'];
 function showSettingsTab(name) {
   const tab = SETTINGS_TABS.includes(name) ? name : 'messaging';
@@ -1194,6 +1384,8 @@ async function fillSettingsView() {
   $('#st-scoreweb').checked = s.score_no_website !== false;
   $('#st-autoremove-warn').hidden = !s.auto_remove_rejected;
   $('#st-exact').checked = !!s.exact_templates; $('#st-followup').value = s.followup_template || '';
+  state.seqEditor.set(s.followup_steps || []);
+  $('#st-seq-on').checked = !!(s.followup_steps || []).length; seqToggle($('#st-seq-on').checked, '#st-seq', '#st-seq-add');
   $('#st-window').checked = !!s.send_window_enabled; $('#st-tz').value = s.timezone || '';
   $('#st-start').innerHTML = Array.from({ length: 24 }, (_, h) => opt(h, hourLabel(h), h === s.send_start_hour)).join('');
   $('#st-end').innerHTML = Array.from({ length: 24 }, (_, i) => opt(i + 1, hourLabel(i + 1), i + 1 === s.send_end_hour)).join('');
@@ -1212,6 +1404,7 @@ async function fillSettingsView() {
   const conn = await api('/api/connections');
   renderConnections(conn.fields);
   $('#conn-unreadable').hidden = !conn.unreadable;
+  await loadInboxes();
   renderUsers();
   renderStorage();
 }
@@ -1251,6 +1444,7 @@ $('#st-save').addEventListener('click', () => run(async () => {
     score_no_website: $('#st-scoreweb').checked, auto_pace: $('#st-autopace').checked,
     max_bounce_rate: num('#st-bounce', 5),
     exact_templates: $('#st-exact').checked, followup_template: $('#st-followup').value,
+    followup_steps: $('#st-seq-on').checked ? state.seqEditor.get() : [],
     send_window_enabled: $('#st-window').checked, send_start_hour: +$('#st-start').value, send_end_hour: +$('#st-end').value,
     send_days: $$('#st-days input:checked').map((c) => +c.value), timezone: $('#st-tz').value.trim(),
     reply_check_minutes: +$('#st-replymin').value,

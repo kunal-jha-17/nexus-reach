@@ -122,6 +122,8 @@
         </div>
         <div class="field"><label class="check"><input type="checkbox" id="cs-prio-on"> Use a different channel order for this campaign</label>
           <div id="cs-prio"></div></div>
+        <div class="field"><label class="check"><input type="checkbox" id="cs-seq-on"> Use a different follow-up sequence for this campaign</label>
+          <div id="cs-seq" hidden></div><button class="btn small" id="cs-seq-add" hidden type="button">Add follow-up step</button></div>
         <div class="field"><label class="check"><input type="checkbox" id="cs-tpl-on"> Use different message templates for this campaign</label>
           <div id="cs-tpl"></div><button class="btn small" id="cs-tpl-add" hidden>Add template</button>
           <p class="hint placeholder-help" hidden id="cs-tpl-help"></p></div>
@@ -160,6 +162,7 @@
             <div class="field"><label for="sc-platform">Where</label>
               <select id="sc-platform">
                 <option value="google_maps">Google Maps</option>
+                <option value="apify_maps">Google Maps via Apify (hundreds at once)</option>
                 <option value="yelp">Yelp</option>
                 <option value="instagram">Instagram (hashtag)</option>
               </select></div>
@@ -176,6 +179,8 @@
           <div class="checks">
             <label class="check"><input type="checkbox" id="sc-nosite"> <span>Only keep businesses with <b>no website</b>
               <span class="muted">&mdash; &ldquo;listings to check&rdquo; is then how many are looked at, not how many are kept</span></span></label>
+            <label class="check" id="sc-contacts-row" hidden><input type="checkbox" id="sc-contacts"> <span>Also find <b>emails and social profiles</b> on each business's website
+              <span class="muted">(Apify charges extra for this)</span></span></label>
             <label class="check"><input type="checkbox" id="sc-then"> <span>When it finishes, <b>judge, enrich and draft</b> what it found
               <span class="muted">&mdash; nothing is sent</span></span></label>
           </div>
@@ -329,6 +334,13 @@
         <div class="card">
           <h2>2. Send the emails</h2>
           <div id="em-status"></div>
+          <div class="row">
+            <div class="field"><label for="em-limit">Emails a day <span class="muted">(all campaigns)</span></label>
+              <div class="row-tight"><input id="em-limit" type="number" min="1" max="100000" inputmode="numeric">
+                <button class="btn small" id="em-limit-save" type="button">Save</button></div></div>
+            <div class="field"><label for="em-max">Send at most <span class="muted">(this run; blank = up to today's limit)</span></label>
+              <input id="em-max" type="number" min="1" max="100000" inputmode="numeric" placeholder="no extra cap"></div>
+          </div>
           <div class="checks">
             <label class="check"><input type="checkbox" id="em-onlyfit"> <span>Only leads judged as Fits</span></label>
           </div>
@@ -338,6 +350,17 @@
           </div>
           <div data-jobs="send_bulk,followups" data-limit="2" data-quiet="1"></div>
         </div>
+      </div>
+      <div class="card" id="pf-card">
+        <h2>What's working</h2>
+        <p class="hint">Of the leads you contacted: how many answered, were interested, bounced or opted out &mdash; by template,
+           channel and campaign. Each lead counts once, however many follow-ups it got.</p>
+        <div class="seg" id="pf-tabs" role="tablist">
+          <button class="btn small" data-pf="by_template" aria-pressed="true">Templates</button>
+          <button class="btn small" data-pf="by_channel">Channels</button>
+          <button class="btn small" data-pf="by_campaign">Campaigns</button>
+        </div>
+        <div id="pf-table" class="tablewrap"></div>
       </div>
       <div class="card">
         <h2>Replies to answer <span class="count-badge" id="rp-n" hidden></span></h2>
@@ -408,6 +431,12 @@
           <p class="hint">Sent to leads who haven't answered. Blanks like <code>{business_name}</code> work here too.
              Leave it empty and the AI writes a short nudge for each lead instead.</p>
           <textarea id="st-followup" rows="3" placeholder="Hi {first_name|there}, just floating this back up — is this something you'd want for {business_name}?"></textarea>
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="st-seq-on"> <span><b>Use a sequence</b> &mdash; a different message and wait for each follow-up
+              <span class="muted">(replaces the message above and "Follow up after / Follow-ups per lead" under Sending)</span></span></label>
+          </div>
+          <div id="st-seq" hidden></div>
+          <button class="btn small" id="st-seq-add" type="button" hidden>Add follow-up step</button>
         </div>
       </div>
 
@@ -492,6 +521,38 @@
           <div id="conn-unreadable" class="notice" hidden>Your saved keys couldn't be read &mdash; the server's secret key
             changed since you saved them. Enter them again below (your old copy is kept aside), or ask the server owner to restore the old key.</div>
           <div id="st-conn"></div>
+        </div>
+        <div class="card" id="ib-card">
+          <div class="card-head"><div><h2>Sending inboxes <span class="count-badge" id="ib-n" hidden></span></h2>
+            <p class="hint" style="margin:0">Add more mailboxes and the day's emails are shared between them &mdash; each with its own
+              daily limit and warm-up. Five Workspace mailboxes at 400 a day send 2,000 a day together. A follow-up always
+              leaves from the inbox the first email came from, and replies are checked in every inbox.</p></div>
+            <button class="btn" id="ib-add" type="button">Add an inbox</button></div>
+          <div id="ib-list"></div>
+          <form id="ib-form" class="tpl" hidden autocomplete="off">
+            <h3 id="ib-form-title">New inbox</h3>
+            <div class="conn-grid">
+              <div class="field"><label>Mail provider (fills in the servers)</label><select id="ib-provider"></select></div>
+              <div class="field"><label>Name (for you)</label><input data-ib="label" placeholder="e.g. kunal2@neurospark.in"></div>
+              <div class="field"><label>Login (email address or SMTP username)</label><input data-ib="smtp_user"></div>
+              <div class="field"><label>Password (App Password / SMTP password / API key)</label><input data-ib="smtp_pass" type="password" autocomplete="new-password"></div>
+              <div class="field"><label>Send from (if different from the login)</label><input data-ib="from_email" placeholder="e.g. kunal2@neurospark.in"></div>
+              <div class="field"><label>Sender name</label><input data-ib="from_name" placeholder="e.g. Kunal"></div>
+              <div class="field"><label>Mail server (SMTP)</label><input data-ib="smtp_host" placeholder="smtp.gmail.com"></div>
+              <div class="field"><label>Mail server port</label><input data-ib="smtp_port" placeholder="587"></div>
+              <div class="field"><label>Emails a day from this inbox</label><input data-ib="daily_limit" type="number" min="1" max="100000" value="50"></div>
+              <div class="field"><label>Send through</label><select data-ib="send_via"><option value="">Automatic</option><option value="smtp">SMTP server</option><option value="gmail_api">Gmail API</option></select></div>
+              <div class="field"><label>Gmail API refresh token <span class="muted">(instead of a password)</span></label><input data-ib="gmail_refresh_token" type="password" autocomplete="new-password"></div>
+              <div class="field"><label>Inbox server for replies (IMAP)</label><input data-ib="imap_host" placeholder="imap.gmail.com"></div>
+              <div class="field"><label>Inbox login <span class="muted">(blank = the login above)</span></label><input data-ib="imap_user"></div>
+              <div class="field"><label>Inbox password <span class="muted">(blank = the password above)</span></label><input data-ib="imap_pass" type="password" autocomplete="new-password"></div>
+            </div>
+            <div class="row actions">
+              <button class="btn primary" type="submit">Save inbox</button>
+              <button class="btn" type="button" id="ib-cancel">Cancel</button>
+              <span class="hint" id="ib-form-note">Password boxes left empty keep what's saved.</span>
+            </div>
+          </form>
         </div>
       </div>
 

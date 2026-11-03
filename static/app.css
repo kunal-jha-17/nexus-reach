@@ -415,3 +415,12 @@ table.leads .c-biz { min-width: 200px; }
 
 /* a form that is still fetching its saved values: visible, but not yet editable */
 .view.loading .tabpane { opacity: 0.55; pointer-events: none; transition: opacity 0.15s; }
+
+/* "What's working" table on Outreach */
+.seg { display: flex; gap: 6px; margin: 4px 0 10px; flex-wrap: wrap; }
+.seg [aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+table.perf { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.perf th, table.perf td { padding: 8px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+table.perf th { font-weight: 600; color: var(--muted); font-size: 12.5px; }
+table.perf .num { text-align: right; white-space: nowrap; }
+@media (max-width: 640px) { table.perf { font-size: 12.5px; } table.perf th, table.perf td { padding: 6px; } }

@@ -846,6 +846,7 @@ def scrape_instagram(tag, ig_username, ig_password, max_results=30, progress=Non
 # --------------------------------------------------------------- job entry
 
 MAX_SEARCHES_PER_RUN = 40
+PLATFORMS = ("google_maps", "apify_maps", "yelp", "instagram")
 YELP_COUNTRIES = ("", "US", "CA", "GB", "AU", "NZ", "IE", "DE", "FR", "ES", "IT", "MX", "SG")
 
 
@@ -930,14 +931,14 @@ def run_scrape(ctx, params):
     campaign = (params.get("campaign") or "").strip()
     only_no_website = bool(params.get("only_no_website"))
     searches = plan_searches(params)
-    if platform not in ("google_maps", "yelp", "instagram"):
+    if platform not in PLATFORMS:
         raise ValueError(f"Unknown platform '{platform}'")
     if ctx.stopped:
         return "Stopped before starting"
     cur = {"query": searches[0][0]}
 
     st = {"checked": 0, "kept": 0, "inserted": 0, "merged": 0, "skipped_suppressed": 0,
-          "known": 0, "limit": ""}
+          "known": 0, "limit": "", "cost": None}
     handled = set()
 
     def has_real_site(url):
@@ -984,6 +985,17 @@ def run_scrape(ctx, params):
     def one_search(query, location):
         rows = []
         cur["cc"] = calling_code_for_location(location)
+        if platform == "apify_maps":
+            import apify
+            try:
+                _, cost = apify.run_search(query, location, max_results, ctx, on_row=save,
+                                           contacts=bool(params.get("contacts")), log=ctx.log)
+            except apify.ApifyError as e:
+                raise RuntimeError(str(e))
+            if cost is not None:
+                st["cost"] = (st["cost"] or 0) + cost
+                ctx.log(f"  Apify charged ${cost:.2f} for this search.")
+            return
         if platform == "google_maps":
             rows = scrape_google_maps(query, location, max_results, ctx.log, ctx,
                                       on_row=save, skip_known=skip_known, skip_site=skip_site)
@@ -1065,6 +1077,8 @@ def run_scrape(ctx, params):
             msg += f" -- {len(failed)} ended early ({'; '.join(failed[:3])}{'...' if len(failed) > 3 else ''})"
     if st["limit"]:
         msg += f" -- stopped early: {st['limit']}"
+    if st["cost"] is not None:
+        msg += f" (Apify cost ${st['cost']:.2f})"
     if not checked and not st["known"]:
         msg += " (0 results usually means the site's markup changed or a CAPTCHA appeared)"
     elif not kept and only_no_website and checked:
